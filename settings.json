@@ -1,0 +1,7 @@
+{
+  "baseUrl": "http://localhost:43076",
+  "backendBaseUrl": "http://localhost:8000",
+  "notes": {
+    "deviation_from_default_template": "NemoGuard's React frontend calls '/api/v2/...' endpoints directly (not the Axet template's generic '/backend/api/' method+action endpoint). The .flows middleware/nginx layer in front of this app must proxy '/api/*' requests through to backendBaseUrl (FastAPI on port 8000) for the frontend to work unmodified. See HOW-TO-START.md and DEPLOY-TO-AXET.md."
+  }
+}
