@@ -26,7 +26,7 @@ AXET_FLOWS_AUTH = os.environ.get("AXET_FLOWS_AUTH", "false").strip().lower() in 
     "on",
 )
 
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 class User(BaseModel):
     user_id: str
@@ -216,9 +216,27 @@ def authenticate_token(token: str) -> User:
 
 
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    return authenticate_token(credentials.credentials)
+    token: Optional[str] = None
+
+    # Standard/local NemoGuard authentication.
+    if credentials and credentials.credentials:
+        token = credentials.credentials
+
+    # aXet Flows runtime stores the authenticated JWT in an HttpOnly cookie.
+    # The python-gateway forwards that cookie unchanged to FastAPI.
+    elif AXET_FLOWS_AUTH:
+        token = request.cookies.get("axetflows_token")
+
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Not authenticated",
+        )
+
+    return authenticate_token(token)
 
 def require_role(required_role: str):
     """
