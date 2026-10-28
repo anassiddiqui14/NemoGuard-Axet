@@ -100,7 +100,17 @@ You MUST return ONLY valid JSON in this exact format as your final response once
 """
         )
 
-    async def analyze(self, incident_id: str) -> Dict[str, Any]:
+    async def analyze(self, incident_id: str, feedback_context: str = "") -> Dict[str, Any]:
+        # When present, feedback_context carries operator-provided guidance
+        # or a confirmed fact (from Commander Live), or human rejection
+        # feedback on a previous plan -- injected as a clearly delimited
+        # section so the RCA agent actually incorporates it into its
+        # reasoning rather than it only ever being stored in the database.
+        # Callers (langgraph_investigator.py) are responsible for labeling
+        # confirmed facts as authoritative vs. guidance as strong-but-not-
+        # authoritative evidence; this agent simply surfaces whatever
+        # section text it was given verbatim.
+        feedback_section = f"\n\n{feedback_context}\n" if feedback_context else ""
         prompt = f"""
         Analyze the root cause for incident {incident_id}. 
         Use the `query_logs` tool to gather evidence before returning your JSON conclusion.
@@ -108,6 +118,7 @@ You MUST return ONLY valid JSON in this exact format as your final response once
         database table, also use the real observability + data-integrity tools described in
         your instructions (query_cloudwatch_logs, list_s3_objects/read_s3_object,
         check_table_staleness) to build a complete, verified picture.
+        {feedback_section}
         """
         
         response = await self.call_llm_with_tools(prompt, _get_full_tools_schema(), execute_tool_call)

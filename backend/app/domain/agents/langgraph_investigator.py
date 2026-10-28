@@ -11,7 +11,15 @@ from app.domain.agents.agent_tools import _get_read_only_tools_schema, execute_t
 class InvestigationState(TypedDict):
     incident_id: str
     alerts: List[Dict[str, Any]]
-    
+
+    # Optional operator-provided guidance/confirmed-fact/rejection-feedback
+    # context (e.g. from Commander Live or a rejected-plan resubmission),
+    # carried through the graph so RCA (and, transitively, the Grounding
+    # Critic) actually reason over it rather than it only ever being
+    # persisted to the database. Empty string for a normal first-pass
+    # triage -- this is purely additive and never required.
+    feedback_context: str
+
     rca_result: Dict[str, Any]
     impact_result: Dict[str, Any]
     runbook_result: Dict[str, Any]
@@ -133,14 +141,21 @@ format as your final response (do not wrap it in markdown):
 }}"""
         )
         
-    async def analyze(self, incident_id: str, rca: Dict, impact: Dict, runbook: Dict) -> Dict:
+    async def analyze(self, incident_id: str, rca: Dict, impact: Dict, runbook: Dict, feedback_context: str = "") -> Dict:
+        # When present, feedback_context carries the same operator-provided
+        # guidance/confirmed-fact (or rejection-feedback) text that was fed
+        # into RCA for this investigation run. Surfacing it to the critic
+        # too ensures the final plan isn't accidentally validated as
+        # "grounded" while silently contradicting an authoritative human
+        # confirmed fact that RCA was asked to treat as ground truth.
+        feedback_section = f"\n\n{feedback_context}\n" if feedback_context else ""
         prompt = f"""
         AUTHORITATIVE INCIDENT ID: {incident_id}
 
         RCA Result: {rca}
         IMPACT Result: {impact}
         RUNBOOK Result: {runbook}
-        
+        {feedback_section}
         Critique the findings for evidence grounding. Use your read-only tools to
         independently verify any specific factual claims you can (e.g. re-check a log line,
         a CloudWatch metric, or a table's staleness) before combining everything into a
@@ -151,6 +166,9 @@ format as your final response (do not wrap it in markdown):
         - Never invent, substitute, shorten, or use example incident IDs.
         - Example IDs appearing in tool schemas such as `INC-12345` are documentation examples
           only and must never be used as the actual query argument.
+        - If operator-provided context above is present, verify the final_plan does not
+          contradict an authoritative HUMAN CONFIRMED FACT; if the runbook/RCA plan conflicts
+          with it, flag that in "feedback" and correct "final_plan" accordingly.
         """
         result = await self.call_llm_with_tools(prompt, _get_read_only_tools_schema(), execute_tool_call)
 
@@ -177,7 +195,7 @@ class LangGraphInvestigator:
         
         # Define nodes
         async def run_rca(state: InvestigationState):
-            res = await self.rca_agent.analyze(state["incident_id"])
+            res = await self.rca_agent.analyze(state["incident_id"], feedback_context=state.get("feedback_context", ""))
             return {"rca_result": res}
             
         async def run_impact(state: InvestigationState):
@@ -204,7 +222,10 @@ class LangGraphInvestigator:
             impact = state.get("impact_result", {}) or {}
             runbook = state.get("runbook_result", {}) or {}
 
-            res = await self.critic.analyze(state["incident_id"], rca, impact, runbook)
+            res = await self.critic.analyze(
+                state["incident_id"], rca, impact, runbook,
+                feedback_context=state.get("feedback_context", ""),
+            )
 
             final_plan = res.get("final_plan") or {}
             # The critic call can fail outright (LLM error, malformed/truncated JSON — see
@@ -251,12 +272,16 @@ class LangGraphInvestigator:
         
         return workflow.compile()
         
-    async def investigate(self, incident_id: str, alerts: List[Dict] = None, audit_callback=None):
+    async def investigate(
+        self, incident_id: str, alerts: List[Dict] = None, audit_callback=None,
+        feedback_context: str = "",
+    ):
         if alerts is None:
             alerts = []
         state = {
             "incident_id": incident_id,
             "alerts": alerts,
+            "feedback_context": feedback_context,
             "rca_result": {},
             "impact_result": {},
             "runbook_result": {},

@@ -266,8 +266,23 @@ class IncidentOrchestrator:
         self._log_audit(incident_id, "Impact Agent", "IMPACT_CALCULATED", f"Identified {len(impacts)} affected downstream assets.")
         self._log_audit(incident_id, "Commander", "PLAN_CREATED", f"Formulated {len(steps)}-step recovery plan {plan_id} (risk: {plan_risk}).")
         
-    def save_agent_findings(self, incident_id: str, llm_response: Dict[str, Any], critic_passed: bool = True, critic_feedback: str = "") -> Dict[str, Any]:
-        """Saves the JSON output from the NemoClaw agents into the database."""
+    def save_agent_findings(
+        self, incident_id: str, llm_response: Dict[str, Any], critic_passed: bool = True,
+        critic_feedback: str = "", parent_plan_id: str = None, feedback_reference: str = None,
+        plan_version: int = 1,
+    ) -> Dict[str, Any]:
+        """
+        Saves the JSON output from the NemoClaw agents into the database.
+
+        `parent_plan_id` / `feedback_reference` / `plan_version` support the
+        plan-versioning model: when this is a re-investigation triggered by
+        a plan rejection or Commander Live guidance, the new action_plan row
+        is linked back to the plan it supersedes and the specific
+        feedback/guidance record that triggered the revision, rather than
+        being indistinguishable from a first-pass plan. All existing
+        callers default to plan_version=1 with no parent/feedback link,
+        preserving current behavior exactly.
+        """
         now = datetime.now(timezone.utc).isoformat()
         
         if "error" in llm_response:
@@ -322,7 +337,14 @@ class IncidentOrchestrator:
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (hyp_id, incident_id, "SYSTEM", idx+1, hyp.get("statement", ""), hyp.get("cause_type", "OTHER"), hyp.get("confidence", 0.5), "PROBABLE_CAUSE", json.dumps(evidence_ids), "[]", "[]", now))
                 
-            # 3. Insert Impacts
+            # 3. Insert/refresh Impacts. Revision-safe: a re-investigation
+            # (Commander guidance, plan feedback, new correlated evidence)
+            # must be able to update an existing asset's impact facts
+            # rather than fail or silently duplicate -- incident_impact's
+            # primary key is (incident_id, asset_id), so ON CONFLICT DO
+            # UPDATE refreshes impact_type/status/reason/score/evidence
+            # for that pair in place. Old impacts for OTHER assets are
+            # never wholesale-deleted.
             for imp in llm_response.get("impacts", []):
                 asset_id = imp.get("asset_id", "Unknown")
                 conn.execute("""
@@ -333,6 +355,12 @@ class IncidentOrchestrator:
                 conn.execute("""
                     INSERT INTO incident_impact (incident_id, asset_id, impact_type, impact_status, reason, impact_score, evidence_ids_json)
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (incident_id, asset_id) DO UPDATE SET
+                        impact_type = EXCLUDED.impact_type,
+                        impact_status = EXCLUDED.impact_status,
+                        reason = EXCLUDED.reason,
+                        impact_score = EXCLUDED.impact_score,
+                        evidence_ids_json = EXCLUDED.evidence_ids_json
                 """, (incident_id, asset_id, imp.get("impact_type", "Unknown"), imp.get("status", "AT_RISK"), imp.get("reason", ""), imp.get("score", 0.5), json.dumps(evidence_ids)))
                 
             # 4. Insert Action Plan
@@ -346,10 +374,35 @@ class IncidentOrchestrator:
             if not critic_passed and critic_feedback:
                 rationale = f"[SAFETY REVIEW REQUIRED] {critic_feedback}\n\n{rationale}"
             conn.execute("""
-                INSERT INTO action_plan (action_plan_id, incident_id, agent_run_id, plan_version, status, overall_risk, rationale, expected_outcome, rollback_summary, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (plan_id, incident_id, "SYSTEM", 1, plan_status, plan_data.get("risk", "MEDIUM"), rationale, plan_data.get("expected_outcome", ""), "Manual Rollback Required", now))
-            
+                INSERT INTO action_plan (action_plan_id, incident_id, agent_run_id, plan_version, status, overall_risk, rationale, expected_outcome, rollback_summary, created_at, parent_plan_id, feedback_reference)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (plan_id, incident_id, "SYSTEM", plan_version, plan_status, plan_data.get("risk", "MEDIUM"), rationale, plan_data.get("expected_outcome", ""), "Manual Rollback Required", now, parent_plan_id, feedback_reference))
+
+            # If this plan supersedes a previously rejected/superseded plan,
+            # mark that old plan with a pointer to the new plan. The old
+            # plan row itself is never deleted or mutated beyond its status
+            # -- its original content remains immutable for audit purposes.
+            #
+            # Note: `feedback_reference` is stored on action_plan as-is
+            # (it may be a plan_feedback.plan_feedback_id from
+            # triage_feedback(), or a commander_guidance.guidance_id from
+            # reinvestigate_from_commander_guidance() -- these are two
+            # different tables/id-spaces). We deliberately do NOT
+            # unconditionally UPDATE plan_feedback here: doing so with a
+            # Commander guidance_id would either no-op silently or corrupt
+            # an unrelated plan_feedback row if the IDs ever collided. No
+            # current caller of save_agent_findings() needs
+            # plan_feedback.resulting_plan_id populated through this path;
+            # if/when a caller passes an actual plan_feedback_id and needs
+            # that back-reference, it should update plan_feedback itself
+            # (as it already knows which table its id came from) rather
+            # than this generic method guessing.
+            if parent_plan_id:
+                conn.execute(
+                    "UPDATE action_plan SET status = 'SUPERSEDED' WHERE action_plan_id = %s AND status != 'SUPERSEDED'",
+                    (parent_plan_id,),
+                )
+
             # Action Steps
             for i, step in enumerate(plan_data.get("steps", []), 1):
                 risk = step.get("risk", "LOW")
@@ -365,9 +418,19 @@ class IncidentOrchestrator:
                 "UPDATE incident SET actual_root_cause = %s, rca_confidence = %s, status = %s WHERE incident_id = %s",
                 (rca_statement, rca_confidence, IncidentState.PLAN_READY.value, incident_id)
             )
-            
-        self._log_audit(incident_id, "Commander", "PLAN_CREATED", f"Commander synthesized multi-agent findings into recovery plan {plan_id}.")
-        
+
+        # Distinguish a genuine first-pass plan from a Commander-triggered
+        # (or feedback-triggered) revision in the audit trail: a revision
+        # gets PLAN_REVISED, not a second, misleading PLAN_CREATED.
+        if parent_plan_id:
+            self._log_audit(
+                incident_id, "Commander", "PLAN_REVISED",
+                f"Plan revised to v{plan_version} ({plan_id}), superseding {parent_plan_id}, "
+                f"based on re-investigation informed by new operator-provided evidence.",
+            )
+        else:
+            self._log_audit(incident_id, "Commander", "PLAN_CREATED", f"Commander synthesized multi-agent findings into recovery plan {plan_id}.")
+
         return {"status": "success", "plan_id": plan_id}
 
     def triage_fallback(self, incident_id: str) -> Dict[str, Any]:
@@ -662,6 +725,189 @@ class IncidentOrchestrator:
         self._log_audit(incident_id, "Feedback Agent", "PLAN_REVISED", f"Action plan {plan_id} revised based on user feedback.")
         
         return {"status": "success", "plan_id": plan_id}
+
+    async def reinvestigate_from_commander_guidance(
+        self, incident_id: str, guidance_text: str, is_fact: bool, guidance_id: str,
+    ) -> Dict[str, Any]:
+        """
+        Re-runs the full multi-agent investigation (RCA -> Impact -> Runbook
+        -> Critic, via LangGraphInvestigator) in response to operator
+        guidance/a confirmed fact submitted through Commander Live that the
+        deterministic classifier in app/domain/commander/conversation.py
+        flagged as materially state-changing. The guidance/fact becomes
+        authoritative NEW EVIDENCE fed into the full investigation (via
+        feedback_context), not just patched text on the existing plan.
+
+        This repository has no separate `IncidentStateService` / Temporal
+        workflow for Commander -- state transitions here are plain
+        `UPDATE incident SET status = ...` statements against the current
+        schema's `incident.status` column, matching how every other
+        orchestrator method (triage_incident, execute_plan,
+        process_webhook) already manages incident state directly.
+
+        Only re-investigates while the incident is sitting at a safe
+        plan-review checkpoint: PLAN_READY, AWAITING_APPROVAL, or
+        MANUAL_ACTION_REQUIRED (the states save_agent_findings() already
+        knows how to walk back from to PLAN_READY). Terminal states
+        (RESOLVED/FAILED/CLOSED/CANCELLED) and active-execution states
+        (INVESTIGATING/EXECUTING/VERIFYING) are intentionally excluded --
+        the former because there's nothing left to safely revise, the
+        latter to avoid racing an in-flight investigation or execution.
+        """
+        with self.db.get_connection() as conn:
+            cursor = conn.execute("SELECT status FROM incident WHERE incident_id = %s", (incident_id,))
+            row = cursor.fetchone()
+        if not row:
+            return {"error": f"Incident {incident_id} not found."}
+        current_status = row[0]
+
+        _SAFE_REINVESTIGATION_CHECKPOINTS = {
+            IncidentState.PLAN_READY.value,
+            IncidentState.AWAITING_APPROVAL.value,
+            "MANUAL_ACTION_REQUIRED",
+        }
+        if current_status not in _SAFE_REINVESTIGATION_CHECKPOINTS:
+            return {"status": "skipped", "reason": f"incident is {current_status}; not re-investigating now"}
+
+        with self.db.get_connection() as conn:
+            cursor = conn.execute(
+                # plan_version is the authoritative revision ordering (not
+                # created_at) -- select the highest-versioned plan first,
+                # breaking ties by recency.
+                "SELECT action_plan_id, plan_version FROM action_plan WHERE incident_id = %s "
+                "ORDER BY plan_version DESC, created_at DESC LIMIT 1",
+                (incident_id,),
+            )
+            plan_row = cursor.fetchone()
+        if not plan_row:
+            return {"status": "skipped", "reason": "no existing plan to revise"}
+        rejected_plan_id, prev_version = plan_row[0], plan_row[1] or 1
+
+        alerts_data = []
+        with self.db.get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT alert.alert_id, alert.severity, alert.alert_type, alert.source_system, alert.message FROM alert "
+                "JOIN incident_alert ON alert.alert_id = incident_alert.alert_id "
+                "WHERE incident_alert.incident_id = %s",
+                (incident_id,),
+            )
+            for row in cursor.fetchall():
+                alerts_data.append({
+                    "alert_id": row[0], "severity": row[1], "alert_type": row[2],
+                    "source_system": row[3], "message": row[4],
+                })
+
+        authority_label = "a CONFIRMED FACT (authoritative)" if is_fact else "operator guidance"
+        self._log_audit(
+            incident_id, "Commander", "REINVESTIGATION_TRIGGERED",
+            f"Re-running investigation: operator provided {authority_label} via Commander Live "
+            f"(guidance_id={guidance_id}) that was flagged as materially state-changing: \"{guidance_text}\"",
+        )
+
+        # Move the incident to INVESTIGATING for the duration of this
+        # re-run so phase-based UI indicators (anything keying off
+        # incident.status) actually reflect that something is happening
+        # DURING the run, not just after it completes.
+        try:
+            with self.db.get_connection() as conn:
+                conn.execute(
+                    "UPDATE incident SET status = %s, updated_at = %s WHERE incident_id = %s",
+                    (IncidentState.INVESTIGATING.value, datetime.now(timezone.utc).isoformat(), incident_id),
+                )
+        except Exception as e:
+            print(f"reinvestigate_from_commander_guidance: could not transition {incident_id} to INVESTIGATING: {e}")
+
+        from app.domain.agents.langgraph_investigator import LangGraphInvestigator
+        investigator = LangGraphInvestigator()
+        feedback_context = (
+            f"OPERATOR-PROVIDED {'CONFIRMED FACT' if is_fact else 'GUIDANCE'} (via Commander Live chat): "
+            f"\"{guidance_text}\"\n\n"
+            f"{'This is an authoritative, confirmed fact from the operator -- treat it as ground truth.' if is_fact else 'This is an operator observation -- weigh it as strong but not necessarily authoritative evidence.'} "
+            "Re-evaluate whether the current root cause and recovery plan still apply given this input, "
+            "or whether it points to a different/additional root cause the plan must address."
+        )
+        try:
+            final_state = await investigator.investigate(
+                incident_id, alerts_data, audit_callback=self._log_audit,
+                feedback_context=feedback_context,
+            )
+        except Exception as e:
+            self._log_audit(incident_id, "SYSTEM", "REINVESTIGATION_FAILED", f"Re-investigation after Commander Live guidance failed: {e}")
+            # Restore a sensible, reviewable status rather than leaving the
+            # incident falsely stuck in INVESTIGATING with no plan to show
+            # for it. The prior plan (rejected_plan_id) is untouched.
+            try:
+                with self.db.get_connection() as conn:
+                    conn.execute(
+                        "UPDATE incident SET status = %s, updated_at = %s WHERE incident_id = %s",
+                        (current_status, datetime.now(timezone.utc).isoformat(), incident_id),
+                    )
+            except Exception as restore_exc:
+                print(f"reinvestigate_from_commander_guidance: could not restore status for {incident_id}: {restore_exc}")
+            return {"error": f"Re-investigation failed: {e}"}
+
+        rca_res = final_state.get("rca_result", {})
+        impact_res = final_state.get("impact_result", {})
+        plan_res = final_state.get("final_plan", {})
+        rca_hypotheses = rca_res.get("hypotheses") or [{
+            "statement": rca_res.get("finding", "Unknown root cause"),
+            "cause_type": rca_res.get("cause_type", "OTHER"),
+            "confidence": rca_res.get("confidence", 0.9),
+        }]
+        llm_response = {
+            "evidence": rca_res.get("evidence", []),
+            "hypotheses": rca_hypotheses,
+            "impacts": impact_res.get("impacts", []),
+            "action_plan": {
+                "rationale": plan_res.get("rationale", ""),
+                "expected_outcome": plan_res.get("expected_outcome", ""),
+                "risk": plan_res.get("risk", "MEDIUM"),
+                "steps": plan_res.get("steps", []),
+            },
+        }
+        # save_agent_findings() unconditionally sets incident.status back
+        # to PLAN_READY on success, which both completes this re-run's
+        # journey through INVESTIGATING and gives the operator a fresh
+        # plan-review checkpoint for the revised plan. It can also raise
+        # (not just return an {"error": ...} dict) -- e.g. a DB constraint
+        # violation or unexpected exception inside its own transaction --
+        # so this call is wrapped in try/except as well, matching the
+        # investigator-failure handling above: never leave the incident
+        # stuck in INVESTIGATING.
+        try:
+            result = self.save_agent_findings(
+                incident_id, llm_response,
+                critic_passed=final_state.get("critic_passed", True),
+                critic_feedback=final_state.get("critic_feedback", ""),
+                parent_plan_id=rejected_plan_id,
+                feedback_reference=guidance_id,
+                plan_version=prev_version + 1,
+            )
+        except Exception as e:
+            self._log_audit(incident_id, "SYSTEM", "REINVESTIGATION_FAILED", f"Saving the revised plan after Commander Live guidance failed: {e}")
+            try:
+                with self.db.get_connection() as conn:
+                    conn.execute(
+                        "UPDATE incident SET status = %s, updated_at = %s WHERE incident_id = %s",
+                        (current_status, datetime.now(timezone.utc).isoformat(), incident_id),
+                    )
+            except Exception as restore_exc:
+                print(f"reinvestigate_from_commander_guidance: could not restore status for {incident_id}: {restore_exc}")
+            return {"error": f"Failed to save revised plan: {e}"}
+
+        if "error" in result:
+            # save_agent_findings returned (rather than raised) an error --
+            # don't leave the incident stuck in INVESTIGATING with nothing
+            # to show.
+            try:
+                with self.db.get_connection() as conn:
+                    conn.execute(
+                        "UPDATE incident SET status = %s, updated_at = %s WHERE incident_id = %s",
+                        (current_status, datetime.now(timezone.utc).isoformat(), incident_id),
+                    )
+            except Exception as restore_exc:
+                print(f"reinvestigate_from_commander_guidance: could not restore status for {incident_id}: {restore_exc}")
+        return result
 
     async def process_webhook(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Processes incoming webhooks via the WatcherAgent to determine if it's a valid alert and if it correlates."""

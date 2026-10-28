@@ -554,6 +554,98 @@ def auth_me(current_user: User = Depends(get_current_user)):
         "workspace_id": current_user.workspace_id,
     }
 
+
+# ---------------------------------------------------------------------------
+# Commander Live / Commander Pulse.
+# Commander Pulse projects the existing audit_event stream into meaningful
+# status updates; Commander Live is the persistent ASK/GUIDE/ADD_FACT
+# conversation attached to every incident. Every endpoint below is scoped
+# to the caller's tenant via _require_incident_in_tenant /
+# CommanderConversation's own equivalent check.
+# ---------------------------------------------------------------------------
+
+def _require_incident_in_tenant(db: PostgresDatabase, incident_id: str, tenant_id: str) -> None:
+    """
+    Verifies `incident_id` exists AND belongs to `tenant_id`, raising 404 if
+    not (never 403 -- "doesn't exist" and "wrong tenant" are intentionally
+    indistinguishable to the caller, so cross-tenant existence is never
+    leaked).
+    """
+    with db.get_connection() as conn:
+        cursor = conn.execute(
+            "SELECT 1 FROM incident WHERE incident_id = %s AND tenant_id = %s",
+            (incident_id, tenant_id),
+        )
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Incident not found")
+
+
+@app.get("/api/v2/incidents/{incident_id}/commander/status")
+def get_commander_pulse(incident_id: str, current_user: User = Depends(get_current_user)):
+    from app.domain.commander.status_projector import StatusProjector
+    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    _require_incident_in_tenant(db, incident_id, current_user.tenant_id)
+    return StatusProjector(db).get_pulse(incident_id)
+
+
+@app.get("/api/v2/incidents/{incident_id}/commander/messages")
+def get_commander_messages(incident_id: str, current_user: User = Depends(get_current_user)):
+    from app.domain.commander.conversation import CommanderConversation, IncidentNotFoundError
+    conv = CommanderConversation()
+    try:
+        return conv.get_messages(incident_id, current_user.tenant_id)
+    except IncidentNotFoundError:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+
+class CommanderAskRequest(BaseModel):
+    question: str
+
+
+@app.post("/api/v2/incidents/{incident_id}/commander/ask")
+async def commander_ask(incident_id: str, req: CommanderAskRequest, current_user: User = Depends(get_current_user)):
+    from app.domain.commander.conversation import CommanderConversation, IncidentNotFoundError
+    conv = CommanderConversation()
+    try:
+        return await conv.ask(incident_id, current_user.tenant_id, req.question, current_user.user_id)
+    except IncidentNotFoundError:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+
+class CommanderGuidanceRequest(BaseModel):
+    text: str
+    guidance_type: Optional[str] = "INVESTIGATION_DIRECTION"
+
+
+@app.post("/api/v2/incidents/{incident_id}/commander/guidance")
+async def commander_guidance(incident_id: str, req: CommanderGuidanceRequest, current_user: User = Depends(require_role("operator"))):
+    from app.domain.commander.conversation import CommanderConversation, IncidentNotFoundError
+    conv = CommanderConversation()
+    try:
+        return await conv.guide(
+            incident_id, current_user.tenant_id, req.text, current_user.user_id,
+            guidance_type=req.guidance_type or "INVESTIGATION_DIRECTION", is_fact=False,
+        )
+    except IncidentNotFoundError:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+
+class CommanderFactRequest(BaseModel):
+    text: str
+
+
+@app.post("/api/v2/incidents/{incident_id}/commander/facts")
+async def commander_add_fact(incident_id: str, req: CommanderFactRequest, current_user: User = Depends(require_role("operator"))):
+    from app.domain.commander.conversation import CommanderConversation, IncidentNotFoundError
+    conv = CommanderConversation()
+    try:
+        return await conv.guide(
+            incident_id, current_user.tenant_id, req.text, current_user.user_id,
+            guidance_type="MANUAL_EVIDENCE_REFERENCE", is_fact=True,
+        )
+    except IncidentNotFoundError:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
 @app.get("/api/v2/incidents/{incident_id}/events/stream")
 async def stream_events(
     incident_id: str,
