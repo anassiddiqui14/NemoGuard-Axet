@@ -1,9 +1,10 @@
 import { useState } from 'react';
 import { motion } from 'framer-motion';
-import { CheckSquare, FileText, AlertTriangle, ShieldCheck, Send, X, CheckCircle, Sparkles } from 'lucide-react';
-import toast from 'react-hot-toast';
+import { CheckSquare, FileText, AlertTriangle, ShieldCheck, Send, X, CheckCircle, ListOrdered } from 'lucide-react';
+import { ngToast } from '../design-system/toast';
 import { modalBackdrop, modalPanel } from './dashboard/shared';
 import { authFetch } from '../contexts/AuthGateContext';
+import { IconButton } from '../design-system/components/IconButton';
 
 const RISK_STYLES: Record<string, string> = {
   LOW: 'border-l-healthy',
@@ -42,14 +43,14 @@ export function PlanApprovalModal({ incidentId, plan, onClose, onRefreshPlan }: 
         } catch {
           // response wasn't JSON; fall back to the status code above
         }
-        toast.error(`Failed to approve plan: ${detail}`);
+        ngToast.error(`Failed to approve plan: ${detail}`);
         return;
       }
-      toast.success('Plan approved — executing recovery actions.');
+      ngToast.success('Plan approved — executing recovery actions.');
       onRefreshPlan();
       onClose();
     } catch (e) {
-      toast.error(`Failed to approve plan: ${e instanceof Error ? e.message : 'network error'}`);
+      ngToast.error(`Failed to approve plan: ${e instanceof Error ? e.message : 'network error'}`);
     } finally {
       setSubmitting(false);
     }
@@ -72,14 +73,14 @@ export function PlanApprovalModal({ incidentId, plan, onClose, onRefreshPlan }: 
         } catch {
           // response wasn't JSON; fall back to the status code above
         }
-        toast.error(`Failed to submit feedback: ${detail}`);
+        ngToast.error(`Failed to submit feedback: ${detail}`);
         return;
       }
-      toast.success('Feedback submitted — plan is being revised.');
+      ngToast.success('Feedback submitted — plan is being revised.');
       onRefreshPlan();
       onClose();
     } catch (e) {
-      toast.error(`Failed to submit feedback: ${e instanceof Error ? e.message : 'network error'}`);
+      ngToast.error(`Failed to submit feedback: ${e instanceof Error ? e.message : 'network error'}`);
     } finally {
       setSubmitting(false);
     }
@@ -90,7 +91,7 @@ export function PlanApprovalModal({ incidentId, plan, onClose, onRefreshPlan }: 
       <motion.div {...modalPanel} className="glass-panel rounded-2xl shadow-2xl w-full max-w-3xl max-h-[90vh] flex flex-col overflow-hidden ring-1 ring-white/[0.08]">
         <div className="px-6 py-4 border-b border-white/[0.06] flex items-center justify-between">
           <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-primary/20 to-agent-active/20 flex items-center justify-center">
+            <div className="w-8 h-8 rounded-lg bg-primary/12 ring-1 ring-primary/25 flex items-center justify-center">
               <CheckSquare className="w-4 h-4 text-primary" />
             </div>
             <h2 className="text-[15px] font-semibold text-text-primary">Approve Recovery Plan</h2>
@@ -98,9 +99,17 @@ export function PlanApprovalModal({ incidentId, plan, onClose, onRefreshPlan }: 
               <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-agent-active/15 text-agent-active">v{plan.plan_version}</span>
             )}
           </div>
-          <button onClick={onClose} className="p-2 hover:bg-white/[0.06] rounded-full transition-colors">
-            <X className="w-4 h-4 text-text-muted hover:text-text-primary" />
-          </button>
+          {/*
+           * UI MODERNIZATION (spec Section 18/73 -- genuine accessibility
+           * gap found and fixed): this close button had NO accessible
+           * name at all -- icon-only, no aria-label, no title. For the
+           * plan-approval workflow specifically (a critical, high-stakes
+           * action), this is a particularly significant gap to leave
+           * unfixed. Migrated to IconButton, which makes `label` required.
+           */}
+          <IconButton onClick={onClose} label="Close">
+            <X className="w-4 h-4" />
+          </IconButton>
         </div>
 
         <div className="p-6 overflow-y-auto space-y-4 flex-1">
@@ -130,7 +139,7 @@ export function PlanApprovalModal({ incidentId, plan, onClose, onRefreshPlan }: 
 
           <div>
             <h4 className="font-semibold text-text-primary mb-3 text-[14px] flex items-center gap-2">
-              <Sparkles className="w-3.5 h-3.5 text-agent-active" /> Execution Steps
+              <ListOrdered className="w-3.5 h-3.5 text-agent-active" /> Execution Steps
             </h4>
             <div className="space-y-2.5">
               {plan?.steps?.map((step: any, idx: number) => (

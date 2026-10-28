@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { Toaster } from 'react-hot-toast';
 import { IncidentQueue } from './dashboard/IncidentQueue';
 import { IncidentWorkspace } from './dashboard/IncidentWorkspace';
 import { GreetingBar } from './shell/GreetingBar';
 import type { IncidentSummary } from './dashboard/shared';
 import { needsAttention } from './dashboard/shared';
+import { authFetch } from '../contexts/AuthGateContext';
 
 export function Dashboard() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -22,22 +22,36 @@ export function Dashboard() {
   // against two empty arrays on mount and immediately null out the
   // just-selected incident before the real data ever arrived.
   const [queueLoaded, setQueueLoaded] = useState(false);
+  // UI MODERNIZATION (Phase 6, spec Section 31/62): a failed poll
+  // previously wiped BOTH incident arrays to empty in the catch block --
+  // identical in appearance to the legitimate "zero active incidents"
+  // empty state. An operator whose network blipped mid-incident would see
+  // the entire queue vanish and have no way to tell "the system is
+  // actually healthy and quiet" apart from "the dashboard just lost its
+  // connection to the API". Now a failed refresh keeps the last-known-good
+  // data on screen and surfaces a dedicated, dismissable connection-error
+  // banner instead of silently discarding state.
+  const [queueError, setQueueError] = useState<string | null>(null);
 
   const refreshQueue = async () => {
     try {
       const [openRes, allRes] = await Promise.all([
-        fetch('/api/v2/incidents?state=open'),
-        fetch('/api/v2/incidents?state=all'),
+        authFetch('/api/v2/incidents?state=open'),
+        authFetch('/api/v2/incidents?state=all'),
       ]);
+      if (!openRes.ok || !allRes.ok) throw new Error(`HTTP ${openRes.status}/${allRes.status}`);
       const openData = (await openRes.json()) as IncidentSummary[];
       const allData = (await allRes.json()) as IncidentSummary[];
       setOpenIncidents(Array.isArray(openData) ? openData : []);
       setResolvedIncidents(
         Array.isArray(allData) ? allData.filter((i) => i.status?.toUpperCase() === 'RESOLVED') : [],
       );
+      setQueueError(null);
     } catch {
-      setOpenIncidents([]);
-      setResolvedIncidents([]);
+      // Deliberately do NOT clear openIncidents/resolvedIncidents here --
+      // stale-but-real data is far more useful to an operator than an
+      // empty queue that looks like "all clear".
+      setQueueError('Lost connection to the incident feed. Showing last known data.');
     } finally {
       setQueueLoaded(true);
     }
@@ -108,21 +122,35 @@ export function Dashboard() {
 
   return (
     <div className="flex h-full min-h-0 bg-app-bg text-text-primary overflow-hidden selection:bg-primary/30">
-      <Toaster position="top-right" />
-
-      <IncidentQueue
-        openIncidents={sortedIncidents}
-        activeIncidentId={activeIncidentId}
-        setActiveIncidentId={setActiveIncidentId}
-        refreshQueue={refreshQueue}
-      />
+      {/*
+       * UI MODERNIZATION (spec Section 30 -- Dashboard responsive
+       * behavior): IncidentQueue has a fixed w-[300px], and this
+       * container had no responsive handling at all -- at a 375px
+       * mobile viewport that left only ~75px for the entire main
+       * content area, which the spec explicitly calls unacceptable
+       * ("Do not squeeze 3 columns... use sequential visual states:
+       * Incident Queue -> Incident Detail"). Below md, the queue and
+       * detail pane now behave like the IncidentsPage's existing
+       * list/detail pattern: show the queue OR the detail, never a
+       * squeezed version of both, with the queue reappearing once no
+       * incident is selected.
+       */}
+      <div className={`${activeIncidentId ? 'hidden md:flex' : 'flex'} md:flex-shrink-0`}>
+        <IncidentQueue
+          openIncidents={sortedIncidents}
+          activeIncidentId={activeIncidentId}
+          setActiveIncidentId={setActiveIncidentId}
+          refreshQueue={refreshQueue}
+          connectionError={queueError}
+        />
+      </div>
 
       <motion.main
         key={activeIncidentId ?? 'no-incident'}
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
         transition={{ duration: 0.2 }}
-        className="flex-1 overflow-y-auto flex flex-col gap-4 min-w-0"
+        className={`flex-1 overflow-y-auto flex-col gap-4 min-w-0 ${activeIncidentId ? 'flex' : 'hidden md:flex'}`}
       >
         <GreetingBar
           activeCount={openIncidents.length}
@@ -134,6 +162,11 @@ export function Dashboard() {
             incidentId={activeIncidentId}
             selectedIncident={selectedIncident}
             onRefreshParent={refreshQueue}
+            // Mobile-only "back to queue" -- on desktop (md+) the queue
+            // is always visible alongside the detail pane, so a visible
+            // back button there would be redundant.
+            onBack={() => setActiveIncidentId(null)}
+            backButtonMobileOnly
           />
         </div>
       </motion.main>

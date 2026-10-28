@@ -1,15 +1,24 @@
 import { useEffect, useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Search, ListChecks } from 'lucide-react';
+import { Search, ListChecks, AlertTriangle, RefreshCw } from 'lucide-react';
 import { severityPill, statusBadge, formatElapsedSeconds, EmptyState } from '../../components/dashboard/shared';
+import { SkeletonTableRows } from '../../design-system/components/Skeleton';
 import { IncidentWorkspace } from '../../components/dashboard/IncidentWorkspace';
 import type { IncidentSummary } from '../../components/dashboard/shared';
+import { authFetch } from '../../contexts/AuthGateContext';
 
 type SortKey = 'detected_at' | 'severity' | 'status';
 
 export function IncidentsPage() {
     const [incidents, setIncidents] = useState<IncidentSummary[]>([]);
     const [loading, setLoading] = useState(true);
+    // UI MODERNIZATION (Phase 7, spec Section 62): previously there was no
+    // error state at all here -- a failed fetch silently left `incidents`
+    // empty, which then rendered the exact same "No incidents found" empty
+    // state as a genuinely empty, healthy result. An operator would have
+    // no way to tell "there really are zero incidents" apart from "the API
+    // call failed and this list may be wrong/incomplete".
+    const [error, setError] = useState<string | null>(null);
     const [query, setQuery] = useState('');
     const [sortKey, setSortKey] = useState<SortKey>('detected_at');
     // Selecting an incident now shows its full workspace INLINE, right here
@@ -22,11 +31,15 @@ export function IncidentsPage() {
 
     const fetchAll = async () => {
         try {
-            const res = await fetch('/api/v2/incidents?state=all');
+            const res = await authFetch('/api/v2/incidents?state=all');
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const data = await res.json();
-            if (Array.isArray(data)) setIncidents(data);
-        } catch {
-            // ignore
+            if (Array.isArray(data)) {
+                setIncidents(data);
+                setError(null);
+            }
+        } catch (e) {
+            setError(e instanceof Error ? e.message : 'Failed to load incidents');
         } finally {
             setLoading(false);
         }
@@ -110,48 +123,117 @@ export function IncidentsPage() {
                 </div>
             </div>
 
+            {/*
+             * Consistent with the Dashboard's queue fix (Phase 6): a
+             * polling failure after we already have real data should NOT
+             * hide that data behind a full error screen -- it should keep
+             * showing it (possibly stale) with a small inline warning. The
+             * full-screen error treatment only applies to the FIRST load
+             * failing, where there's no prior data to fall back to.
+             */}
+            {error && incidents.length > 0 && (
+                <div className="mb-4 px-3 py-2 rounded-lg bg-warning/10 ring-1 ring-warning/25 flex items-center gap-2">
+                    <AlertTriangle className="w-3.5 h-3.5 text-warning flex-shrink-0" />
+                    <p className="text-[11.5px] text-warning flex-1">Lost connection on the last refresh -- showing last known data.</p>
+                    <button onClick={() => void fetchAll()} className="text-[11px] font-medium text-warning hover:underline flex-shrink-0">Retry</button>
+                </div>
+            )}
+            {/*
+             * UI MODERNIZATION (Phase 12, spec Section 38/63): replaced
+             * a plain "Loading incidents…" text row with a structural
+             * skeleton that approximates the real table shape (5 columns
+             * matching the actual header below), per spec guidance to
+             * use skeletons for predictable structures like tables.
+             */}
             {loading ? (
-                <div className="text-[13px] text-text-muted py-10 text-center">Loading incidents…</div>
+                // UI MODERNIZATION (spec Section 58 -- responsive audit):
+                // this table previously had no overflow-x-auto wrapper at
+                // all (unlike every correctly-built Admin table), so at
+                // narrow viewports its 5 fixed columns had no horizontal
+                // scroll affordance -- real risk of either clipped
+                // content (overflow-hidden on the parent) or page-level
+                // horizontal overflow, both explicitly flagged by the
+                // spec. Added the same overflow-x-auto wrapper pattern
+                // already used correctly elsewhere.
+                <div className="glass-panel rounded-2xl overflow-hidden ring-1 ring-white/[0.06]">
+                    <div className="overflow-x-auto">
+                        <table className="w-full text-left">
+                            <thead>
+                                <tr className="border-b border-white/[0.06] text-[11px] font-semibold uppercase tracking-wide text-text-muted">
+                                    <th className="px-4 py-3">Severity</th>
+                                    <th className="px-4 py-3">Incident</th>
+                                    <th className="px-4 py-3">Status</th>
+                                    <th className="px-4 py-3">Owner</th>
+                                    <th className="px-4 py-3">Elapsed</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <SkeletonTableRows columns={5} rows={6} />
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            ) : error && incidents.length === 0 ? (
+                <div className="mt-10">
+                    <EmptyState
+                        icon={<AlertTriangle className="w-5 h-5 text-critical" />}
+                        title="Couldn't load incidents"
+                        subtitle={error}
+                        action={
+                            <button
+                                onClick={() => {
+                                    setLoading(true);
+                                    void fetchAll();
+                                }}
+                                className="inline-flex items-center gap-1.5 text-[11.5px] font-medium px-3 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.07] ring-1 ring-white/[0.08] text-text-secondary hover:text-text-primary transition-colors"
+                            >
+                                <RefreshCw className="w-3.5 h-3.5" /> Retry
+                            </button>
+                        }
+                    />
+                </div>
             ) : filtered.length === 0 ? (
                 <div className="mt-10">
                     <EmptyState icon={<ListChecks className="w-5 h-5" />} title="No incidents found" subtitle="Try a different search or wait for new alerts to arrive." />
                 </div>
             ) : (
                 <div className="glass-panel rounded-2xl overflow-hidden ring-1 ring-white/[0.06]">
-                    <table className="w-full text-left">
-                        <thead>
-                            <tr className="border-b border-white/[0.06] text-[11px] font-semibold uppercase tracking-wide text-text-muted">
-                                <th className="px-4 py-3">Severity</th>
-                                <th className="px-4 py-3">Incident</th>
-                                <th className="px-4 py-3">Status</th>
-                                <th className="px-4 py-3">Owner</th>
-                                <th className="px-4 py-3">Elapsed</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {filtered.map((inc, idx) => (
-                                <motion.tr
-                                    key={inc.incident_id}
-                                    initial={{ opacity: 0 }}
-                                    animate={{ opacity: 1 }}
-                                    transition={{ delay: idx * 0.02 }}
-                                    onClick={() => setSelectedId(inc.incident_id)}
-                                    className="border-b border-white/[0.04] last:border-b-0 hover:bg-white/[0.02] cursor-pointer transition-colors"
-                                >
-                                    <td className="px-4 py-3">{severityPill(inc.severity)}</td>
-                                    <td className="px-4 py-3 min-w-0">
-                                        <div className="text-[13px] font-medium text-text-primary truncate max-w-[360px]">{inc.title}</div>
-                                        <div className="text-[10.5px] font-mono text-text-muted mt-0.5">{inc.incident_id}</div>
-                                    </td>
-                                    <td className="px-4 py-3">{statusBadge(inc.status)}</td>
-                                    <td className="px-4 py-3 text-[12.5px] text-text-secondary">{inc.owner_team || '—'}</td>
-                                    <td className="px-4 py-3 text-[12.5px] font-mono text-text-secondary">
-                                        {formatElapsedSeconds(inc.detected_at, inc.resolved_at)}
-                                    </td>
-                                </motion.tr>
-                            ))}
-                        </tbody>
-                    </table>
+                    <div className="overflow-x-auto">
+                        <table className="w-full text-left">
+                            <thead>
+                                <tr className="border-b border-white/[0.06] text-[11px] font-semibold uppercase tracking-wide text-text-muted">
+                                    <th className="px-4 py-3">Severity</th>
+                                    <th className="px-4 py-3">Incident</th>
+                                    <th className="px-4 py-3">Status</th>
+                                    <th className="px-4 py-3">Owner</th>
+                                    <th className="px-4 py-3">Elapsed</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {filtered.map((inc, idx) => (
+                                    <motion.tr
+                                        key={inc.incident_id}
+                                        initial={{ opacity: 0 }}
+                                        animate={{ opacity: 1 }}
+                                        transition={{ delay: idx * 0.02 }}
+                                        onClick={() => setSelectedId(inc.incident_id)}
+                                        className="border-b border-white/[0.04] last:border-b-0 hover:bg-white/[0.02] cursor-pointer transition-colors"
+                                    >
+                                        <td className="px-4 py-3">{severityPill(inc.severity)}</td>
+                                        <td className="px-4 py-3 min-w-0">
+                                            <div className="text-[13px] font-medium text-text-primary truncate max-w-[360px]">{inc.title}</div>
+                                            <div className="text-[10.5px] font-mono text-text-muted mt-0.5">{inc.incident_id}</div>
+                                        </td>
+                                        <td className="px-4 py-3">{statusBadge(inc.status)}</td>
+                                        <td className="px-4 py-3 text-[12.5px] text-text-secondary">{inc.owner_team || '—'}</td>
+                                        <td className="px-4 py-3 text-[12.5px] font-mono text-text-secondary">
+                                            {formatElapsedSeconds(inc.detected_at, inc.resolved_at)}
+                                        </td>
+                                    </motion.tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
                 </div>
             )}
         </div>

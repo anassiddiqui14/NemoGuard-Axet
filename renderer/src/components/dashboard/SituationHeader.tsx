@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
-import { PlayCircle, ShieldAlert, Clock, Users, Briefcase, Layers, AlarmClock } from 'lucide-react';
+import { PlayCircle, ShieldAlert, Clock, Users, Briefcase, Layers, AlarmClock, XCircle } from 'lucide-react';
 import { LifecycleStepper, formatElapsedSeconds, severityPill, statusBadge } from './shared';
+import { Button } from '../../design-system/components/Button';
 import type { IncidentSummary } from './shared';
 
 interface Props {
@@ -11,6 +12,14 @@ interface Props {
     hypothesis: any;
     triageStarting: boolean;
     handleStartTriage: () => void;
+    // Cancelling is a distinct, human-in-the-loop lifecycle exit available at
+    // any point while an incident is still open — previously there was NO
+    // way to cancel an incident from the UI at all once it was created,
+    // regardless of stage (before a plan exists, awaiting approval, etc.),
+    // even though the backend has supported POST /cancel (a real Temporal
+    // signal, not a fake status flip) since WP-009's predecessor work.
+    onCancelIncident?: () => void;
+    cancelling?: boolean;
 }
 
 function Metric({ icon, label, value, sub, accent }: { icon: React.ReactNode; label: string; value: React.ReactNode; sub: string; accent?: string }) {
@@ -18,7 +27,7 @@ function Metric({ icon, label, value, sub, accent }: { icon: React.ReactNode; la
         <motion.div
             initial={{ opacity: 0, y: 6 }}
             animate={{ opacity: 1, y: 0 }}
-            className="relative rounded-xl p-3.5 bg-white/[0.02] ring-1 ring-white/[0.05] overflow-hidden group hover:ring-white/[0.09] hover:-translate-y-0.5 transition-all duration-200"
+            className="interactive-surface relative rounded-xl p-3.5 bg-white/[0.02] ring-1 ring-white/[0.05] overflow-hidden group"
         >
             <div className="flex items-center gap-1.5 mb-2">
                 <span className={`${accent || 'text-text-muted'}`}>{icon}</span>
@@ -88,16 +97,25 @@ function SlaBreachCard({ incident, impact }: { incident: IncidentSummary; impact
     );
 }
 
-export function SituationHeader({ selectedIncident, alerts, impact, hypothesis, triageStarting, handleStartTriage }: Props) {
+export function SituationHeader({ selectedIncident, alerts, impact, hypothesis, triageStarting, handleStartTriage, onCancelIncident, cancelling }: Props) {
     const status = selectedIncident?.status?.toUpperCase() || '';
     const canTriage = selectedIncident && (status === 'DETECTED' || status === '');
+    // The backend's IncidentState machine (src/domain/state_machine.py)
+    // deliberately only permits CANCELLED as an outgoing transition from
+    // AWAITING_APPROVAL, not from every open state — cancelling mid-agent
+    // investigation isn't a supported operation (the agents own that phase;
+    // there's nothing running yet to safely tear down). Gating the button on
+    // the same condition the backend actually enforces avoids presenting a
+    // control that would otherwise fail with an HTTP 409 for every other
+    // open status (DETECTED, INVESTIGATING, PLAN_READY, etc.).
+    const canCancel = selectedIncident?.status?.toUpperCase() === 'AWAITING_APPROVAL' && !!onCancelIncident;
 
     return (
         <motion.div
             initial={{ opacity: 0, y: 8 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.25 }}
-            className="glass-panel rounded-2xl p-5 lg:p-6 relative"
+            className="console-surface rounded-2xl p-5 lg:p-6 relative overflow-hidden"
         >
             <div className="flex flex-col lg:flex-row items-start justify-between gap-4 mb-5">
                 <div className="min-w-0 w-full lg:flex-1">
@@ -134,16 +152,41 @@ export function SituationHeader({ selectedIncident, alerts, impact, hypothesis, 
                         </div>
                     )}
 
-                    {canTriage && (
-                        <button
-                            onClick={handleStartTriage}
-                            disabled={triageStarting}
-                            className="press-scale inline-flex items-center gap-2 text-[13px] px-4 py-2 rounded-xl bg-gradient-to-r from-primary to-agent-active text-white hover:brightness-110 transition font-semibold disabled:opacity-60 shadow-lg shadow-primary/20"
-                        >
-                            <PlayCircle className="w-4 h-4" />
-                            {triageStarting ? 'Starting investigation…' : 'Start Triage Now'}
-                        </button>
-                    )}
+                    <div className="flex items-center gap-2.5 flex-wrap">
+                        {/*
+                         * UI MODERNIZATION (Phase 9, spec Section 42): these
+                         * two buttons previously swapped their label text
+                         * on loading ("Start Triage Now" -> "Starting
+                         * investigation…") with NO visual spinner at all --
+                         * easy to miss, especially on a slow network. The
+                         * shared Button primitive's `loading` prop swaps in
+                         * a real animated spinner while preserving layout
+                         * width, consistent with every other migrated
+                         * loading button in the app.
+                         */}
+                        {canTriage && (
+                            <Button
+                                onClick={handleStartTriage}
+                                loading={triageStarting}
+                                leadingIcon={<PlayCircle className="w-4 h-4" />}
+                                className="!bg-gradient-to-r !from-primary !to-agent-active shadow-lg shadow-primary/20"
+                            >
+                                {triageStarting ? 'Starting investigation…' : 'Start Triage Now'}
+                            </Button>
+                        )}
+
+                        {canCancel && (
+                            <Button
+                                variant="danger"
+                                onClick={onCancelIncident}
+                                loading={cancelling}
+                                leadingIcon={<XCircle className="w-4 h-4" />}
+                                title="Stand this incident down without executing a recovery plan."
+                            >
+                                {cancelling ? 'Cancelling…' : 'Cancel Incident'}
+                            </Button>
+                        )}
+                    </div>
                 </div>
 
                 {selectedIncident && status !== 'RESOLVED' && <SlaBreachCard incident={selectedIncident} impact={impact} />}

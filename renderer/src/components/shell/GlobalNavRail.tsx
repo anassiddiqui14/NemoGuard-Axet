@@ -1,18 +1,9 @@
 import { NavLink } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { LayoutGrid, ListChecks, Cpu, Sparkles, Settings, BrainCircuit } from 'lucide-react';
-import { LATEST_CHANGELOG_VERSION } from '../../data/changelog';
-
-interface NavItem {
-    to: string;
-    label: string;
-    icon: React.ReactNode;
-    end?: boolean;
-    badge?: boolean;
-}
+import { useNavItems } from '../../hooks/useNavItems';
+import { Tooltip } from '../../design-system/components/Tooltip';
 
 interface Props {
-    hasUnseenChangelog: boolean;
     collapsed: boolean;
 }
 
@@ -23,16 +14,13 @@ interface Props {
  * shrinks it down to an icon-only rail instead of hiding it completely, so
  * the current section is always visible at a glance and switching sections
  * never costs more than a single click.
+ *
+ * Icons are the bespoke NemoGuard glyph set (NemoIcons.tsx) that shares the
+ * perimeter-watch frame from the primary brand mark, rather than generic
+ * icon-library glyphs.
  */
-export function GlobalNavRail({ hasUnseenChangelog, collapsed }: Props) {
-    const items: NavItem[] = [
-        { to: '/app', label: 'Command Center', icon: <LayoutGrid className="w-4.5 h-4.5" />, end: true },
-        { to: '/app/incidents', label: 'Incidents', icon: <ListChecks className="w-4.5 h-4.5" /> },
-        { to: '/app/agent-operations', label: 'Agent Operations', icon: <Cpu className="w-4.5 h-4.5" /> },
-        { to: '/app/intelligence', label: 'Intelligence', icon: <BrainCircuit className="w-4.5 h-4.5" /> },
-        { to: '/app/whats-new', label: "What's New", icon: <Sparkles className="w-4.5 h-4.5" />, badge: hasUnseenChangelog },
-        { to: '/app/settings', label: 'Settings', icon: <Settings className="w-4.5 h-4.5" /> },
-    ];
+export function GlobalNavRail({ collapsed }: Props) {
+    const items = useNavItems();
 
     return (
         <motion.aside
@@ -42,43 +30,49 @@ export function GlobalNavRail({ hasUnseenChangelog, collapsed }: Props) {
             className="hidden md:flex flex-col flex-shrink-0 h-full border-r border-white/[0.06] bg-black/20 overflow-hidden"
         >
             <nav className={`flex-1 py-3 space-y-1 overflow-y-auto ${collapsed ? 'px-2' : 'px-2.5'}`}>
-                {items.map((item) => (
-                    <NavLink
-                        key={item.to}
-                        to={item.to}
-                        end={item.end}
-                        title={collapsed ? item.label : undefined}
-                        className={({ isActive }) =>
-                            `relative flex items-center gap-3 px-3 py-2.5 rounded-xl transition-colors ${collapsed ? 'justify-center' : ''} ${isActive
-                                ? 'bg-primary/[0.12] text-primary ring-1 ring-primary/25'
-                                : 'text-text-secondary hover:bg-white/[0.04] hover:text-text-primary'
-                            }`
-                        }
-                    >
-                        {({ isActive }) => (
-                            <>
-                                {isActive && (
-                                    <motion.div
-                                        layoutId="nav-active-rail"
-                                        className="absolute left-0 top-1.5 bottom-1.5 w-[3px] rounded-full bg-gradient-to-b from-primary to-agent-active"
-                                    />
-                                )}
-                                <span className="flex-shrink-0 relative">
-                                    {item.icon}
-                                    {item.badge && (
-                                        <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-critical ring-2 ring-surface" />
+                {items.map((item) => {
+                    const link = (
+                        <NavLink
+                            key={item.to}
+                            to={item.to}
+                            end={item.end}
+                            className={({ isActive }) =>
+                                `relative flex items-center gap-3 px-3 py-2.5 rounded-xl transition-colors w-full ${collapsed ? 'justify-center' : ''} ${isActive
+                                    ? 'bg-primary/[0.12] text-primary ring-1 ring-primary/25'
+                                    : 'text-text-secondary hover:bg-white/[0.04] hover:text-text-primary'
+                                }`
+                            }
+                        >
+                            {({ isActive }) => (
+                                <>
+                                    {isActive && (
+                                        <motion.div
+                                            layoutId="nav-active-rail"
+                                            className="absolute left-0 top-1.5 bottom-1.5 w-[3px] rounded-full bg-gradient-to-b from-primary to-agent-active"
+                                        />
                                     )}
-                                </span>
-                                {!collapsed && <span className="text-[13px] font-medium whitespace-nowrap">{item.label}</span>}
-                            </>
-                        )}
-                    </NavLink>
-                ))}
+                                    <span className="flex-shrink-0">{item.icon}</span>
+                                    {!collapsed && <span className="text-[13px] font-medium whitespace-nowrap">{item.label}</span>}
+                                </>
+                            )}
+                        </NavLink>
+                    );
+                    // UI MODERNIZATION (Phase 18, spec Section 73): collapsed
+                    // rail icons previously relied solely on the native HTML
+                    // `title` attribute -- the browser's own slow (~1s delay),
+                    // unstyled, cross-browser-inconsistent tooltip. Wrapped in
+                    // the themed Tooltip primitive instead, only when
+                    // collapsed (expanded state already shows the label
+                    // inline, so a tooltip there would be redundant).
+                    return collapsed ? (
+                        <Tooltip key={item.to} label={item.label} side="right">
+                            {link}
+                        </Tooltip>
+                    ) : (
+                        link
+                    );
+                })}
             </nav>
         </motion.aside>
     );
-}
-
-export function useLatestChangelogVersion() {
-    return LATEST_CHANGELOG_VERSION;
 }

@@ -1,58 +1,136 @@
 @import "tailwindcss";
 
+/*
+ * PHASE 1 FIX (NemoGuard UI Modernization Spec, Section 10/48/9):
+ * tailwind.config.js is DEAD CODE. Tailwind v4's CSS-first config model only
+ * loads a JS config file when explicitly referenced via `@config "..."` in
+ * this file -- no such directive exists here, so tailwind.config.js (with
+ * its fontFamily extension mapping font-sans/font-mono to Inter/JetBrains
+ * Mono, and its stale dark-only hex color values) was never actually
+ * applied. Verified against built CSS output: `.font-mono` resolved to
+ * Tailwind's generic `ui-monospace, SFMono-Regular...` stack, not JetBrains
+ * Mono -- meaning every incident ID / timestamp / technical-metadata string
+ * across ~19 files using `font-mono` was silently rendering in the
+ * visitor's OS default monospace font instead of the intended typeface,
+ * even though JetBrains Mono IS correctly loaded as a webfont in
+ * index.html. Restoring the font-family theme mapping directly here (the
+ * actual active config source) fixes this for every call site at once with
+ * zero component changes required.
+ */
 @theme {
-  /* Default (dark) theme tokens */
-  --color-app-bg: #030308;
-  --color-surface: #0D0D16;
-  --color-surface-secondary: #14141F;
-  --color-surface-elevated: #191926;
-  --color-border-color: #24243380;
-  --color-border-strong: #34344a;
-  --color-text-primary: #F5F5FA;
-  --color-text-secondary: #A0A0B8;
-  --color-text-muted: #6B6B82;
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 
-  --color-primary: #6366F1;
-  --color-primary-glow: rgba(99, 102, 241, 0.45);
+  /*
+   * BRAND IDENTITY OVERHAUL: previously indigo (#6366F1) + magenta
+   * (#C026D3) -- a palette near-indistinguishable from most generic
+   * "AI SaaS" dashboard templates. NemoGuard's own name point to a
+   * genuine, ownable concept: a vessel watching from the deep. The
+   * primary accent is now a deep sonar teal/cyan (not a desaturated
+   * "safe" teal -- a real, saturated signal color) instead of indigo,
+   * which reads as distinctly NemoGuard rather than interchangeable
+   * with any other product. Magenta is kept ONLY as the secondary
+   * "agent" accent (now shifted slightly warmer/pinker to contrast
+   * more clearly against the new teal primary) rather than being one
+   * of two near-equal primary brand colors.
+   */
+  --color-app-bg: #040B0D;
+  --color-surface: #0A1619;
+  --color-surface-secondary: #0F1E22;
+  --color-surface-elevated: #13262B;
+  --color-border-color: #1D373D80;
+  --color-border-strong: #2A4A50;
+  --color-text-primary: #F2FAFA;
+  --color-text-secondary: #9DBAC0;
+  --color-text-muted: #5E7F85;
 
-  --color-agent-active: #C026D3;
-  --color-healthy: #22D3A0;
-  --color-warning: #FBBF24;
-  --color-critical: #FB4570;
-  --color-info: #38BDF8;
+  --color-primary: #0EA5A8;
+  --color-primary-glow: rgba(14, 165, 168, 0.45);
+
+  --color-agent-active: #D6499B;
+  --color-healthy: #2DD4A8;
+  --color-warning: #F2B84B;
+  --color-critical: #F35B6B;
+  --color-info: #3FB8E0;
 }
 
 :root {
-  --panel-bg: rgba(20, 20, 31, 0.55);
+  --panel-bg: rgba(10, 22, 25, 0.55);
   --panel-border: rgba(255, 255, 255, 0.06);
-  --glow-primary: rgba(99, 102, 241, 0.12);
-  --glow-agent: rgba(192, 38, 211, 0.08);
+  --glow-primary: rgba(14, 165, 168, 0.14);
+  --glow-agent: rgba(214, 73, 155, 0.08);
+
+  /*
+   * UI MODERNIZATION (spec Section 53 -- chart theming): a dedicated,
+   * reusable token set for recharts/any future chart library, decoupled
+   * from the raw --color-* tokens so a chart's palette can be tuned
+   * independently of the rest of the UI without touching every chart
+   * call site. Mapped 1:1 onto the existing semantic colors by default
+   * (dark theme) -- see the :root.light override below for the light
+   * equivalent. This fixes the exact bug found and corrected in
+   * InvestigationPanels.tsx's radar chart (hardcoded #14141F/rgba(255,
+   * 255,255,...) values that never adapted to light mode) by giving
+   * every future chart a single, already-theme-aware source to pull
+   * from instead of hand-rolling raw rgba() values per chart.
+   */
+  --chart-primary: var(--color-primary);
+  --chart-secondary: var(--color-agent-active);
+  --chart-positive: var(--color-healthy);
+  --chart-warning: var(--color-warning);
+  --chart-critical: var(--color-critical);
+  --chart-neutral: var(--color-text-muted);
+  --chart-grid: var(--panel-border);
+  --chart-tooltip-bg: var(--color-surface-elevated);
+  --chart-tooltip-border: var(--panel-border);
+  --chart-tooltip-text: var(--color-text-primary);
+  --chart-axis-text: var(--color-text-muted);
 }
 
 :root.light {
-  --color-app-bg: #F4F5FA;
+  /*
+   * BRAND IDENTITY OVERHAUL (light mode): the dark theme's deep-teal
+   * surfaces are rebalanced here to a cool slate-cyan tint rather than
+   * the previous neutral gray -- light mode should still clearly feel
+   * like the same product, not a palette-swapped "default Tailwind
+   * light theme" fallback.
+   */
+  --color-app-bg: #F2F8F8;
   --color-surface: #FFFFFF;
-  --color-surface-secondary: #F0F1F7;
+  --color-surface-secondary: #ECF5F5;
   --color-surface-elevated: #FFFFFF;
-  --color-border-color: #E2E4EE;
-  --color-border-strong: #C7CBDD;
-  --color-text-primary: #14141F;
-  --color-text-secondary: #4B4D63;
-  --color-text-muted: #7A7C93;
+  --color-border-color: #D6E6E6;
+  --color-border-strong: #B8D2D2;
+  --color-text-primary: #0F2426;
+  --color-text-secondary: #3F5E61;
+  --color-text-muted: #6E8C8F;
 
-  --color-primary: #5457E5;
-  --color-primary-glow: rgba(84, 87, 229, 0.25);
+  --color-primary: #0A8D8F;
+  --color-primary-glow: rgba(10, 141, 143, 0.25);
 
-  --color-agent-active: #A21CAF;
+  --color-agent-active: #B32E7E;
   --color-healthy: #0D9C74;
   --color-warning: #B45309;
   --color-critical: #DC2650;
   --color-info: #0284C7;
 
   --panel-bg: rgba(255, 255, 255, 0.75);
-  --panel-border: rgba(20, 20, 31, 0.08);
-  --glow-primary: rgba(84, 87, 229, 0.08);
-  --glow-agent: rgba(162, 28, 175, 0.06);
+  --panel-border: rgba(15, 36, 38, 0.08);
+  --glow-primary: rgba(10, 141, 143, 0.08);
+  --glow-agent: rgba(179, 46, 126, 0.06);
+
+  /* Light-mode chart tokens -- same mapping, resolves to the already-
+     light-adjusted semantic colors defined above in this same block. */
+  --chart-primary: var(--color-primary);
+  --chart-secondary: var(--color-agent-active);
+  --chart-positive: var(--color-healthy);
+  --chart-warning: var(--color-warning);
+  --chart-critical: var(--color-critical);
+  --chart-neutral: var(--color-text-muted);
+  --chart-grid: var(--panel-border);
+  --chart-tooltip-bg: var(--color-surface-elevated);
+  --chart-tooltip-border: var(--panel-border);
+  --chart-tooltip-text: var(--color-text-primary);
+  --chart-axis-text: var(--color-text-muted);
 }
 
 @layer base {
@@ -97,6 +175,84 @@
     backdrop-filter: blur(20px) saturate(140%);
     -webkit-backdrop-filter: blur(20px) saturate(140%);
     border: 1px solid var(--panel-border);
+    box-shadow: 0 12px 32px -20px rgba(0, 0, 0, 0.65);
+  }
+
+  /*
+   * Floating dropdown/popover menus (user menu, notifications) sit above
+   * arbitrary page content rather than a single flat background, so the
+   * semi-transparent glass-panel treatment reads as washed-out/see-through
+   * in these contexts -- especially in light mode where --panel-bg is a
+   * light, low-opacity white. menu-panel uses a solid (opaque) surface
+   * color instead of a translucent one, while keeping the same blur/
+   * shadow/border language as the rest of the app's floating surfaces.
+   */
+  .menu-panel {
+    background: var(--color-surface-elevated);
+    border: 1px solid var(--panel-border);
+    box-shadow: 0 20px 44px -22px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(0, 0, 0, 0.04);
+  }
+
+  .console-surface {
+    background:
+      linear-gradient(145deg, rgba(255, 255, 255, 0.045), transparent 38%),
+      var(--panel-bg);
+    backdrop-filter: blur(20px) saturate(140%);
+    -webkit-backdrop-filter: blur(20px) saturate(140%);
+    border: 1px solid var(--panel-border);
+    box-shadow: 0 16px 40px -26px rgba(0, 0, 0, 0.8);
+  }
+
+  .interactive-surface {
+    transition: transform 180ms ease, background-color 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
+  }
+
+  .interactive-surface:hover {
+    transform: translateY(-2px);
+    border-color: color-mix(in srgb, var(--color-primary) 30%, var(--panel-border));
+    box-shadow: 0 18px 36px -25px rgba(0, 0, 0, 0.9), 0 0 0 1px rgba(14, 165, 168, 0.08);
+  }
+
+  .focus-ring {
+    outline: none;
+  }
+
+  .focus-ring:focus-visible {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-primary) 32%, transparent);
+  }
+
+  /*
+   * UI MODERNIZATION (Phase 8, spec Section 57): a global focus-visible
+   * safety net. Audited the codebase and found only 13 of 53 .tsx files
+   * use the `.focus-ring` utility above -- the remaining ~40 files'
+   * interactive elements either fall back to each browser's own
+   * inconsistent default outline, or in several places use
+   * `focus:outline-none` with NO ring replacement at all, making those
+   * controls genuinely invisible to keyboard users when focused. Rather
+   * than risk a large, unreviewed find-and-replace across every one of
+   * those files, this global rule gives every focusable element in the
+   * app a consistent, theme-aware focus-visible ring by default. Elements
+   * that already explicitly opt into `.focus-ring` (the newer, more
+   * polished treatment used by the Phase 2 Button/IconButton/Modal
+   * primitives) are unaffected, since `:not(.focus-ring)` excludes them
+   * from this fallback.
+   */
+  a:focus-visible,
+  button:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible,
+  [tabindex]:focus-visible {
+    outline: none;
+  }
+
+  a:focus-visible:not(.focus-ring),
+  button:focus-visible:not(.focus-ring),
+  input:focus-visible:not(.focus-ring),
+  select:focus-visible:not(.focus-ring),
+  textarea:focus-visible:not(.focus-ring),
+  [tabindex]:focus-visible:not(.focus-ring) {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-primary) 32%, transparent);
   }
 
   .gradient-border {
@@ -110,7 +266,7 @@
     inset: 0;
     border-radius: inherit;
     padding: 1px;
-    background: linear-gradient(135deg, rgba(99, 102, 241, 0.6), rgba(192, 38, 211, 0.4), transparent 70%);
+    background: linear-gradient(135deg, rgba(14, 165, 168, 0.65), rgba(214, 73, 155, 0.4), transparent 70%);
     -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
     -webkit-mask-composite: xor;
     mask-composite: exclude;
@@ -118,18 +274,18 @@
   }
 
   .text-gradient {
-    background: linear-gradient(90deg, #A5B4FC, #F0ABFC);
+    background: linear-gradient(90deg, #5EEAD4, #F2A8CE);
     -webkit-background-clip: text;
     background-clip: text;
     color: transparent;
   }
 
   .glow-primary {
-    box-shadow: 0 0 24px 0 rgba(99, 102, 241, 0.25);
+    box-shadow: 0 0 24px 0 rgba(14, 165, 168, 0.3);
   }
 
   .glow-agent {
-    box-shadow: 0 0 24px 0 rgba(192, 38, 211, 0.25);
+    box-shadow: 0 0 24px 0 rgba(214, 73, 155, 0.25);
   }
 
   /* Micro-interaction helpers */
@@ -175,6 +331,118 @@
     background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.08), transparent);
     background-size: 200% 100%;
     animation: shimmer 1.6s ease-in-out infinite;
+  }
+
+  /*
+   * NemoGuard signal-network primitives
+   * These are deliberately quiet: they visualize coordinated handoffs and
+   * system readiness without turning an operator workflow into decoration.
+   */
+  .signal-grid {
+    background-image:
+      linear-gradient(rgba(94, 234, 212, 0.08) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(94, 234, 212, 0.08) 1px, transparent 1px);
+    background-size: 36px 36px;
+    mask-image: radial-gradient(ellipse 75% 65% at 50% 50%, black 25%, transparent 78%);
+  }
+
+  .signal-orbit {
+    animation: signalOrbit 18s linear infinite;
+    transform-origin: center;
+  }
+
+  .signal-pulse {
+    animation: signalPulse 2.8s ease-in-out infinite;
+  }
+
+  .signal-scan {
+    background: linear-gradient(90deg, transparent, rgba(94, 234, 212, 0.75), rgba(242, 168, 206, 0.55), transparent);
+    background-size: 45% 100%;
+    background-repeat: no-repeat;
+    animation: signalScan 3.6s ease-in-out infinite;
+  }
+
+  .status-breath {
+    animation: statusBreath 2.4s ease-in-out infinite;
+  }
+
+  @keyframes signalOrbit {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  @keyframes signalPulse {
+
+    0%,
+    100% {
+      opacity: 0.35;
+      transform: scale(0.9);
+    }
+
+    50% {
+      opacity: 0.95;
+      transform: scale(1.1);
+    }
+  }
+
+  @keyframes signalScan {
+    0% {
+      background-position: -50% 0;
+      opacity: 0;
+    }
+
+    20%,
+    80% {
+      opacity: 1;
+    }
+
+    100% {
+      background-position: 150% 0;
+      opacity: 0;
+    }
+  }
+
+  @keyframes statusBreath {
+
+    0%,
+    100% {
+      box-shadow: 0 0 0 0 rgba(34, 211, 160, 0.16);
+    }
+
+    50% {
+      box-shadow: 0 0 0 5px rgba(34, 211, 160, 0);
+    }
+  }
+
+  /*
+   * Commander's "thinking" status line (see CommanderPanel.tsx
+   * ShimmerText) -- a slow, subtle light sweep across text, the same
+   * restrained device Claude/Perplexity use to signal active
+   * processing without resorting to spinners or bouncing dots. A
+   * production-grade, professional treatment rather than a playful
+   * loading animation.
+   */
+  @keyframes commanderShimmer {
+    0% {
+      background-position: 200% 0;
+    }
+
+    100% {
+      background-position: -200% 0;
+    }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
   }
 }
 

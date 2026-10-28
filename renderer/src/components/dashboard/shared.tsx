@@ -113,6 +113,25 @@ export function needsAttention(status: string | undefined) {
     return up.includes('APPROVAL') || up === 'NEEDS_REVIEW';
 }
 
+// Every terminal incident status -- i.e. one where the incident is fully
+// done being worked, whatever the outcome. Mirrors the backend's own
+// "open" filter (src/api/main.py's list_incidents: `status NOT IN
+// ('RESOLVED', 'FAILED', 'CLOSED', 'CANCELLED')`). Several frontend
+// components independently re-derived their own "is this incident still
+// active" check and only ever excluded RESOLVED -- meaning a page showing
+// nothing but CANCELLED/FAILED incidents still displayed "Monitoring" /
+// "Working" system-health indicators as if a real incident were in
+// progress. Centralizing this here keeps every such check in sync with the
+// backend's actual definition of "open" going forward.
+export function isTerminalStatus(status: string | undefined) {
+    const up = status?.toUpperCase() || '';
+    return up === 'RESOLVED' || up === 'FAILED' || up === 'CLOSED' || up === 'CANCELLED';
+}
+
+export function isActiveIncident(status: string | undefined) {
+    return !isTerminalStatus(status);
+}
+
 export function EmptyState({ icon, title, subtitle, action }: { icon: React.ReactNode; title: string; subtitle?: string; action?: React.ReactNode }) {
     return (
         <div className="h-full flex flex-col items-center justify-center text-center px-6 py-8">
@@ -141,6 +160,22 @@ export function LifecycleStepper({ status }: { status: string }) {
         if (idx >= 0) return idx;
         if (current === 'TRIAGING') return 2;
         if (current === 'NEEDS_REVIEW') return 3;
+        // BUG FIX (user-reported live via screenshot): MANUAL_ACTION_REQUIRED
+        // had no entry in `steps` and matched none of the fallback checks
+        // above, so it silently fell through to the final `return 0` --
+        // showing "Detected" as the current stage for an incident that was
+        // actually 4+ hours into its lifecycle (SEV-2, 90% confidence,
+        // execution already attempted). Per the state machine
+        // (src/domain/state_machine.py), MANUAL_ACTION_REQUIRED is reachable
+        // from PLAN_READY, AWAITING_APPROVAL, or EXECUTING -- i.e. it is
+        // fundamentally a late-stage "an operator must intervene" state,
+        // not an early one. Placed at the EXECUTING/VERIFYING boundary
+        // (index 5, same position as EXECUTING) since that's the most
+        // common real trigger (an execution attempt hit a snag requiring
+        // manual action) and it is never reached before PLAN_READY.
+        if (current === 'MANUAL_ACTION_REQUIRED') return 5;
+        if (current === 'FAILED' || current === 'ROLLED_BACK') return 5;
+        if (current === 'CANCELLED') return 0;
         return 0;
     })();
     // Once the incident has reached the terminal "Resolved" step, every step

@@ -13,7 +13,7 @@ export function EvidenceShowcase() {
     const inView = useInView(ref, { once: true, margin: '-15% 0px' });
 
     return (
-        <section ref={ref} className="py-24 px-6 max-w-5xl mx-auto">
+        <section id="evidence" ref={ref} className="py-24 px-6 max-w-5xl mx-auto">
             <motion.div
                 initial={{ opacity: 0, y: 20 }}
                 animate={inView ? { opacity: 1, y: 0 } : {}}
@@ -46,7 +46,7 @@ export function EvidenceShowcase() {
                                         {h.status}
                                     </div>
                                 </div>
-                                <div className="text-[15px] font-bold tabular-nums flex-shrink-0" style={{ color: h.rank === 1 ? '#C026D3' : h.rank === 2 ? '#FBBF24' : undefined }}>
+                                <div className="text-[15px] font-bold tabular-nums flex-shrink-0" style={{ color: h.rank === 1 ? '#D6499B' : h.rank === 2 ? '#F2B84B' : undefined }}>
                                     {h.confidence}%
                                 </div>
                             </div>

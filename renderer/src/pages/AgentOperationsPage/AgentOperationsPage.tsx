@@ -3,9 +3,12 @@ import { motion } from 'framer-motion';
 import { Cpu, ChevronRight, Radio, Brain, ShieldCheck as ShieldCheckIcon } from 'lucide-react';
 import { AgentConstellation } from '../../components/AgentConstellation';
 import { LiveOperationsConsole } from '../../components/LiveOperationsConsole';
-import { severityPill, EmptyState, needsAttention } from '../../components/dashboard/shared';
+import { severityPill, EmptyState, needsAttention, isActiveIncident } from '../../components/dashboard/shared';
 import type { IncidentSummary } from '../../components/dashboard/shared';
 import type { AgentEvent } from '../../hooks/useIncidentEvents';
+import { authFetch } from '../../contexts/AuthGateContext';
+import { SkeletonBlock } from '../../design-system/components/Skeleton';
+import { AlertTriangle } from 'lucide-react';
 
 // Operational readiness row — inspired by a UI exploration on the
 // `darshan-dev` branch (an "Operations" page summarizing service
@@ -14,8 +17,13 @@ import type { AgentEvent } from '../../hooks/useIncidentEvents';
 // page is already the natural home for "is the agentic system itself
 // healthy" questions (as opposed to per-incident status).
 function ReadinessRow({ incidents }: { incidents: IncidentSummary[] }) {
-    const reviewCount = incidents.filter((i) => needsAttention(i.status)).length;
-    const activeCount = incidents.filter((i) => i.status?.toUpperCase() !== 'RESOLVED').length;
+    // Previously only excluded RESOLVED, so a queue containing nothing but
+    // CANCELLED/FAILED incidents still showed "Monitoring"/"Working" here as
+    // if real work were actively in progress. isActiveIncident() matches the
+    // backend's own definition of "open" (excludes every terminal status:
+    // RESOLVED, FAILED, CLOSED, CANCELLED).
+    const reviewCount = incidents.filter((i) => isActiveIncident(i.status) && needsAttention(i.status)).length;
+    const activeCount = incidents.filter((i) => isActiveIncident(i.status)).length;
 
     const items = [
         {
@@ -26,7 +34,7 @@ function ReadinessRow({ incidents }: { incidents: IncidentSummary[] }) {
         },
         {
             icon: <Brain className="w-4 h-4" />,
-            label: 'NemoClaw investigation agents',
+            label: 'NemoGuard investigation agents',
             status: activeCount > 0 ? 'Working' : 'Standing by',
             tone: activeCount > 0 ? ('active' as const) : ('healthy' as const),
         },
@@ -75,19 +83,32 @@ export function AgentOperationsPage() {
     const [selectedId, setSelectedId] = useState<string | null>(null);
     const [events, setEvents] = useState<AgentEvent[]>([]);
     const [loadingEvents, setLoadingEvents] = useState(false);
+    // UI MODERNIZATION (Phase 20, spec Section 62): previously both
+    // fetches here had `.catch(() => {})` -- a failure was completely
+    // silent, leaving incidents/events empty with no indication to the
+    // operator that anything had gone wrong (vs. there genuinely being no
+    // events yet). Added real error surfaces for both.
+    const [incidentsError, setIncidentsError] = useState<string | null>(null);
+    const [eventsError, setEventsError] = useState<string | null>(null);
 
     useEffect(() => {
         let cancelled = false;
         const load = () => {
-            fetch('/api/v2/incidents?state=all')
-                .then((r) => r.json())
+            authFetch('/api/v2/incidents?state=all')
+                .then((r) => {
+                    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                    return r.json();
+                })
                 .then((data) => {
                     if (!cancelled && Array.isArray(data)) {
                         setIncidents(data);
                         setSelectedId((prev) => prev ?? (data.length > 0 ? data[0].incident_id : null));
+                        setIncidentsError(null);
                     }
                 })
-                .catch(() => { });
+                .catch((e) => {
+                    if (!cancelled) setIncidentsError(e instanceof Error ? e.message : 'Failed to load incidents');
+                });
         };
         load();
         const interval = setInterval(load, 5000);
@@ -104,8 +125,11 @@ export function AgentOperationsPage() {
         }
         let cancelled = false;
         setLoadingEvents(true);
-        fetch(`/api/v2/incidents/${selectedId}/events`)
-            .then((r) => r.json())
+        authFetch(`/api/v2/incidents/${selectedId}/events`)
+            .then((r) => {
+                if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                return r.json();
+            })
             .then((data) => {
                 if (!cancelled && Array.isArray(data)) {
                     setEvents(
@@ -117,9 +141,12 @@ export function AgentOperationsPage() {
                             message: e.message || '',
                         })),
                     );
+                    setEventsError(null);
                 }
             })
-            .catch(() => { })
+            .catch((e) => {
+                if (!cancelled) setEventsError(e instanceof Error ? e.message : 'Failed to load events');
+            })
             .finally(() => {
                 if (!cancelled) setLoadingEvents(false);
             });
@@ -130,14 +157,25 @@ export function AgentOperationsPage() {
 
     const selectedIncident = incidents.find((i) => i.incident_id === selectedId) ?? null;
 
+    // UI MODERNIZATION (spec Section 30/58 -- responsive width audit):
+    // this fixed w-[280px] sidebar + flex layout had no responsive
+    // handling, exactly the same real overflow risk found and fixed on
+    // the Dashboard's IncidentQueue -- at a 375px viewport, a fixed
+    // 280px sidebar leaves under 100px for the main content. Applied
+    // the same sequential-view pattern: hide the sidebar once an
+    // incident is selected (below md), with a "Back" control to return.
     return (
         <div className="h-full flex overflow-hidden">
-            <aside className="w-[280px] flex-shrink-0 border-r border-white/[0.06] overflow-y-auto p-3">
+            <aside className={`w-[280px] flex-shrink-0 border-r border-white/[0.06] overflow-y-auto p-3 ${selectedId ? 'hidden md:block' : 'block'}`}>
                 <div className="px-2 py-2 mb-1">
                     <h2 className="text-[13px] font-semibold text-text-primary">Agent Operations</h2>
                     <p className="text-[11px] text-text-muted mt-0.5">Historical agent runs by incident</p>
                 </div>
-                {incidents.length === 0 ? (
+                {incidentsError && incidents.length === 0 ? (
+                    <div className="px-3 py-3 flex items-start gap-2 text-[11.5px] text-critical bg-critical/10 ring-1 ring-critical/25 rounded-lg mx-1">
+                        <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" /> {incidentsError}
+                    </div>
+                ) : incidents.length === 0 ? (
                     <div className="px-2 py-8 text-center text-[12px] text-text-muted">No incidents yet.</div>
                 ) : (
                     incidents.map((inc) => (
@@ -162,7 +200,15 @@ export function AgentOperationsPage() {
                 )}
             </aside>
 
-            <main className="flex-1 overflow-y-auto p-6">
+            <main className={`flex-1 overflow-y-auto p-6 ${selectedId ? 'block' : 'hidden md:block'}`}>
+                {selectedId && (
+                    <button
+                        onClick={() => setSelectedId(null)}
+                        className="focus-ring press-scale md:hidden mb-4 inline-flex items-center gap-1.5 text-[12.5px] font-medium text-text-secondary hover:text-text-primary px-3 py-1.5 rounded-lg hover:bg-white/[0.04] transition-colors"
+                    >
+                        ← Back to incidents
+                    </button>
+                )}
                 <ReadinessRow incidents={incidents} />
                 {!selectedIncident ? (
                     <EmptyState icon={<Cpu className="w-5 h-5" />} title="No incident selected" subtitle="Choose an incident from the list to review its agent activity." />
@@ -186,7 +232,15 @@ export function AgentOperationsPage() {
                                 Full Event History
                             </div>
                             {loadingEvents ? (
-                                <div className="p-6 text-[12.5px] text-text-muted">Loading events…</div>
+                                <div className="p-5 space-y-2.5">
+                                    {Array.from({ length: 5 }).map((_, i) => (
+                                        <SkeletonBlock key={i} className="h-4 w-full" />
+                                    ))}
+                                </div>
+                            ) : eventsError ? (
+                                <div className="p-5 flex items-start gap-2 text-[12px] text-critical">
+                                    <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" /> {eventsError}
+                                </div>
                             ) : (
                                 <LiveOperationsConsole events={events} status="connected" />
                             )}

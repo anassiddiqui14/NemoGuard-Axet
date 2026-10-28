@@ -3,6 +3,8 @@ import { motion } from 'framer-motion';
 import { Layers, AlertOctagon, FileSearch, Clock3, ShieldCheck, TrendingUp } from 'lucide-react';
 import { fadeInUp, severityPill, needsAttention, EmptyState } from '../../components/dashboard/shared';
 import type { IncidentSummary } from '../../components/dashboard/shared';
+import { authFetch } from '../../contexts/AuthGateContext';
+import { SkeletonCard } from '../../design-system/components/Skeleton';
 
 // The "Intelligence" page — a decision-ready, at-a-glance risk overview
 // across the whole incident response system, distinct from the per-
@@ -92,15 +94,27 @@ export function IntelligencePage() {
     const [openIncidents, setOpenIncidents] = useState<IncidentSummary[]>([]);
     const [resolvedToday, setResolvedToday] = useState(0);
     const [loading, setLoading] = useState(true);
+    // UI MODERNIZATION (Phase 21, spec Section 62): this page explicitly
+    // bills itself as a "decision-ready, at-a-glance risk overview" --
+    // but a failed fetch previously silently reset openIncidents to []
+    // in the catch block, which then rendered every stat card as a
+    // reassuring "0" and the "No active incidents, the queue is clear"
+    // empty state. A manager glancing at this page during an actual API
+    // outage would see the exact opposite of reality: a false "all
+    // clear" at the worst possible moment. Added a real error state,
+    // and (consistent with every other polling surface fixed so far)
+    // kept whatever last-known-good data existed rather than wiping it.
+    const [error, setError] = useState<string | null>(null);
 
     useEffect(() => {
         let cancelled = false;
         const load = async () => {
             try {
                 const [openRes, allRes] = await Promise.all([
-                    fetch('/api/v2/incidents?state=open'),
-                    fetch('/api/v2/incidents?state=all'),
+                    authFetch('/api/v2/incidents?state=open'),
+                    authFetch('/api/v2/incidents?state=all'),
                 ]);
+                if (!openRes.ok || !allRes.ok) throw new Error(`HTTP ${openRes.status}/${allRes.status}`);
                 const openData = (await openRes.json()) as IncidentSummary[];
                 const allData = (await allRes.json()) as IncidentSummary[];
                 if (cancelled) return;
@@ -112,8 +126,9 @@ export function IntelligencePage() {
                     ).length
                     : 0;
                 setResolvedToday(resolvedTodayCount);
-            } catch {
-                setOpenIncidents([]);
+                setError(null);
+            } catch (e) {
+                if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load risk data');
             } finally {
                 if (!cancelled) setLoading(false);
             }
@@ -145,52 +160,73 @@ export function IntelligencePage() {
 
     return (
         <div className="h-full overflow-y-auto p-6">
-            <motion.div
-                initial={{ opacity: 0, y: -8 }}
-                animate={{ opacity: 1, y: 0 }}
-                className="rounded-2xl p-6 mb-6 bg-gradient-to-br from-primary/[0.08] via-agent-active/[0.05] to-transparent ring-1 ring-white/[0.06]"
-            >
-                <div className="text-[11px] font-bold text-primary uppercase tracking-wider mb-2">Intelligence</div>
-                <h1 className="text-[22px] font-bold text-text-primary leading-tight">Understand risk across your response system.</h1>
-                <p className="text-[13px] text-text-secondary mt-1.5 max-w-xl">
+            {/*
+             * UI MODERNIZATION (spec Section 70 -- page header system):
+             * previously a decorative gradient hero panel with a 22px
+             * bold marketing-style tagline ("Understand risk across your
+             * response system.") -- precisely the anti-pattern the spec
+             * explicitly names: "Do not repeat giant marketing-style
+             * headings inside /app." Replaced with the same restrained
+             * page-header pattern already used consistently on
+             * AdminPage/IncidentsPage/SettingsPage/ScenarioCockpitPage
+             * (title + one-line description, no decorative gradient
+             * panel), for a page that otherwise behaves and reads like
+             * any other operational dashboard view.
+             */}
+            <div className="mb-5">
+                <h1 className="text-xl font-semibold text-text-primary tracking-tight">Intelligence</h1>
+                <p className="text-[13px] text-text-muted mt-1">
                     A decision-ready snapshot of incident pressure, safety controls, and investigation coverage.
                 </p>
-            </motion.div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-                <StatCard
-                    icon={<Layers className="w-4.5 h-4.5" />}
-                    value={metrics.activeIncidents}
-                    label="Active incidents"
-                    sublabel="in the response queue"
-                    tone="default"
-                    delay={0}
-                />
-                <StatCard
-                    icon={<AlertOctagon className="w-4.5 h-4.5" />}
-                    value={metrics.criticalRisk}
-                    label="Critical risk"
-                    sublabel="SEV-1 incidents"
-                    tone="critical"
-                    delay={0.05}
-                />
-                <StatCard
-                    icon={<FileSearch className="w-4.5 h-4.5" />}
-                    value={metrics.reviewRequired}
-                    label="Review required"
-                    sublabel="plans awaiting human sign-off"
-                    tone="warning"
-                    delay={0.1}
-                />
-                <StatCard
-                    icon={<ShieldCheck className="w-4.5 h-4.5" />}
-                    value={metrics.resolvedToday}
-                    label="Resolved today"
-                    sublabel="verified recoveries"
-                    tone="healthy"
-                    delay={0.15}
-                />
             </div>
+
+            {error && (
+                <div className="mb-4 px-3 py-2 rounded-lg bg-critical/10 ring-1 ring-critical/25 flex items-center gap-2 text-[12px] text-critical">
+                    <AlertOctagon className="w-3.5 h-3.5 flex-shrink-0" />
+                    Couldn't refresh risk data -- figures below may be stale. {error}
+                </div>
+            )}
+
+            {loading && openIncidents.length === 0 ? (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                    {Array.from({ length: 4 }).map((_, i) => <SkeletonCard key={i} />)}
+                </div>
+            ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                    <StatCard
+                        icon={<Layers className="w-4.5 h-4.5" />}
+                        value={metrics.activeIncidents}
+                        label="Active incidents"
+                        sublabel="in the response queue"
+                        tone="default"
+                        delay={0}
+                    />
+                    <StatCard
+                        icon={<AlertOctagon className="w-4.5 h-4.5" />}
+                        value={metrics.criticalRisk}
+                        label="Critical risk"
+                        sublabel="SEV-1 incidents"
+                        tone="critical"
+                        delay={0.05}
+                    />
+                    <StatCard
+                        icon={<FileSearch className="w-4.5 h-4.5" />}
+                        value={metrics.reviewRequired}
+                        label="Review required"
+                        sublabel="plans awaiting human sign-off"
+                        tone="warning"
+                        delay={0.1}
+                    />
+                    <StatCard
+                        icon={<ShieldCheck className="w-4.5 h-4.5" />}
+                        value={metrics.resolvedToday}
+                        label="Resolved today"
+                        sublabel="verified recoveries"
+                        tone="healthy"
+                        delay={0.15}
+                    />
+                </div>
+            )}
 
             <motion.div
                 initial={{ opacity: 0, y: 12 }}

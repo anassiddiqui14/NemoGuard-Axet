@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { AnimatePresence } from 'framer-motion';
-import toast from 'react-hot-toast';
+import { ngToast } from '../../design-system/toast';
 import { ArrowLeft, AlertTriangle } from 'lucide-react';
 import { useIncidentData } from '../../hooks/useIncidentData';
 import { useIncidentEvents } from '../../hooks/useIncidentEvents';
@@ -8,7 +8,9 @@ import { authFetch } from '../../contexts/AuthGateContext';
 import { SituationHeader } from './SituationHeader';
 import { AlertsPanel, AgentAndHypothesisRow, ActivityAndImpactRow } from './InvestigationPanels';
 import { RecoveryRail } from './RecoveryRail';
+import { CommanderPanel } from './CommanderPanel';
 import { EvidenceModal } from './EvidenceModal';
+import { CancelIncidentModal } from './CancelIncidentModal';
 import { PlanApprovalModal } from '../PlanApprovalModal';
 import { WorkspaceTabs } from './WorkspaceTabs';
 import { EmptyState } from './shared';
@@ -27,6 +29,15 @@ interface Props {
     // page that provided it (e.g. the Incidents page), rather than
     // navigating the user elsewhere to view incident details.
     onBack?: () => void;
+    // UI MODERNIZATION (spec Section 30): Dashboard.tsx's queue is
+    // always visible on desktop (md+) alongside this workspace, so a
+    // "Back to incidents" control there would be redundant above md --
+    // it's only meaningful on narrow viewports where the queue is
+    // hidden in favor of showing just the detail pane. IncidentsPage.tsx
+    // (the other consumer of onBack) has no persistent sidebar at any
+    // width, so its back button should always show -- hence this is
+    // opt-in per caller rather than a blanket rule.
+    backButtonMobileOnly?: boolean;
 }
 
 /**
@@ -37,12 +48,14 @@ interface Props {
  * of forcing every "view incident" action to jump to the Command Center
  * dashboard.
  */
-export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParent, onBack }: Props) {
+export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParent, onBack, backButtonMobileOnly }: Props) {
     const [isEvidenceModalOpen, setIsEvidenceModalOpen] = useState(false);
     const [expandedAlert, setExpandedAlert] = useState<string | null>(null);
     const [isModalOpen, setIsModalOpen] = useState(false);
     const [triageStarting, setTriageStarting] = useState(false);
     const [safetyAcknowledged, setSafetyAcknowledged] = useState(false);
+    const [cancelling, setCancelling] = useState(false);
+    const [isCancelModalOpen, setIsCancelModalOpen] = useState(false);
 
     const { evidence, hypothesis, hypotheses, plan, impact, alerts, loading: dataLoading } = useIncidentData(incidentId);
     const { events: liveEvents, status: sseStatus } = useIncidentEvents(incidentId);
@@ -67,11 +80,11 @@ export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParen
                 } catch {
                     // response wasn't JSON; fall back to the status code above
                 }
-                toast.error(`Failed to execute plan: ${detail}`);
+                ngToast.error(`Failed to execute plan: ${detail}`);
                 return;
             }
 
-            toast.success('Plan approved — executing recovery actions.');
+            ngToast.success('Plan approved — executing recovery actions.');
             onRefreshParent();
 
             // Approval is asynchronous when Temporal owns the workflow. Poll
@@ -86,13 +99,13 @@ export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParen
                 const status = String(updatedIncident.status || '').toUpperCase();
 
                 if (status === 'RESOLVED') {
-                    toast.success('Recovery verified — incident resolved.');
+                    ngToast.success('Recovery verified — incident resolved.');
                     onRefreshParent();
                     return;
                 }
 
                 if (status === 'FAILED') {
-                    toast.error('Recovery completed but verification failed — incident escalated for follow-up.', { duration: 7000 });
+                    ngToast.error('Recovery completed but verification failed — incident escalated for follow-up.', { duration: 7000 });
                     onRefreshParent();
                     return;
                 }
@@ -101,9 +114,9 @@ export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParen
             // The plan is still running or the workflow is taking longer than
             // the short UI polling window. Its latest state continues to be
             // refreshed by useIncidentData.
-            toast('Recovery execution is still in progress. Live status will update automatically.', { icon: '⏳' });
+            ngToast.info('Recovery execution is still in progress. Live status will update automatically.');
         } catch (e) {
-            toast.error(`Failed to execute plan: ${e instanceof Error ? e.message : 'network error'}`);
+            ngToast.error(`Failed to execute plan: ${e instanceof Error ? e.message : 'network error'}`);
         }
     };
 
@@ -122,14 +135,44 @@ export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParen
                 } catch {
                     // response wasn't JSON; fall back to the status code above
                 }
-                toast.error(`Failed to start triage: ${detail}`);
+                ngToast.error(`Failed to start triage: ${detail}`);
                 return;
             }
             onRefreshParent();
         } catch (e) {
-            toast.error(`Failed to start triage: ${e instanceof Error ? e.message : 'network error'}`);
+            ngToast.error(`Failed to start triage: ${e instanceof Error ? e.message : 'network error'}`);
         } finally {
             setTriageStarting(false);
+        }
+    };
+
+    const handleConfirmCancelIncident = async (reason: string) => {
+        if (!selectedIncident) return;
+        setCancelling(true);
+        try {
+            const res = await authFetch(`/api/v2/incidents/${selectedIncident.incident_id}/cancel`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ reason: reason || undefined }),
+            });
+            if (!res.ok) {
+                let detail = `HTTP ${res.status}`;
+                try {
+                    const body = await res.json();
+                    detail = body?.detail || detail;
+                } catch {
+                    // response wasn't JSON; fall back to the status code above
+                }
+                ngToast.error(`Failed to cancel incident: ${detail}`);
+                return;
+            }
+            ngToast.success('Incident cancelled.');
+            setIsCancelModalOpen(false);
+            onRefreshParent();
+        } catch (e) {
+            ngToast.error(`Failed to cancel incident: ${e instanceof Error ? e.message : 'network error'}`);
+        } finally {
+            setCancelling(false);
         }
     };
 
@@ -144,12 +187,12 @@ export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParen
                 {onBack && (
                     <button
                         onClick={onBack}
-                        className="press-scale self-start flex items-center gap-1.5 text-[12.5px] font-medium text-text-secondary hover:text-text-primary px-3 py-1.5 rounded-lg hover:bg-white/[0.04] transition-colors"
+                        className={`focus-ring press-scale self-start flex items-center gap-1.5 text-[12.5px] font-medium text-text-secondary hover:text-text-primary px-3 py-1.5 rounded-lg hover:bg-white/[0.04] transition-colors ${backButtonMobileOnly ? 'md:hidden' : ''}`}
                     >
                         <ArrowLeft className="w-3.5 h-3.5" /> Back to incidents
                     </button>
                 )}
-                <div className="glass-panel rounded-2xl ring-1 ring-white/[0.06] min-h-[300px] flex items-center justify-center">
+                <div className="console-surface rounded-2xl min-h-[300px] flex items-center justify-center">
                     <EmptyState icon={<AlertTriangle className="w-5 h-5" />} title="No incident selected" subtitle="Choose an incident to view its full detail." />
                 </div>
             </div>
@@ -161,7 +204,7 @@ export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParen
             {onBack && (
                 <button
                     onClick={onBack}
-                    className="press-scale self-start flex items-center gap-1.5 text-[12.5px] font-medium text-text-secondary hover:text-text-primary px-3 py-1.5 rounded-lg hover:bg-white/[0.04] transition-colors"
+                    className={`focus-ring press-scale self-start flex items-center gap-1.5 text-[12.5px] font-medium text-text-secondary hover:text-text-primary px-3 py-1.5 rounded-lg hover:bg-white/[0.04] transition-colors ${backButtonMobileOnly ? 'md:hidden' : ''}`}
                 >
                     <ArrowLeft className="w-3.5 h-3.5" /> Back to incidents
                 </button>
@@ -177,6 +220,8 @@ export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParen
                         hypothesis={hypothesis}
                         triageStarting={triageStarting}
                         handleStartTriage={handleStartTriage}
+                        onCancelIncident={() => setIsCancelModalOpen(true)}
+                        cancelling={cancelling}
                     />
                 }
                 investigation={
@@ -209,6 +254,7 @@ export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParen
                         evidence={evidence}
                         plan={plan}
                         dataLoading={dataLoading}
+                        incidentStatus={selectedIncident?.status}
                         isNeedsReview={isNeedsReview}
                         safetyAcknowledged={safetyAcknowledged}
                         setSafetyAcknowledged={setSafetyAcknowledged}
@@ -220,6 +266,18 @@ export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParen
                 }
             />
 
+            {/* Commander is now a floating launcher (Intercom/Drift
+                pattern), rendered here at fixed position rather than as
+                one of WorkspaceTabs' tabs. Per direct user feedback: an
+                always-visible bottom panel was explicitly rejected ("bad
+                design, i never said bottom") in favor of matching how
+                modern chat/coding agents actually dock -- closed by
+                default, opened on demand, and it auto-opens the instant a
+                request starts so "Thinking" is never silently hidden
+                regardless of which workspace tab is active or whether the
+                operator had closed it. */}
+            <CommanderPanel incidentId={incidentId} />
+
             <AnimatePresence>
                 {isEvidenceModalOpen && hypothesis && (
                     <EvidenceModal hypothesis={hypothesis} hypotheses={hypotheses} evidence={evidence} onClose={() => setIsEvidenceModalOpen(false)} />
@@ -229,6 +287,17 @@ export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParen
             <AnimatePresence>
                 {isModalOpen && plan && (
                     <PlanApprovalModal incidentId={incidentId} plan={plan} onClose={() => setIsModalOpen(false)} onRefreshPlan={onRefreshParent} />
+                )}
+            </AnimatePresence>
+
+            <AnimatePresence>
+                {isCancelModalOpen && selectedIncident && (
+                    <CancelIncidentModal
+                        incidentId={selectedIncident.incident_id}
+                        submitting={cancelling}
+                        onClose={() => setIsCancelModalOpen(false)}
+                        onConfirm={handleConfirmCancelIncident}
+                    />
                 )}
             </AnimatePresence>
         </div>

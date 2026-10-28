@@ -1,27 +1,31 @@
 import { AnimatePresence, motion } from 'framer-motion';
 import { ResponsiveContainer, Radar, RadarChart, PolarGrid, PolarAngleAxis, Tooltip } from 'recharts';
-import { AgentConstellation } from '../AgentConstellation';
+import { AgentConstellation, InvestigationChecklist } from '../AgentConstellation';
 import { LiveOperationsConsole } from '../LiveOperationsConsole';
 import { EmptyState, severityPill } from './shared';
-import { Search, Activity, TrendingUp, ChevronDown, Sparkles } from 'lucide-react';
+import { InvestigationGlyphIcon } from '../../pages/LandingPage/NemoIcons';
+import { Search, Activity, TrendingUp, ChevronDown, Lightbulb } from 'lucide-react';
 import type { AgentEvent } from '../../hooks/useIncidentEvents';
 
-function Card({ title, subtitle, right, children, className = '' }: { title: string; subtitle?: string; right?: React.ReactNode; children: React.ReactNode; className?: string }) {
+function Card({ title, subtitle, right, children, className = '', titleIcon }: { title: string; subtitle?: string; right?: React.ReactNode; children: React.ReactNode; className?: string; titleIcon?: React.ReactNode }) {
     return (
         <motion.div
             initial={{ opacity: 0, y: 12 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.3, ease: 'easeOut' }}
-            className={`glass-panel rounded-2xl overflow-hidden flex flex-col ${className}`}
+            className={`console-surface rounded-2xl overflow-hidden flex flex-col ${className}`}
         >
             <div className="px-4 py-3.5 flex items-center justify-between border-b border-white/[0.05]">
                 <div>
-                    <div className="font-semibold text-[13px] text-text-primary">{title}</div>
+                    <div className="font-semibold text-[13px] text-text-primary flex items-center gap-1.5">
+                        {titleIcon}
+                        {title}
+                    </div>
                     {subtitle && <div className="text-[11px] text-text-muted mt-0.5">{subtitle}</div>}
                 </div>
                 {right}
             </div>
-            <div className="flex-1 overflow-hidden">{children}</div>
+            <div className="flex-1 min-h-0 overflow-hidden">{children}</div>
         </motion.div>
     );
 }
@@ -32,57 +36,72 @@ export function AlertsPanel({ alerts, expandedAlert, setExpandedAlert }: { alert
         <Card title="Consolidated Alerts" subtitle="Downstream alerts dynamically grouped into this incident" right={
             <span className="text-[10px] font-bold px-2.5 py-1 rounded-full bg-primary/15 text-primary ring-1 ring-primary/30">{alerts.length} alerts</span>
         }>
-            <div className="p-3 flex flex-col gap-2 max-h-[280px] overflow-y-auto">
-                {alerts.map((alt: any, idx: number) => (
-                    <motion.div
-                        key={alt.alert_id}
-                        initial={{ opacity: 0, y: 6 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        transition={{ duration: 0.2, delay: idx * 0.03 }}
-                        layout
-                        className="rounded-xl overflow-hidden bg-white/[0.02] ring-1 ring-white/[0.04]"
-                    >
-                        <button
-                            onClick={() => setExpandedAlert(expandedAlert === alt.alert_id ? null : alt.alert_id)}
-                            className="w-full px-3.5 py-3 flex items-center justify-between hover:bg-white/[0.02] transition-colors text-left"
+            <div className="p-4 space-y-2.5">
+                {alerts.map((alt: any) => {
+                    const isExpanded = expandedAlert === alt.alert_id;
+                    return (
+                        <div
+                            key={alt.alert_id}
+                            className={`interactive-surface rounded-xl border ${isExpanded
+                                ? 'border-primary/25 bg-primary/[0.04] shadow-lg shadow-primary/5'
+                                : 'border-white/[0.07] bg-white/[0.02] hover:bg-white/[0.04]'
+                                }`}
                         >
-                            <div className="flex items-center gap-3 min-w-0">
-                                <span
-                                    className={`text-[9px] font-bold px-2 py-0.5 rounded-full uppercase flex-shrink-0 ${alt.severity === 'critical' ? 'bg-critical/15 text-critical' : alt.severity === 'high' ? 'bg-warning/15 text-warning' : 'bg-healthy/15 text-healthy'
-                                        }`}
-                                >
-                                    {alt.severity}
-                                </span>
-                                <div className="min-w-0">
-                                    <div className="font-medium text-[12.5px] truncate">{alt.source_system} · {alt.alert_type}</div>
-                                    <div className="text-[11px] text-text-muted truncate">{alt.message}</div>
-                                </div>
-                            </div>
-                            <motion.div animate={{ rotate: expandedAlert === alt.alert_id ? 180 : 0 }} transition={{ duration: 0.2 }} className="flex-shrink-0 ml-2">
-                                <ChevronDown className="w-3.5 h-3.5 text-text-muted" />
-                            </motion.div>
-                        </button>
-                        <AnimatePresence initial={false}>
-                            {expandedAlert === alt.alert_id && (
-                                <motion.div
-                                    key="content"
-                                    initial={{ height: 0, opacity: 0 }}
-                                    animate={{ height: 'auto', opacity: 1 }}
-                                    exit={{ height: 0, opacity: 0 }}
-                                    transition={{ duration: 0.22, ease: 'easeInOut' }}
-                                    className="overflow-hidden"
-                                >
-                                    <div className="px-3.5 py-3 border-t border-white/[0.05] bg-black/20 text-[12px] font-mono text-text-secondary leading-relaxed whitespace-pre-wrap break-all">
-                                        <div className="p-2.5 bg-white/[0.02] rounded-lg ring-1 ring-white/[0.04]">{alt.message}</div>
+                            <button
+                                type="button"
+                                aria-expanded={isExpanded}
+                                onClick={() => setExpandedAlert(isExpanded ? null : alt.alert_id)}
+                                className="focus-ring w-full px-3.5 py-3 flex items-center justify-between gap-3 text-left rounded-xl"
+                            >
+                                <div className="flex items-center gap-3 min-w-0">
+                                    <span
+                                        className={`text-[9px] font-bold px-2 py-0.5 rounded-full uppercase flex-shrink-0 ${alt.severity === 'critical' ? 'bg-critical/15 text-critical' : alt.severity === 'high' ? 'bg-warning/15 text-warning' : 'bg-healthy/15 text-healthy'}`}
+                                    >
+                                        {alt.severity}
+                                    </span>
+                                    <div className="min-w-0">
+                                        <div className="font-medium text-[12.5px] leading-5 text-text-primary truncate">{alt.source_system} · {alt.alert_type}</div>
+                                        <div className="text-[11px] leading-4 text-text-muted truncate">{alt.message}</div>
                                     </div>
-                                </motion.div>
+                                </div>
+                                <ChevronDown
+                                    className={`w-4 h-4 text-text-muted flex-shrink-0 transition-transform duration-150 ${isExpanded ? 'rotate-180 text-primary' : ''}`}
+                                />
+                            </button>
+
+                            {isExpanded && (
+                                <div className="border-t border-white/[0.07] px-3.5 py-3 bg-black/[0.12]">
+                                    <div className="text-[10px] font-semibold uppercase tracking-wider text-text-muted mb-1.5">Alert details</div>
+                                    <p className="text-[12px] font-mono text-text-secondary leading-5 whitespace-pre-wrap break-words">
+                                        {alt.message}
+                                    </p>
+                                </div>
                             )}
-                        </AnimatePresence>
-                    </motion.div>
-                ))}
+                        </div>
+                    );
+                })}
             </div>
         </Card>
     );
+}
+
+function describeInvestigationProgress(events: AgentEvent[]): { title: string; subtitle: string } {
+    const hasEvent = (types: string[]) => events.some((e) => types.includes(e.event_type));
+    const rcaDone = hasEvent(['HYPOTHESIS_CREATED']);
+    const impactDone = hasEvent(['IMPACT_CALCULATED']);
+    const runbookDone = hasEvent(['RUNBOOK_RETRIEVED']);
+    const safetyDone = hasEvent(['SAFETY_VALIDATION_PASSED', 'SAFETY_VALIDATION_FAILED']);
+
+    if (!rcaDone) {
+        return { title: 'RCA Agent is investigating logs…', subtitle: 'Synthesizing evidence from execution logs and topology.' };
+    }
+    if (!impactDone || !runbookDone) {
+        return { title: 'Impact & Runbook Agents are assessing blast radius…', subtitle: 'Root cause identified — calculating downstream impact and matching recovery procedures.' };
+    }
+    if (!safetyDone) {
+        return { title: 'Safety Agent is validating the recovery plan…', subtitle: 'Independently verifying plan grounding before the hypothesis is finalized.' };
+    }
+    return { title: 'Finalizing root-cause hypothesis…', subtitle: 'Persisting findings from the completed investigation.' };
 }
 
 export function AgentAndHypothesisRow({
@@ -96,6 +115,7 @@ export function AgentAndHypothesisRow({
     dataLoading: boolean;
     onViewEvidence: () => void;
 }) {
+    const progress = dataLoading ? describeInvestigationProgress(liveEvents) : null;
     return (
         <div className="grid grid-cols-1 lg:grid-cols-[1fr_1fr] gap-4 items-start">
             <Card title="Agent Constellation" subtitle="Coordinated multi-agent investigation" className="h-[400px]">
@@ -111,8 +131,9 @@ export function AgentAndHypothesisRow({
             <Card
                 title="Root-Cause Hypothesis"
                 subtitle="Ranked and evidence-grounded"
+                titleIcon={<InvestigationGlyphIcon className="w-3.5 h-3.5 text-agent-active" />}
                 right={
-                    <button onClick={onViewEvidence} className="text-[11px] font-medium px-3 py-1.5 rounded-lg bg-white/[0.03] hover:bg-white/[0.06] ring-1 ring-white/[0.06] transition flex items-center gap-1.5 text-text-secondary">
+                    <button onClick={onViewEvidence} className="focus-ring press-scale text-[11px] font-medium px-3 py-1.5 rounded-lg bg-white/[0.03] hover:bg-white/[0.06] ring-1 ring-white/[0.06] transition flex items-center gap-1.5 text-text-secondary">
                         <Search className="w-3 h-3" /> Evidence
                     </button>
                 }
@@ -120,17 +141,30 @@ export function AgentAndHypothesisRow({
             >
                 <div className="p-4 h-full overflow-y-auto">
                     {!hypothesis ? (
-                        <EmptyState
-                            icon={<TrendingUp className="w-5 h-5" />}
-                            title={dataLoading ? 'RCA Agent is investigating logs…' : 'No hypothesis formulated yet'}
-                            subtitle={dataLoading ? 'Synthesizing evidence from execution logs and topology.' : 'Start triage to begin root-cause analysis.'}
-                        />
+                        activeIncidentId && liveEvents.length > 0 ? (
+                            // UI MODERNIZATION (spec Section 43 -- "NemoGuard
+                            // Investigation" branded checklist loader): while
+                            // waiting on a hypothesis, show real per-agent
+                            // progress (reusing AgentConstellation's exact
+                            // state computation, so this can never say
+                            // something different than the grid view does)
+                            // instead of a generic "no hypothesis yet" empty
+                            // state with zero indication of what's actually
+                            // happening.
+                            <InvestigationChecklist status={incidentStatus} events={liveEvents} />
+                        ) : (
+                            <EmptyState
+                                icon={<TrendingUp className="w-5 h-5" />}
+                                title={progress ? progress.title : 'No hypothesis formulated yet'}
+                                subtitle={progress ? progress.subtitle : 'Start triage to begin root-cause analysis.'}
+                            />
+                        )
                     ) : (
                         <div className="space-y-4">
                             <div className="relative rounded-xl p-4 bg-gradient-to-br from-agent-active/10 to-transparent ring-1 ring-agent-active/20">
                                 <div className="flex items-start gap-3">
                                     <div className="w-8 h-8 rounded-lg bg-agent-active/15 flex items-center justify-center flex-shrink-0">
-                                        <Sparkles className="w-4 h-4 text-agent-active" />
+                                        <Lightbulb className="w-4 h-4 text-agent-active" />
                                     </div>
                                     <div className="flex-1 min-w-0">
                                         <div className="font-medium text-[13px] leading-relaxed text-text-primary break-words">{hypothesis.title}</div>
@@ -207,16 +241,26 @@ export function ActivityAndImpactRow({ activeIncidentId, liveEvents, sseStatus, 
                         {impact.length > 0 ? (
                             <ResponsiveContainer width="100%" height="100%">
                                 <RadarChart cx="50%" cy="50%" outerRadius="75%" data={[
-                                    { subject: 'Jobs', A: impact.filter((i) => i.impact_type?.includes('Job')).length || 1, fullMark: 10 },
-                                    { subject: 'Products', A: impact.filter((i) => !i.impact_type?.includes('Job')).length || 1, fullMark: 5 },
-                                    { subject: 'Dashboards', A: impact.length > 0 ? 2 : 0, fullMark: 5 },
-                                    { subject: 'Latency', A: impact.length > 0 ? 2 : 0, fullMark: 10 },
-                                    { subject: 'Risk', A: impact.length > 0 ? 8 : 0, fullMark: 10 },
+                                    { subject: 'Jobs', A: impact.filter((i) => i.impact_type?.includes('Job')).length, fullMark: Math.max(impact.length, 5) },
+                                    { subject: 'Products', A: impact.filter((i) => !i.impact_type?.includes('Job')).length, fullMark: Math.max(impact.length, 5) },
+                                    {
+                                        subject: 'Business risk',
+                                        A: Math.round(
+                                            (impact.reduce((sum, i) => sum + (typeof i.impact_score === 'number' ? i.impact_score : 0), 0) / impact.length) * 10,
+                                        ),
+                                        fullMark: 10,
+                                    },
+                                    {
+                                        subject: 'SLA at risk',
+                                        A: impact.filter((i) => ['AT_RISK', 'BREACHED'].includes(String(i.sla_status || '').toUpperCase())).length,
+                                        fullMark: Math.max(impact.length, 5),
+                                    },
                                 ]}>
-                                    <PolarGrid stroke="rgba(255,255,255,0.06)" />
-                                    <PolarAngleAxis dataKey="subject" tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 9.5 }} />
-                                    <Tooltip contentStyle={{ backgroundColor: '#14141F', borderColor: 'rgba(255,255,255,0.1)', borderRadius: '10px', fontSize: '12px' }} />
-                                    <Radar name="Impact" dataKey="A" stroke="#C026D3" fill="#C026D3" fillOpacity={0.35} />
+                                    {/* UI MODERNIZATION (spec Section 53): this chart previously had HARDCODED dark-mode-only colors (a literal #14141F hex and rgba(255,255,255,...) white-overlay values that never adapted to light mode). Now uses the dedicated chart token set in index.css instead of hand-rolled raw color values. */}
+                                    <PolarGrid stroke="var(--chart-grid)" />
+                                    <PolarAngleAxis dataKey="subject" tick={{ fill: 'var(--chart-axis-text)', fontSize: 9.5 }} />
+                                    <Tooltip contentStyle={{ backgroundColor: 'var(--chart-tooltip-bg)', borderColor: 'var(--chart-tooltip-border)', borderRadius: '10px', fontSize: '12px', color: 'var(--chart-tooltip-text)' }} />
+                                    <Radar name="Impact" dataKey="A" stroke="var(--chart-secondary)" fill="var(--chart-secondary)" fillOpacity={0.35} />
                                 </RadarChart>
                             </ResponsiveContainer>
                         ) : (
@@ -234,14 +278,23 @@ export function ActivityAndImpactRow({ activeIncidentId, liveEvents, sseStatus, 
                                         initial={{ opacity: 0, x: 16 }}
                                         animate={{ opacity: 1, x: 0 }}
                                         transition={{ delay: 0.08 * idx }}
-                                        className="flex items-center justify-between p-2.5 mb-1.5 rounded-lg bg-white/[0.02] ring-1 ring-white/[0.05]"
+                                        className="interactive-surface flex items-center justify-between p-2.5 mb-1.5 rounded-lg bg-white/[0.02] ring-1 ring-white/[0.05]"
                                     >
-                                        <span className="font-medium text-[12px] text-text-secondary break-words pr-2 truncate">{imp.asset_name || imp.asset_id}</span>
+                                        <div className="min-w-0 pr-2">
+                                            <div className="font-medium text-[12px] text-text-secondary truncate">{imp.asset_name || imp.asset_id}</div>
+                                            <div className="text-[9.5px] text-text-muted mt-0.5">
+                                                {imp.business_risk ? `${imp.business_risk} risk · ${Math.round((imp.impact_score || 0) * 100)} score` : (imp.impact_status || imp.status || 'AT RISK')}
+                                            </div>
+                                        </div>
                                         <span
-                                            className={`text-[9px] font-bold px-2 py-0.5 rounded-full flex-shrink-0 ${imp.impact_status === 'BLOCKED' || imp.status === 'BLOCKED' ? 'bg-critical/15 text-critical' : 'bg-warning/15 text-warning'
+                                            className={`text-[9px] font-bold px-2 py-0.5 rounded-full flex-shrink-0 ${String(imp.sla_status || '').toUpperCase() === 'BREACHED'
+                                                ? 'bg-critical/15 text-critical'
+                                                : String(imp.sla_status || '').toUpperCase() === 'AT_RISK'
+                                                    ? 'bg-warning/15 text-warning'
+                                                    : 'bg-healthy/15 text-healthy'
                                                 }`}
                                         >
-                                            {imp.impact_status || imp.status || 'AT RISK'}
+                                            {imp.sla_status === 'UNKNOWN' ? 'SLA UNKNOWN' : (imp.sla_status || imp.impact_status || imp.status || 'AT RISK')}
                                         </span>
                                     </motion.div>
                                 ))}
