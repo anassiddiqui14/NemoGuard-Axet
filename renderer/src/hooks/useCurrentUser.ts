@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { authFetch, isAxetFlowsRuntime } from '../contexts/AuthGateContext';
 
 export interface CurrentUser {
     email: string;
@@ -64,23 +65,58 @@ const DEFAULT_USER: CurrentUser = {
     initials: '—',
 };
 
-/** Reads the JWT from localStorage and decodes it client-side purely for display. */
 export function useCurrentUser(): CurrentUser {
     const [user, setUser] = useState<CurrentUser>(DEFAULT_USER);
 
     useEffect(() => {
+        if (isAxetFlowsRuntime()) {
+            let cancelled = false;
+
+            const loadAxetUser = async () => {
+                try {
+                    const response = await authFetch('/api/v2/auth/me');
+
+                    if (!response.ok) {
+                        if (!cancelled) {
+                            setUser(DEFAULT_USER);
+                        }
+                        return;
+                    }
+
+                    const payload = await response.json();
+
+                    if (!cancelled) {
+                        setUser(buildUser(payload));
+                    }
+                } catch {
+                    if (!cancelled) {
+                        setUser(DEFAULT_USER);
+                    }
+                }
+            };
+
+            void loadAxetUser();
+
+            return () => {
+                cancelled = true;
+            };
+        }
+
         const readUser = () => {
             const token = localStorage.getItem('nemoguard_token');
+
             if (!token) {
                 setUser(DEFAULT_USER);
                 return;
             }
+
             const payload = decodeJwtPayload(token);
             setUser(payload ? buildUser(payload) : DEFAULT_USER);
         };
 
         readUser();
         window.addEventListener('storage', readUser);
+
         return () => window.removeEventListener('storage', readUser);
     }, []);
 

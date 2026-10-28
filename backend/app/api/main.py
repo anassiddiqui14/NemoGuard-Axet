@@ -544,6 +544,15 @@ async def reload_capability_policy(current_user: User = Depends(require_role("ad
     return {"status": "reloaded", "config_path": str(policy._CONFIG_PATH)}
 
 
+@app.get("/api/v2/auth/me")
+def auth_me(current_user: User = Depends(get_current_user)):
+    return {
+        "user_id": current_user.user_id,
+        "email": current_user.email,
+        "roles": current_user.roles,
+        "tenant_id": current_user.tenant_id,
+        "workspace_id": current_user.workspace_id,
+    }
 
 @app.get("/api/v2/incidents/{incident_id}/events/stream")
 async def stream_events(
