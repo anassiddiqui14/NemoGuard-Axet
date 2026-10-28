@@ -563,6 +563,14 @@ async def stream_events(
         yield ": ping\n\n"
         db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
         last_ts = ""
+        # Elapsed-time heartbeat timer: in addition to polling the audit table
+        # roughly every second, emit an SSE comment heartbeat (": ping\n\n")
+        # approximately every 15 seconds so the connection stays alive through
+        # proxies/load-balancers even while no audit events are being
+        # generated. This is a plain SSE comment, never a fake AgentEvent.
+        loop = asyncio.get_event_loop()
+        last_heartbeat = loop.time()
+        HEARTBEAT_INTERVAL_SECONDS = 15
         while True:
             with db.get_connection() as conn:
                 try:
@@ -583,6 +591,19 @@ async def stream_events(
                         last_ts = row[1]
                 except Exception as e:
                     print(f"SSE Error: {e}")
+
+            now = loop.time()
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
+                yield ": ping\n\n"
+                last_heartbeat = now
+
             await asyncio.sleep(1)
-    
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
