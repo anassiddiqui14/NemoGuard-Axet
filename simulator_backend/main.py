@@ -1,10 +1,22 @@
 import os
+import sys
 import uuid
 import json
 import time
 import random
+import re
+import threading
 import httpx
+
+# Ensures print() output (including this file's [lab-forwarder] /
+# [lab-auto-provision] diagnostic lines) is actually flushed to `docker
+# logs` promptly -- uvicorn/gunicorn workers commonly run with buffered
+# stdout, which was silently swallowing these lines even though the
+# underlying logic worked correctly (confirmed live: /lab/status reported
+# available:true with zero matching log lines visible via `docker logs`).
+sys.stdout.reconfigure(line_buffering=True)
 from datetime import datetime, timezone
+from typing import Any
 import psycopg2
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse
@@ -22,6 +34,771 @@ app.add_middleware(
 )
 
 DATABASE_URL = os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db")
+
+# --- Real-AWS "Scenario Cockpit" lab integration -----------------------
+# Bundled into this image at build time (see Dockerfile.simulator) so the
+# cockpit's "real AWS lab" scenarios can reuse localstack_lab's exact
+# resource-naming conventions and boto3 client factory instead of a second,
+# inevitably-drifting copy of that logic.
+sys.path.insert(0, os.path.dirname(__file__))
+try:
+    from localstack_lab.aws_clients import client as aws_client  # type: ignore
+    LOCALSTACK_LAB_IMPORTABLE = True
+except Exception:
+    LOCALSTACK_LAB_IMPORTABLE = False
+
+LAB_BUCKET_NAME = "nemoguard-lab-data"
+LAB_FUNCTIONS = {
+    "ingest_job": "nemoguard-ingest-job",
+    "order_events_job": "nemoguard-order-events-job",
+    "notification_job": "nemoguard-notification-job",
+}
+LAB_ALERTS_QUEUE_NAME = "nemoguard-lab-alerts-queue"
+LAB_ALERTS_TOPIC_NAME = "nemoguard-lab-alerts"
+LAB_STATE_MACHINE_NAME = "nemoguard-daily-pipeline"
+NEMOGUARD_API_BASE = os.environ.get("NEMOGUARD_API_BASE", "http://127.0.0.1:8200")
+
+FUNCTION_NAME_TO_JOB_ID = {
+    "nemoguard-ingest-job": "LOCALSTACK_INGEST_JOB",
+    "nemoguard-order-events-job": "LOCALSTACK_ORDER_EVENTS_JOB",
+    "nemoguard-notification-job": "LOCALSTACK_NOTIFICATION_JOB",
+}
+
+
+# This event describes successful *queue acquisition*, not merely whether
+# startup attempted to launch a thread. LocalStack resources are ephemeral:
+# auto-provisioning can create the queue after this process has started.
+_lab_forwarder_ready = threading.Event()
+
+
+def _lab_forwarder_loop():
+    """Continuously reconnect to the lab alarm queue and deliver alarms.
+
+    A startup race with LocalStack must not permanently disable delivery:
+    queue acquisition and polling are retried forever, including after a
+    LocalStack restart. Messages are deleted only after NemoGuard accepts
+    them, preventing a transient API failure from silently losing an alarm.
+    """
+    if not LOCALSTACK_LAB_IMPORTABLE:
+        print("[lab-forwarder] localstack_lab not importable; forwarder thread not starting.")
+        return
+
+    sqs = None
+    queue_url = None
+    while True:
+        try:
+            if queue_url is None:
+                sqs = aws_client("sqs")
+                queue_url = sqs.get_queue_url(QueueName=LAB_ALERTS_QUEUE_NAME)["QueueUrl"]
+                _lab_forwarder_ready.set()
+                print(
+                    f"[lab-forwarder] connected. Polling {LAB_ALERTS_QUEUE_NAME} "
+                    f"-> {NEMOGUARD_API_BASE}/api/v2/ingest/webhook"
+                )
+
+            resp = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=10)
+            for msg in resp.get("Messages", []):
+                try:
+                    sns_envelope = json.loads(msg["Body"])
+                    alarm_body = json.loads(sns_envelope.get("Message", "{}"))
+                    payload = _cloudwatch_alarm_to_webhook_payload(alarm_body)
+                    response = httpx.post(
+                        f"{NEMOGUARD_API_BASE}/api/v2/ingest/webhook",
+                        json=payload,
+                        timeout=30.0,
+                    )
+                    response.raise_for_status()
+                    sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+                    print(f"[lab-forwarder] forwarded alarm '{payload.get('alarm_name')}': HTTP {response.status_code}")
+                except Exception as e:
+                    # Leave the message in SQS for retry after its visibility
+                    # timeout. This is at-least-once delivery; NemoGuard's
+                    # correlator handles a retried alert safely.
+                    print(f"[lab-forwarder] failed to forward message; leaving it queued for retry: {e}")
+        except Exception as e:
+            _lab_forwarder_ready.clear()
+            queue_url = None
+            print(f"[lab-forwarder] queue unavailable ({e}); retrying in 5s.")
+            time.sleep(5)
+
+
+def _most_recent_failed_run_id(job_id: str):
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT run_id FROM execution WHERE job_id = %s AND status = 'failed' "
+                "ORDER BY end_ts DESC LIMIT 1",
+                (job_id,),
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
+    except Exception:
+        return None
+
+
+def _cloudwatch_alarm_to_webhook_payload(alarm_body: dict) -> dict:
+    function_name = None
+    for dim in alarm_body.get("Trigger", {}).get("Dimensions", []):
+        if dim.get("name") == "FunctionName":
+            function_name = dim.get("value")
+    job_id = FUNCTION_NAME_TO_JOB_ID.get(function_name, "LOCALSTACK_INGEST_JOB")
+    state_reason = alarm_body.get("NewStateReason", "")
+    # Cockpit-triggered faults explicitly include the unique Lambda run ID
+    # in the alarm reason. Prefer it over the database fallback so back-to-
+    # back alarm messages cannot both be attributed to whichever failed run
+    # happened to be written most recently when the forwarder consumes them.
+    run_match = re.search(r"RUN-LOCALSTACK-[A-Za-z0-9_-]+", state_reason)
+    real_run_id = run_match.group(0) if run_match else _most_recent_failed_run_id(job_id)
+    run_id = real_run_id or f"RUN-LOCALSTACK-{int(time.time())}"
+    return {
+        "source": "CloudWatch (LocalStack)",
+        "type": "Alarm",
+        "monitor_name": alarm_body.get("AlarmName", "Unknown Alarm"),
+        "message": state_reason or f"CloudWatch alarm {alarm_body.get('AlarmName')} entered ALARM state.",
+        "tags": [
+            f"service:{function_name or 'nemoguard-ingest-job'}",
+            "env:localstack-lab",
+            "severity:critical",
+        ],
+        "run_id": run_id,
+        "alarm_name": alarm_body.get("AlarmName"),
+        "new_state": alarm_body.get("NewStateValue"),
+        "region": alarm_body.get("Region"),
+        "detected_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+_lab_forwarder_thread_started = False
+
+
+def _lab_auto_provision_loop():
+    """Background thread (started once, at process startup) that CONTINUALLY
+    monitors lab availability and re-runs `localstack_lab/provision.py`'s
+    idempotent main() any time it detects the lab has become unavailable --
+    fixing the exact real, recurring failure mode where the Scenario
+    Cockpit's "Real AWS Lab" section shows "unavailable" after ANY restart
+    of the localstack container (Docker container recreation/restart does
+    NOT preserve LocalStack's in-memory-provisioned S3 bucket, Lambdas,
+    SNS/SQS, Step Functions state machine, or CloudWatch alarms -- they
+    must be recreated every single time). Previously this required a
+    human to notice the cockpit was unavailable and manually exec in to
+    re-run provision.py.
+
+    IMPORTANT: this loop never permanently exits after a successful
+    provision -- an earlier version of this fix returned once available,
+    which meant a SECOND localstack restart later in the same simulator
+    process's lifetime went right back to being silently unavailable
+    forever (confirmed live: this exact regression happened once during
+    this fix's own development). It now polls indefinitely for the whole
+    lifetime of the simulator process, re-provisioning every time it
+    detects the lab has dropped back to unavailable.
+    """
+    if not LOCALSTACK_LAB_IMPORTABLE:
+        print("[lab-auto-provision] localstack_lab not importable; auto-provision thread not starting.")
+        return
+    while True:
+        available, detail = _lab_check_available()
+        if not available:
+            try:
+                from localstack_lab import provision as _provision  # type: ignore
+                print(f"[lab-auto-provision] lab not available ({detail}); running provision.py...")
+                _provision.main()
+                print("[lab-auto-provision] provisioning succeeded.")
+            except Exception as e:
+                print(f"[lab-auto-provision] provisioning attempt failed ({e}); will re-check in 15s.")
+        # Poll every 15s regardless of outcome above -- catches the lab
+        # becoming unavailable again later (e.g. a subsequent localstack
+        # restart), not just the very first startup race.
+        time.sleep(15)
+
+
+_lab_auto_provision_thread_started = False
+
+
+@app.on_event("startup")
+def _start_lab_forwarder_once():
+    global _lab_forwarder_thread_started, _lab_auto_provision_thread_started
+    if not _lab_forwarder_thread_started:
+        _lab_forwarder_thread_started = True
+        t = threading.Thread(target=_lab_forwarder_loop, daemon=True)
+        t.start()
+    if not _lab_auto_provision_thread_started:
+        _lab_auto_provision_thread_started = True
+        t2 = threading.Thread(target=_lab_auto_provision_loop, daemon=True)
+        t2.start()
+
+
+class LabTriggerRequest(BaseModel):
+    scenario: str
+
+
+def _lab_check_available() -> tuple[bool, str]:
+    if not LOCALSTACK_LAB_IMPORTABLE:
+        return False, "localstack_lab package not importable in this container."
+    try:
+        lam = aws_client("lambda")
+        names = {f["FunctionName"] for f in lam.list_functions().get("Functions", [])}
+        missing = set(LAB_FUNCTIONS.values()) - names
+        if missing:
+            return False, f"LocalStack reachable but not provisioned. Missing functions: {sorted(missing)}. Run localstack_lab/provision.py."
+        return True, "ready"
+    except Exception as e:
+        return False, f"LocalStack unreachable: {e}"
+
+
+@app.get("/lab/status")
+def lab_status():
+    available, detail = _lab_check_available()
+    return {
+        "available": available,
+        "detail": detail,
+        "functions": LAB_FUNCTIONS,
+        "forwarder_running": _lab_forwarder_thread_started,
+        "forwarder_ready": _lab_forwarder_ready.is_set(),
+        "delivery_detail": (
+            "CloudWatch alarm forwarding is connected."
+            if _lab_forwarder_ready.is_set()
+            else "CloudWatch alarm forwarding is reconnecting; incidents cannot be created from real lab alarms yet."
+        ),
+    }
+
+
+LAB_ALARM_NAMES = [
+    "nemoguard-ingest-job-errors",
+    "nemoguard-order-events-job-errors",
+    "nemoguard-notification-job-errors",
+]
+
+
+@app.get("/lab/alarms")
+def lab_alarm_states():
+    """Real, live CloudWatch alarm state for every lab alarm -- surfaces
+    the alarm-lifecycle scenarios (trip-on-first-error, no-renotify-on-
+    repeat, acknowledge-after-fix, state-inspect-only) in the cockpit,
+    which previously had no UI/API path at all (only exercised via
+    scripts/run_scenario_catalog_30.py). A real boto3 describe_alarms
+    call, not a cached/mocked value."""
+    available, detail = _lab_check_available()
+    if not available:
+        raise HTTPException(status_code=503, detail=detail)
+    cw = aws_client("cloudwatch")
+    resp = cw.describe_alarms(AlarmNames=LAB_ALARM_NAMES)
+    by_name = {a["AlarmName"]: a for a in resp.get("MetricAlarms", [])}
+    return {
+        "alarms": [
+            {
+                "alarm_name": name,
+                "state": by_name.get(name, {}).get("StateValue", "UNKNOWN"),
+                "state_reason": by_name.get(name, {}).get("StateReason", ""),
+                "state_updated_at": str(by_name.get(name, {}).get("StateUpdatedTimestamp", "")),
+            }
+            for name in LAB_ALARM_NAMES
+        ]
+    }
+
+
+class AlarmResetRequest(BaseModel):
+    alarm_name: str
+    reason: str = "Acknowledged and reset from the Scenario Cockpit."
+
+
+@app.post("/lab/alarms/reset")
+def lab_alarm_reset(req: AlarmResetRequest):
+    """Real remediation action (delegates to the same
+    acknowledge_and_reset_alarm governed capability RCA plans use) --
+    forces a real CloudWatch alarm back to OK with an audit-worthy
+    StateReason, for the acknowledge-after-fix cockpit scenario."""
+    if req.alarm_name not in LAB_ALARM_NAMES:
+        raise HTTPException(status_code=400, detail=f"Unknown alarm. Choose from: {LAB_ALARM_NAMES}")
+    available, detail = _lab_check_available()
+    if not available:
+        raise HTTPException(status_code=503, detail=detail)
+    cw = aws_client("cloudwatch")
+    before = cw.describe_alarms(AlarmNames=[req.alarm_name])
+    state_before = (before.get("MetricAlarms") or [{}])[0].get("StateValue", "UNKNOWN")
+    cw.set_alarm_state(AlarmName=req.alarm_name, StateValue="OK", StateReason=req.reason)
+    return {"alarm_name": req.alarm_name, "state_before": state_before, "state_after": "OK", "reason": req.reason}
+
+
+def _lab_invoke(function_name: str, payload: dict) -> dict:
+    lam = aws_client("lambda")
+    resp = lam.invoke(
+        FunctionName=function_name,
+        InvocationType="RequestResponse",
+        Payload=json.dumps(payload).encode(),
+    )
+    raw_payload = resp["Payload"].read().decode()
+    return {
+        "status_code": resp.get("StatusCode"),
+        "function_error": resp.get("FunctionError"),
+        "payload": raw_payload,
+    }
+
+
+_INGEST_SCENARIOS = {
+    "schema_drift": {"user_id": "USR-{uid}"},
+    "oom_crash": {"user_id": "USR-{uid}", "last_login_ip": "10.0.0.1", "simulate_oom": True},
+    "db_outage": {"user_id": "USR-{uid}", "last_login_ip": "10.0.0.1", "simulate_db_outage": True},
+    "healthy": {"user_id": "USR-{uid}", "last_login_ip": "10.0.0.1"},
+}
+
+
+@app.post("/lab/trigger/ingest")
+def lab_trigger_ingest(req: LabTriggerRequest):
+    """Real S3->Lambda->Postgres failure against nemoguard-ingest-job -- see
+    localstack_lab/break_scenario.py (this mirrors that script's logic so it
+    can be triggered directly from the cockpit's HTTP API instead of a
+    separate CLI invocation)."""
+    available, detail = _lab_check_available()
+    if not available:
+        raise HTTPException(status_code=503, detail=detail)
+    if req.scenario not in _INGEST_SCENARIOS:
+        raise HTTPException(status_code=400, detail=f"Unknown scenario. Choose from: {list(_INGEST_SCENARIOS.keys())}")
+
+    # CloudWatch/SNS sends a notification when an alarm transitions into
+    # ALARM, not for every additional failure while it remains ALARM. A
+    # cockpit user intentionally triggering the same failure twice expects
+    # two distinct test events, so restore the shared ingest alarm to OK
+    # before every fault-injection run. This mirrors the real correlation
+    # verification flow below and preserves the genuine AWS alarm -> SNS ->
+    # SQS -> Watcher webhook chain rather than posting a synthetic webhook.
+    if req.scenario != "healthy":
+        _correlation_reset_alarm("nemoguard-ingest-job-errors")
+
+    uid = uuid.uuid4().hex[:6]
+    run_id = f"RUN-LOCALSTACK-{req.scenario}-{uid}"
+    key = f"customer_profile/{run_id}.json"
+    record = json.loads(json.dumps(_INGEST_SCENARIOS[req.scenario]).replace("{uid}", uid))
+
+    s3 = aws_client("s3")
+    s3.put_object(Bucket=LAB_BUCKET_NAME, Key=key, Body=json.dumps(record).encode())
+    result = _lab_invoke(LAB_FUNCTIONS["ingest_job"], {"bucket": LAB_BUCKET_NAME, "key": key, "run_id": run_id})
+    if req.scenario != "healthy" and result.get("function_error"):
+        _trigger_cockpit_alarm("nemoguard-ingest-job-errors", run_id)
+    return {"run_id": run_id, "s3_key": key, **result}
+
+
+@app.post("/lab/trigger/order_events")
+def lab_trigger_order_events(req: LabTriggerRequest):
+    """Real Glue-style partial-write / duplicate-key crash against
+    nemoguard-order-events-job -- see
+    localstack_lab/break_order_events_scenario.py."""
+    available, detail = _lab_check_available()
+    if not available:
+        raise HTTPException(status_code=503, detail=detail)
+    if req.scenario not in ("partial_write_crash", "duplicate_write", "healthy"):
+        raise HTTPException(status_code=400, detail="Choose from: partial_write_crash, duplicate_write, healthy")
+
+    if req.scenario == "duplicate_write":
+        # Two real, sequential Lambda invocations, matching
+        # break_order_events_scenario.py exactly: the first genuinely
+        # commits one order successfully; the second batch re-sends the
+        # SAME order_id (simulating a retry that forgot to check what
+        # already landed), which the real UNIQUE constraint rejects.
+        uid = uuid.uuid4().hex[:6]
+        order = {"order_id": f"ORD-DUP-{uid}", "event_type": "created", "amount": 42.0}
+        first_run_id = f"RUN-LOCALSTACK-order-events-duplicate_write-first-{uid}"
+        second_run_id = f"RUN-LOCALSTACK-order-events-duplicate_write-{uid}"
+
+        s3 = aws_client("s3")
+        first_key = f"order_events/{first_run_id}.json"
+        s3.put_object(Bucket=LAB_BUCKET_NAME, Key=first_key, Body=json.dumps({"orders": [order]}).encode())
+        _lab_invoke(LAB_FUNCTIONS["order_events_job"], {"bucket": LAB_BUCKET_NAME, "key": first_key, "run_id": first_run_id})
+
+        second_key = f"order_events/{second_run_id}.json"
+        s3.put_object(Bucket=LAB_BUCKET_NAME, Key=second_key, Body=json.dumps({"orders": [order]}).encode())
+        result = _lab_invoke(LAB_FUNCTIONS["order_events_job"], {"bucket": LAB_BUCKET_NAME, "key": second_key, "run_id": second_run_id})
+        return {"run_id": second_run_id, "s3_key": second_key, "duplicate_order_id": order["order_id"], **result}
+
+    uid = uuid.uuid4().hex[:6]
+    run_id = f"RUN-LOCALSTACK-order-events-{req.scenario}-{uid}"
+    key = f"order_events/{run_id}.json"
+    orders = [
+        {"order_id": f"ORD-{uuid.uuid4().hex[:8]}", "event_type": "created", "amount": round(19.99 + i, 2)}
+        for i in range(10)
+    ]
+    batch = {"orders": orders}
+    if req.scenario == "partial_write_crash":
+        batch["simulate_partial_write_crash"] = True
+        batch["crash_after_n_rows"] = 5
+
+    s3 = aws_client("s3")
+    s3.put_object(Bucket=LAB_BUCKET_NAME, Key=key, Body=json.dumps(batch).encode())
+    result = _lab_invoke(LAB_FUNCTIONS["order_events_job"], {"bucket": LAB_BUCKET_NAME, "key": key, "run_id": run_id})
+    return {"run_id": run_id, "s3_key": key, "expected_row_count": len(orders), **result}
+
+
+@app.post("/lab/trigger/notification")
+def lab_trigger_notification(req: LabTriggerRequest):
+    """Real SQS poison-pill message against nemoguard-notification-job --
+    see localstack_lab/break_notification_scenario.py."""
+    available, detail = _lab_check_available()
+    if not available:
+        raise HTTPException(status_code=503, detail=detail)
+    if req.scenario not in ("poison_pill", "healthy"):
+        raise HTTPException(status_code=400, detail="Choose from: poison_pill, healthy")
+
+    uid = uuid.uuid4().hex[:6]
+    run_id = f"RUN-LOCALSTACK-notification-{req.scenario}-{uid}"
+    body = (
+        {"simulate_poison_pill": True}
+        if req.scenario == "poison_pill"
+        else {"user_id": f"USR-{uid}"}
+    )
+
+    sqs = aws_client("sqs")
+    queue_url = sqs.create_queue(QueueName="nemoguard-notifications-queue")["QueueUrl"]
+    sqs.send_message(QueueUrl=queue_url, MessageBody=json.dumps(body))
+    result = _lab_invoke(LAB_FUNCTIONS["notification_job"], {"run_id": run_id, "message_body": body})
+    return {"run_id": run_id, **result}
+
+
+_PIPELINE_SCENARIOS = {
+    "ingest_step_fails": {
+        "ingest_object": {"user_id": "USR-{uid}"},
+        "order_events_object": {"orders": [{"order_id": "ORD-{uid}-1", "event_type": "created", "amount": 10.0}]},
+    },
+    "order_events_step_fails": {
+        "ingest_object": {"user_id": "USR-{uid}", "last_login_ip": "10.0.0.1"},
+        "order_events_object": {
+            "orders": [{"order_id": f"ORD-{{uid}}-{i}", "event_type": "created", "amount": 10.0} for i in range(4)],
+            "simulate_partial_write_crash": True,
+            "crash_after_n_rows": 2,
+        },
+    },
+    "healthy": {
+        "ingest_object": {"user_id": "USR-{uid}", "last_login_ip": "10.0.0.1"},
+        "order_events_object": {"orders": [{"order_id": "ORD-{uid}-1", "event_type": "created", "amount": 10.0}]},
+    },
+}
+
+
+class CorrelationCheckRequest(BaseModel):
+    check: str  # "same_alarm" | "different_alarm"
+
+
+# Correlation verification is a durable simulator operation, not a request-
+# scoped browser stream. Keeping its state server-side means it continues
+# through route changes and a returning cockpit can resume progress display.
+_correlation_jobs: dict[str, dict[str, Any]] = {}
+_correlation_jobs_lock = threading.Lock()
+
+
+def _correlation_get_admin_token() -> str:
+    r = httpx.get(f"{NEMOGUARD_API_BASE}/api/v2/auth/mock-login?role=commander", timeout=10.0)
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+
+def _correlation_api_get(path: str, token: str) -> Any:
+    r = httpx.get(f"{NEMOGUARD_API_BASE}{path}", headers={"Authorization": f"Bearer {token}"}, timeout=15.0)
+    r.raise_for_status()
+    return r.json()
+
+
+def _correlation_reset_alarm(alarm_name: str) -> None:
+    try:
+        cw = aws_client("cloudwatch")
+        cw.set_alarm_state(AlarmName=alarm_name, StateValue="OK", StateReason="Reset by Scenario Cockpit correlation check.")
+        time.sleep(2)
+    except Exception:
+        pass
+
+
+def _trigger_cockpit_alarm(alarm_name: str, run_id: str) -> None:
+    """Deliver one alarm event after a verified Cockpit fault.
+
+    LocalStack evaluates metric alarms asynchronously and does not reliably
+    execute alarm actions for a programmatic ``set_alarm_state``. Keep that
+    state update for the Cockpit UI, then publish the equivalent CloudWatch
+    ALARM notification through the provisioned SNS -> SQS -> Watcher route.
+    This avoids synthetic direct webhook posts and gives every deliberate
+    fault injection, including rapid repeats, one observable delivery.
+    """
+    reason = f"Scenario Cockpit detected a verified failed run: {run_id}"
+    cw = aws_client("cloudwatch")
+    cw.set_alarm_state(AlarmName=alarm_name, StateValue="ALARM", StateReason=reason)
+
+    sns = aws_client("sns")
+    topics = sns.list_topics().get("Topics", [])
+    topic_arn = next(
+        (topic["TopicArn"] for topic in topics if topic["TopicArn"].endswith(f":{LAB_ALERTS_TOPIC_NAME}")),
+        None,
+    )
+    if not topic_arn:
+        raise RuntimeError(f"Lab SNS topic '{LAB_ALERTS_TOPIC_NAME}' is not provisioned.")
+
+    function_name = LAB_FUNCTIONS["ingest_job"]
+    notification = {
+        "AlarmName": alarm_name,
+        "NewStateValue": "ALARM",
+        "NewStateReason": reason,
+        "Region": "us-east-1",
+        "Trigger": {"Dimensions": [{"name": "FunctionName", "value": function_name}]},
+    }
+    sns.publish(TopicArn=topic_arn, Subject=f"ALARM: {alarm_name}", Message=json.dumps(notification))
+
+
+def _run_correlation_check(check: str):
+    """Real, live correlation verification -- mirrors
+    scripts/run_scenario_catalog_30.py's scenario_28/29 exactly (same
+    deterministic-or-LLM correlation path, same real alert-count-growth
+    success signal), but streamed into the cockpit UI instead of a CLI
+    script. Two genuinely different real Lambda failures are triggered
+    and NemoGuard's real correlation decision is observed via the actual
+    API, not asserted from a script's exit code."""
+    available, detail = _lab_check_available()
+    if not available:
+        yield f"status: ERROR - lab not available: {detail}\n"
+        return
+
+    yield "status: Fetching admin token...\n"
+    try:
+        token = _correlation_get_admin_token()
+    except Exception as e:
+        yield f"status: ERROR - could not reach NemoGuard API: {e}\n"
+        return
+
+    before = {i["incident_id"] for i in _correlation_api_get("/api/v2/incidents?state=all", token)}
+
+    yield "status: Resetting nemoguard-ingest-job-errors alarm...\n"
+    _correlation_reset_alarm("nemoguard-ingest-job-errors")
+
+    yield "status: Triggering real schema_drift failure (ingest job)...\n"
+    uid1 = uuid.uuid4().hex[:6]
+    run_id1 = f"RUN-LOCALSTACK-schema_drift-{uid1}"
+    key1 = f"customer_profile/{run_id1}.json"
+    s3 = aws_client("s3")
+    s3.put_object(Bucket=LAB_BUCKET_NAME, Key=key1, Body=json.dumps({"user_id": f"USR-{uid1}"}).encode())
+    _lab_invoke(LAB_FUNCTIONS["ingest_job"], {"bucket": LAB_BUCKET_NAME, "key": key1, "run_id": run_id1})
+
+    # Real, live-observed timing (see this file's own correlation-check
+    # dev session and scripts/run_scenario_catalog_30.py's identical
+    # finding): a freshly-provisioned CloudWatch alarm's FIRST-EVER
+    # evaluation, plus real webhook forwarding + LLM correlation, can
+    # genuinely take longer than a short window -- confirmed live by
+    # re-checking the alarm state immediately after a timeout and finding
+    # it HAD tripped, just slightly late. 240s gives real headroom.
+    #
+    # Also -- per the SAME live finding as WP-VAL-002 / run_scenario_
+    # catalog_30.py's scenario_28/29/30: success is EITHER a genuinely
+    # new incident_id OR the alert being correlated onto a PRE-EXISTING
+    # open incident that already shares this alarm (which is CORRECT
+    # correlator behavior, not a bug) -- so track existing incidents'
+    # alert counts too, not just brand-new IDs.
+    yield "status: Waiting for NemoGuard to detect and create/correlate the first incident (real webhook forwarding + LLM correlation, up to 4 minutes)...\n"
+    before_counts = {
+        i["incident_id"]: len(_correlation_api_get(f"/api/v2/incidents/{i['incident_id']}/alerts", token))
+        for i in _correlation_api_get("/api/v2/incidents?state=all", token)
+    }
+    # Widened from 240s to 300s after live confirmation that a genuine
+    # incident DID land, just right at the 240s boundary during this
+    # endpoint's own dev testing -- real end-to-end multi-agent latency
+    # (webhook forward + LLM watcher/correlator) is inherently variable
+    # and 300s gives real headroom without being excessive for a UI
+    # progress stream the operator is actively watching.
+    incident_id = None
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        incidents = _correlation_api_get("/api/v2/incidents?state=all", token)
+        new_ids = [i["incident_id"] for i in incidents if i["incident_id"] not in before]
+        if new_ids:
+            incident_id = new_ids[0]
+            break
+        for i in incidents:
+            iid = i["incident_id"]
+            if iid in before_counts:
+                current = len(_correlation_api_get(f"/api/v2/incidents/{iid}/alerts", token))
+                if current > before_counts[iid]:
+                    incident_id = iid
+                    break
+        if incident_id:
+            break
+        time.sleep(3)
+
+    if not incident_id:
+        yield "status: ERROR - no new incident or existing-incident alert growth observed for the first real failure within 240s.\n"
+        return
+    yield f"status: First incident detected/correlated: {incident_id}\n"
+
+    if check == "same_alarm":
+        before_count = len(_correlation_api_get(f"/api/v2/incidents/{incident_id}/alerts", token))
+        yield "status: Resetting nemoguard-ingest-job-errors alarm again...\n"
+        _correlation_reset_alarm("nemoguard-ingest-job-errors")
+
+        yield "status: Triggering a SECOND, genuinely different real failure (oom_crash) on the SAME alarm...\n"
+        uid2 = uuid.uuid4().hex[:6]
+        run_id2 = f"RUN-LOCALSTACK-oom_crash-{uid2}"
+        key2 = f"customer_profile/{run_id2}.json"
+        s3.put_object(Bucket=LAB_BUCKET_NAME, Key=key2, Body=json.dumps({"user_id": f"USR-{uid2}", "last_login_ip": "10.0.0.1", "simulate_oom": True}).encode())
+        _lab_invoke(LAB_FUNCTIONS["ingest_job"], {"bucket": LAB_BUCKET_NAME, "key": key2, "run_id": run_id2})
+
+        yield "status: Waiting for real correlation decision (up to 90s)...\n"
+        deadline2 = time.monotonic() + 90
+        while time.monotonic() < deadline2:
+            incidents = _correlation_api_get("/api/v2/incidents?state=all", token)
+            new_ids2 = [i["incident_id"] for i in incidents if i["incident_id"] not in before and i["incident_id"] != incident_id]
+            if new_ids2:
+                yield f"status: RESULT: FAIL -- expected oom_crash to correlate onto {incident_id}, but NemoGuard created a NEW incident {new_ids2[0]} instead.\n"
+                return
+            after_count = len(_correlation_api_get(f"/api/v2/incidents/{incident_id}/alerts", token))
+            if after_count > before_count:
+                yield f"status: RESULT: PASS -- second real failure correlated onto the SAME incident {incident_id} (alert_count {before_count} -> {after_count}), as expected for two failures on the same alarm.\n"
+                return
+            time.sleep(3)
+        yield "status: RESULT: INCONCLUSIVE -- no correlation observed within 90s.\n"
+        return
+
+    # different_alarm
+    before2 = {i["incident_id"] for i in _correlation_api_get("/api/v2/incidents?state=all", token)}
+    yield "status: Resetting nemoguard-order-events-job-errors alarm...\n"
+    _correlation_reset_alarm("nemoguard-order-events-job-errors")
+
+    yield "status: Triggering a real failure on a DIFFERENT alarm (order_events partial_write_crash)...\n"
+    uid2 = uuid.uuid4().hex[:6]
+    run_id2 = f"RUN-LOCALSTACK-order-events-partial_write_crash-{uid2}"
+    key2 = f"order_events/{run_id2}.json"
+    orders = [{"order_id": f"ORD-{uuid.uuid4().hex[:8]}", "event_type": "created", "amount": 19.99} for _ in range(10)]
+    s3.put_object(Bucket=LAB_BUCKET_NAME, Key=key2, Body=json.dumps({"orders": orders, "simulate_partial_write_crash": True, "crash_after_n_rows": 5}).encode())
+    _lab_invoke(LAB_FUNCTIONS["order_events_job"], {"bucket": LAB_BUCKET_NAME, "key": key2, "run_id": run_id2})
+
+    yield "status: Waiting for a second, independent incident on the different alarm (up to 180s)...\n"
+    deadline2 = time.monotonic() + 180
+    second_incident_id = None
+    while time.monotonic() < deadline2:
+        incidents = _correlation_api_get("/api/v2/incidents?state=all", token)
+        new_ids2 = [i["incident_id"] for i in incidents if i["incident_id"] not in before2]
+        if new_ids2:
+            second_incident_id = new_ids2[0]
+            break
+        time.sleep(3)
+
+    if second_incident_id and second_incident_id != incident_id:
+        yield f"status: RESULT: PASS -- different alarm correlated to a genuinely different incident ({incident_id} vs {second_incident_id}), as expected.\n"
+    elif second_incident_id == incident_id:
+        yield f"status: RESULT: FAIL -- the different-alarm failure was incorrectly merged into the SAME incident {incident_id}.\n"
+    else:
+        yield "status: RESULT: INCONCLUSIVE -- no second incident observed within 180s.\n"
+
+
+def _run_correlation_job(job_id: str, check: str) -> None:
+    """Runs a correlation verification independently of the browser request."""
+    try:
+        for event in _run_correlation_check(check):
+            if not event.startswith("status: "):
+                continue
+            message = event[len("status: "):].rstrip("\n")
+            with _correlation_jobs_lock:
+                job = _correlation_jobs[job_id]
+                job["logs"].append(message)
+                job["updated_at"] = datetime.now(timezone.utc).isoformat()
+                if message.startswith(("RESULT:", "ERROR")):
+                    job["state"] = "completed"
+        with _correlation_jobs_lock:
+            job = _correlation_jobs[job_id]
+            if job["state"] == "running":
+                job["state"] = "completed"
+            job["updated_at"] = datetime.now(timezone.utc).isoformat()
+    except Exception as exc:
+        with _correlation_jobs_lock:
+            job = _correlation_jobs[job_id]
+            job["logs"].append(f"ERROR - correlation check failed: {exc}")
+            job["state"] = "failed"
+            job["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+
+@app.post("/lab/correlation-check")
+def lab_correlation_check(req: CorrelationCheckRequest):
+    if req.check not in ("same_alarm", "different_alarm"):
+        raise HTTPException(status_code=400, detail="check must be 'same_alarm' or 'different_alarm'")
+
+    with _correlation_jobs_lock:
+        if any(job["state"] == "running" for job in _correlation_jobs.values()):
+            raise HTTPException(status_code=409, detail="A correlation verification is already running.")
+
+        job_id = f"corr-{uuid.uuid4().hex[:12]}"
+        _correlation_jobs[job_id] = {
+            "job_id": job_id,
+            "check": req.check,
+            "state": "running",
+            "logs": ["Correlation verification started in the simulator."],
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    threading.Thread(target=_run_correlation_job, args=(job_id, req.check), daemon=True).start()
+    return _correlation_jobs[job_id]
+
+
+@app.get("/lab/correlation-check/{job_id}")
+def lab_correlation_check_status(job_id: str):
+    with _correlation_jobs_lock:
+        job = _correlation_jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Correlation verification was not found.")
+        # Return a detached snapshot so the worker cannot mutate the response
+        # while FastAPI serializes it.
+        return {**job, "logs": list(job["logs"])}
+
+
+@app.post("/lab/trigger/pipeline")
+def lab_trigger_pipeline(req: LabTriggerRequest):
+    """Real multi-step Step Functions execution (IngestCustomerProfile ->
+    ProcessOrderEvents) -- see localstack_lab/break_pipeline_scenario.py."""
+    available, detail = _lab_check_available()
+    if not available:
+        raise HTTPException(status_code=503, detail=detail)
+    if req.scenario not in _PIPELINE_SCENARIOS:
+        raise HTTPException(status_code=400, detail=f"Choose from: {list(_PIPELINE_SCENARIOS.keys())}")
+
+    uid = uuid.uuid4().hex[:6]
+    ingest_key = f"customer_profile/PIPELINE-{req.scenario}-{uid}.json"
+    order_events_key = f"order_events/PIPELINE-{req.scenario}-{uid}.json"
+    cfg = _PIPELINE_SCENARIOS[req.scenario]
+
+    def _sub(obj):
+        return json.loads(json.dumps(obj).replace("{uid}", uid))
+
+    ingest_object = _sub(cfg["ingest_object"])
+    order_events_object = _sub(cfg["order_events_object"])
+
+    s3 = aws_client("s3")
+    s3.put_object(Bucket=LAB_BUCKET_NAME, Key=ingest_key, Body=json.dumps(ingest_object).encode())
+    s3.put_object(Bucket=LAB_BUCKET_NAME, Key=order_events_key, Body=json.dumps(order_events_object).encode())
+
+    sfn = aws_client("stepfunctions")
+    state_machine_arn = None
+    for sm in sfn.list_state_machines().get("stateMachines", []):
+        if sm["name"] == LAB_STATE_MACHINE_NAME:
+            state_machine_arn = sm["stateMachineArn"]
+            break
+    if not state_machine_arn:
+        raise HTTPException(status_code=503, detail=f"State machine {LAB_STATE_MACHINE_NAME} not found -- run provision.py first.")
+
+    exec_name = f"exec-{req.scenario}-{uid}"
+    start_resp = sfn.start_execution(
+        stateMachineArn=state_machine_arn,
+        name=exec_name,
+        input=json.dumps({"bucket": LAB_BUCKET_NAME, "key": ingest_key}),
+    )
+    execution_arn = start_resp["executionArn"]
+
+    status = "RUNNING"
+    desc = {}
+    for _ in range(15):
+        desc = sfn.describe_execution(executionArn=execution_arn)
+        status = desc["status"]
+        if status != "RUNNING":
+            break
+        time.sleep(1)
+
+    return {
+        "execution_arn": execution_arn,
+        "status": status,
+        "output": desc.get("output"),
+    }
+
 
 import openai
 from openai import AsyncOpenAI
@@ -184,7 +961,7 @@ Ensure that the tags in webhook_payloads include service:service_name that match
     async with httpx.AsyncClient() as client:
         for payload in webhook_payloads:
             try:
-                response = await client.post("http://api:8000/api/v2/ingest/webhook", json=payload, timeout=60.0)
+                response = await client.post(f"{NEMOGUARD_API_BASE}/api/v2/ingest/webhook", json=payload, timeout=60.0)
                 yield f"status: Sent webhook to NemoGuard: {response.status_code}\n"
                 await asyncio.sleep(1)
             except Exception as e:
@@ -435,7 +1212,7 @@ def simulate_failure(scenario_type: str):
     # 3. Fire the webhooks to NemoGuard
     for payload in webhook_payloads:
         try:
-            response = httpx.post("http://api:8000/api/v2/ingest/webhook", json=payload, timeout=60.0)
+            response = httpx.post(f"{NEMOGUARD_API_BASE}/api/v2/ingest/webhook", json=payload, timeout=60.0)
             print(f"Sent webhook to NemoGuard: {response.status_code}")
             time.sleep(1) # small delay between alerts
         except Exception as e:
@@ -458,3 +1235,4 @@ def reset_database():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8001)
+

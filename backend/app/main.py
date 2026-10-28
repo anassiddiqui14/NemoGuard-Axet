@@ -31,3 +31,8 @@ from .api.main import app  # noqa: F401
 @app.post("/backend/api/health")
 async def _axet_health_alias():
     return {"statusCode": 200, "status": "ok"}
+
+# Mount Scenario Cockpit simulator inside the aXet-hosted FastAPI process.
+from simulator_backend.main import app as simulator_app
+app.mount('/api/v2/sim', simulator_app)
+

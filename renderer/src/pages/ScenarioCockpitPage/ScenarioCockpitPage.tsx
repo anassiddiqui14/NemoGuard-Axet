@@ -16,7 +16,7 @@ import {
  * never talks directly to the simulator's internal port.
  */
 
-const SIM_BASE = '/sim';
+const SIM_BASE = '/backend/api/sim';
 
 function Section({ icon, title, subtitle, children, right }: {
     icon: React.ReactNode; title: string; subtitle: string; children: React.ReactNode; right?: React.ReactNode;
@@ -547,3 +547,4 @@ export function ScenarioCockpitPage() {
         </div>
     );
 }
+
