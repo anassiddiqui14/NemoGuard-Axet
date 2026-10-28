@@ -61,6 +61,38 @@ def _plan_violates_data_integrity_policy(rca: Dict, steps: List[Dict]) -> str:
     return ""
 
 
+# The LocalStack-specific data-integrity ordering policy (check staleness ->
+# cleanup -> rerun -> verify) only makes sense when the LocalStack lab execution
+# tools it references actually exist. In normal aXet deployments those tools are
+# not registered, so instructing the critic to require them would either make it
+# fabricate evidence or reject otherwise-sound plans for a capability that was
+# never available in the first place. This section is built once at module import
+# time (it only depends on the static LOCALSTACK_LAB_ENABLED flag) and interpolated
+# into the critic's system prompt below.
+if LOCALSTACK_LAB_ENABLED:
+    _LOCALSTACK_POLICY_SECTION = """
+DATA-INTEGRITY POLICY: if the RCA finding indicates the failing job writes to a database
+table (e.g. "order_events"), the final plan's steps MUST check for a stale/partial write
+(check_table_staleness) BEFORE any step that reruns the job, and clean up
+(cleanup_partial_write) first if staleness was detected. If the runbook's proposed steps
+violate this ordering, you MUST set "passed": false and explain the violation in "feedback",
+and STILL reorder/fix the steps in "final_plan" so the corrected version follows the required
+ordering (check -> cleanup if needed -> rerun -> verify) rather than passing through the
+unsafe plan unchanged."""
+else:
+    _LOCALSTACK_POLICY_SECTION = """
+LOCALSTACK/LAB CAPABILITY NOTICE: the LocalStack lab execution environment is NOT available
+in this deployment. Tools such as check_table_staleness, cleanup_partial_write,
+rerun_ingest_job, and verify_row_count_matches_expected do not exist here and MUST NOT be
+added to, or required in, the final plan merely to satisfy the lab's data-integrity ordering
+policy. When a remediation step cannot be executed through an available capability, keep it
+as a clearly-labeled human/manual recovery instruction instead of inventing a tool call. The
+mere absence of LocalStack capability must NOT, by itself, cause you to reject an otherwise
+grounded and well-evidenced plan. Do not fabricate infrastructure evidence -- never claim you
+checked table staleness, cleaned up a partial write, or verified a row count unless a real
+tool call actually returned that result."""
+
+
 class GroundingCritic(BaseAgent):
     def __init__(self):
         super().__init__(
@@ -69,7 +101,7 @@ class GroundingCritic(BaseAgent):
             # stronger model since this is the last automated check standing between the AI's
             # output and a real recovery action.
             model="nvidia/nemotron-3-ultra-550b-a55b",
-            system_prompt="""You are the Grounding Critic -- the final independent safety/verification
+            system_prompt=f"""You are the Grounding Critic -- the final independent safety/verification
 gate before a recovery plan reaches a human approver (spec: "Grounding and Safety Critic").
 
 CRITICAL: you are a VERIFIER, not an actor. You have access to READ-ONLY diagnostic tools
@@ -83,34 +115,28 @@ just trusting their text. For example: if the RCA claims a specific log line or 
 error, you may re-run query_logs or query_cloudwatch_logs yourself to confirm it's really
 there. If a claim cannot be independently confirmed, treat it as weaker evidence and say so
 in your feedback.
-
-DATA-INTEGRITY POLICY: if the RCA finding indicates the failing job writes to a database
-table (e.g. "order_events"), the final plan's steps MUST check for a stale/partial write
-(check_table_staleness) BEFORE any step that reruns the job, and clean up
-(cleanup_partial_write) first if staleness was detected. If the runbook's proposed steps
-violate this ordering, you MUST set "passed": false and explain the violation in "feedback",
-and STILL reorder/fix the steps in "final_plan" so the corrected version follows the required
-ordering (check -> cleanup if needed -> rerun -> verify) rather than passing through the
-unsafe plan unchanged.
+{_LOCALSTACK_POLICY_SECTION}
 
 Once you have independently verified what you can, return ONLY valid JSON in this exact
 format as your final response (do not wrap it in markdown):
-{
+{{
   "passed": true|false,
   "feedback": "Your critique here, including anything you independently verified or could not verify",
-  "final_plan": {
+  "final_plan": {{
     "rationale": "Combined summary of RCA, impact and runbook",
     "expected_outcome": "System restored",
     "risk": "MEDIUM",
     "steps": [
-       {"action": "Step action", "tool": "manual", "risk": "LOW"}
+       {{"action": "Step action", "tool": "manual", "risk": "LOW"}}
     ]
-  }
-}"""
+  }}
+}}"""
         )
         
-    async def analyze(self, rca: Dict, impact: Dict, runbook: Dict) -> Dict:
+    async def analyze(self, incident_id: str, rca: Dict, impact: Dict, runbook: Dict) -> Dict:
         prompt = f"""
+        AUTHORITATIVE INCIDENT ID: {incident_id}
+
         RCA Result: {rca}
         IMPACT Result: {impact}
         RUNBOOK Result: {runbook}
@@ -119,6 +145,12 @@ format as your final response (do not wrap it in markdown):
         independently verify any specific factual claims you can (e.g. re-check a log line,
         a CloudWatch metric, or a table's staleness) before combining everything into a
         final recovery plan.
+
+        IMPORTANT:
+        - When calling `query_logs`, use exactly the AUTHORITATIVE INCIDENT ID supplied above.
+        - Never invent, substitute, shorten, or use example incident IDs.
+        - Example IDs appearing in tool schemas such as `INC-12345` are documentation examples
+          only and must never be used as the actual query argument.
         """
         result = await self.call_llm_with_tools(prompt, _get_read_only_tools_schema(), execute_tool_call)
 
@@ -172,7 +204,7 @@ class LangGraphInvestigator:
             impact = state.get("impact_result", {}) or {}
             runbook = state.get("runbook_result", {}) or {}
 
-            res = await self.critic.analyze(rca, impact, runbook)
+            res = await self.critic.analyze(state["incident_id"], rca, impact, runbook)
 
             final_plan = res.get("final_plan") or {}
             # The critic call can fail outright (LLM error, malformed/truncated JSON — see
