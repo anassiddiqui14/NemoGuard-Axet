@@ -1,10 +1,12 @@
 import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { ArrowRight } from 'lucide-react';
+import { isAxetFlowsRuntime } from '../../contexts/AuthGateContext';
 
 export function CtaBand() {
     const navigate = useNavigate();
-    const hasToken = !!localStorage.getItem('nemoguard_token');
+    const hasToken =
+        isAxetFlowsRuntime() || !!localStorage.getItem('nemoguard_token');
 
     const handlePrimary = () => {
         navigate(hasToken ? '/app' : '/login');

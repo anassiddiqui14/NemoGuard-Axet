@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { motion, useScroll, useTransform } from 'framer-motion';
 import { ArrowRight, CheckCircle2, Circle, Radio } from 'lucide-react';
 import { Logomark } from './Brand';
+import { isAxetFlowsRuntime } from '../../contexts/AuthGateContext';
 
 interface Stage {
     id: string;
@@ -107,7 +108,8 @@ export function HeroSection() {
     const navigate = useNavigate();
     const sectionRef = useRef<HTMLDivElement>(null);
     const [stageIndex, setStageIndex] = useState(0);
-    const hasToken = !!localStorage.getItem('nemoguard_token');
+    const hasToken =
+        isAxetFlowsRuntime() || !!localStorage.getItem('nemoguard_token');
 
     const { scrollYProgress } = useScroll({
         target: sectionRef,

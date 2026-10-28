@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { motion, useScroll } from 'framer-motion';
 import { ArrowRight } from 'lucide-react';
 import { BrandLockup } from './Brand';
+import { isAxetFlowsRuntime } from '../../contexts/AuthGateContext';
 
 const LINKS = [
     { label: 'How it works', href: '#lifecycle' },
@@ -15,7 +16,8 @@ export function NavBar() {
     const navigate = useNavigate();
     const { scrollYProgress } = useScroll();
     const [scrolled, setScrolled] = useState(false);
-    const hasToken = !!localStorage.getItem('nemoguard_token');
+    const hasToken =
+        isAxetFlowsRuntime() || !!localStorage.getItem('nemoguard_token');
 
     useEffect(() => {
         const onScroll = () => setScrolled(window.scrollY > 24);
