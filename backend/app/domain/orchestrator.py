@@ -671,7 +671,7 @@ class IncidentOrchestrator:
         active_incidents = []
         with self.db.get_connection() as conn:
             cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-            cursor.execute("SELECT incident_id, title, summary, primary_run_id, status FROM incident WHERE status NOT IN ('RESOLVED', 'CLOSED', 'CANCELLED')")
+            cursor.execute("SELECT incident_id, title, summary, primary_run_id, status FROM incident WHERE status NOT IN ('RESOLVED', 'CLOSED', 'CANCELLED', 'FAILED')")
             active_incidents = [dict(row) for row in cursor.fetchall()]
 
         watcher = WatcherAgent()
