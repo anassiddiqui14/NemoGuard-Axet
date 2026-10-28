@@ -43,7 +43,7 @@ class PostgresDatabase:
         with open(schema_path, 'r') as f:
             schema_sql = f.read()
 
-        migration_path = os.path.join(os.path.dirname(__file__), '../../migrations/002_domain_model.sql')
+        migration_path = os.path.join(os.path.dirname(__file__), '../../../migrations/002_domain_model.sql')
         with open(migration_path, 'r') as f:
             migration_sql = f.read()
 
@@ -63,7 +63,7 @@ class PostgresDatabase:
         idempotent -- this is how 007_platform_users.sql (real credentialed
         accounts) gets applied to existing deployments without a manual step.
         """
-        migrations_dir = os.path.join(os.path.dirname(__file__), '../../migrations')
+        migrations_dir = os.path.join(os.path.dirname(__file__), '../../../migrations')
         if not os.path.isdir(migrations_dir):
             return
         filenames = sorted(f for f in os.listdir(migrations_dir) if f.endswith('.sql') and f != '002_domain_model.sql')

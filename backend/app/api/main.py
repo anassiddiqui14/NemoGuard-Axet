@@ -114,15 +114,25 @@ async def startup_event():
     global temporal_client
     db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
     try:
-        # Check if tables exist
+        # Initialize the base schema only for a brand-new database.
         with db.get_connection() as conn:
-            cursor = conn.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = 'incident'")
-            if not cursor.fetchone():
-                print("Initializing database schema...")
-                db.init_schema()
+            cursor = conn.execute(
+                "SELECT tablename FROM pg_tables "
+                "WHERE schemaname = 'public' AND tablename = 'incident'"
+            )
+            schema_exists = cursor.fetchone() is not None
+
+        if not schema_exists:
+            print("Initializing database schema...")
+            db.init_schema()
+        else:
+            # Existing deployments still need any newly-added migrations.
+            print("Applying pending database migrations...")
+            db.apply_pending_migrations()
+
     except Exception as e:
         print(f"Failed to initialize database: {e}")
-        
+
     try:
         temporal_url = os.getenv("TEMPORAL_URL", "localhost:7233")
         temporal_client = await Client.connect(temporal_url)
@@ -536,7 +546,10 @@ async def reload_capability_policy(current_user: User = Depends(require_role("ad
 
 
 @app.get("/api/v2/incidents/{incident_id}/events/stream")
-async def stream_events(incident_id: str):
+async def stream_events(
+    incident_id: str,
+    current_user: User = Depends(get_current_user),
+):
     async def event_generator():
         yield ": ping\n\n"
         db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))

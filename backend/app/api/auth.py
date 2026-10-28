@@ -5,6 +5,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 from fastapi import Request, HTTPException, Depends
+from app.store.postgres_database import PostgresDatabase
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
 from pydantic import BaseModel
@@ -17,6 +18,13 @@ if not SECRET_KEY:
     )
 ALGORITHM = "HS256"
 IS_DEV_ENV = os.environ.get("ENV", "production").lower() in ("development", "dev", "local")
+
+AXET_FLOWS_AUTH = os.environ.get("AXET_FLOWS_AUTH", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 security = HTTPBearer()
 
@@ -41,29 +49,176 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+def _decode_axet_identity(token: str) -> tuple[str, str]:
     """
-    Dependency to get the current authenticated user from the JWT token.
-    In a real enterprise OIDC integration (Auth0/Okta), this would validate the token signature against the JWKS endpoint.
+    Decode the aXet/Okta bearer identity.
+
+    In aXet Flows, authentication is enforced by the platform middleware.
+    The application consumes the already-authenticated JWT and resolves its
+    Okta identity against NemoGuard's own platform_user table.
     """
-    token = credentials.credentials
+    try:
+        payload = jwt.decode(
+            token,
+            options={
+                "verify_signature": False,
+                "verify_aud": False,
+            },
+        )
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid aXet authentication token")
+
+    okta_id = str(payload.get("okta_id") or payload.get("sub") or "").strip()
+    email = str(payload.get("email") or payload.get("login") or "").strip().lower()
+
+    if not okta_id:
+        raise HTTPException(
+            status_code=401,
+            detail="aXet token does not contain an Okta identity",
+        )
+
+    return okta_id, email
+
+
+def _get_axet_user(token: str) -> User:
+    okta_id, email = _decode_axet_identity(token)
+
+    db = PostgresDatabase(
+        os.environ.get(
+            "POSTGRES_URL",
+            "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db",
+        )
+    )
+
+    with db.get_connection() as conn:
+        cursor = conn.execute(
+            """
+            SELECT
+                user_id,
+                email,
+                roles,
+                tenant_id,
+                workspace_id,
+                is_active,
+                okta_id
+            FROM platform_user
+            WHERE okta_id = %s
+            """,
+            (okta_id,),
+        )
+        row = cursor.fetchone()
+
+        # First aXet login for an existing NemoGuard account:
+        # safely link the corporate Okta identity using the trusted email claim.
+        if row is None and email:
+            cursor = conn.execute(
+                """
+                SELECT
+                    user_id,
+                    email,
+                    roles,
+                    tenant_id,
+                    workspace_id,
+                    is_active,
+                    okta_id
+                FROM platform_user
+                WHERE LOWER(email) = LOWER(%s)
+                """,
+                (email,),
+            )
+            row = cursor.fetchone()
+
+            if row is not None:
+                existing_okta_id = row[6]
+
+                if existing_okta_id and existing_okta_id != okta_id:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="This NemoGuard account is linked to a different Okta identity",
+                    )
+
+                if not existing_okta_id:
+                    conn.execute(
+                        """
+                        UPDATE platform_user
+                        SET okta_id = %s
+                        WHERE user_id = %s
+                        """,
+                        (okta_id, row[0]),
+                    )
+
+        if row is None:
+            raise HTTPException(
+                status_code=403,
+                detail="Authenticated aXet user is not provisioned in NemoGuard",
+            )
+
+        user_id, user_email, roles, tenant_id, workspace_id, is_active, _ = row
+
+        if not is_active:
+            raise HTTPException(
+                status_code=403,
+                detail="NemoGuard account is inactive",
+            )
+
+        conn.execute(
+            """
+            UPDATE platform_user
+            SET last_login_at = %s
+            WHERE user_id = %s
+            """,
+            (datetime.now(timezone.utc).isoformat(), user_id),
+        )
+
+    return User(
+        user_id=user_id,
+        email=user_email,
+        roles=list(roles or ["viewer"]),
+        tenant_id=tenant_id,
+        workspace_id=workspace_id,
+    )
+
+def authenticate_token(token: str) -> User:
+    """
+    Authenticate a raw bearer token.
+
+    Used by normal Authorization-header requests and by transports such as
+    EventSource/SSE that cannot send custom Authorization headers.
+    """
+
+    # aXet Flows authentication.
+    if AXET_FLOWS_AUTH:
+        return _get_axet_user(token)
+
+    # Existing standalone/local NemoGuard authentication.
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+
         user_id: str = payload.get("sub")
         if user_id is None:
-            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
-            
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid authentication credentials",
+            )
+
         return User(
             user_id=user_id,
             email=payload.get("email", ""),
             roles=payload.get("roles", ["viewer"]),
             tenant_id=payload.get("tenant_id", "default_tenant"),
-            workspace_id=payload.get("workspace_id", "default_workspace")
+            workspace_id=payload.get("workspace_id", "default_workspace"),
         )
+
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token has expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    return authenticate_token(credentials.credentials)
 
 def require_role(required_role: str):
     """
@@ -82,8 +237,8 @@ def require_role(required_role: str):
 def get_mock_token(role: str = "admin"):
     access_token = create_access_token(
         data={
-            "sub": "mock-user-123", 
-            "email": "test@nemoguard.com", 
+            "sub": "mock-user-123",
+            "email": "test@nemoguard.com",
             "roles": [role],
             "tenant_id": "tenant_A",
             "workspace_id": "ws_alpha"

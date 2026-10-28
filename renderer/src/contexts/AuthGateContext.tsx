@@ -1,22 +1,14 @@
 import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
 
 interface AuthGateContextValue {
-    // Whether the mock/no-credential login endpoint is reachable at all in
-    // THIS deployment (server-derived; only ever true when the API's ENV is
-    // development/dev/local). Replaces the old client-only `requireLogin`
-    // toggle, which let anyone flip a switch in Settings and bypass sign-in
-    // even in a real deployment.
     devLoginEnabled: boolean;
-    // Whether real email/password sign-in is available (i.e. at least one
-    // active platform_user account has been provisioned via
-    // scripts/create_user.py). Once true, this is a real production
-    // deployment and the login screen should not advertise any bypass.
     credentialLoginEnabled: boolean;
     loading: boolean;
     refresh: () => void;
 }
 
-const TOKEN_KEY = 'nemoguard_token';
+const NEMOGUARD_TOKEN_KEY = 'nemoguard_token';
+const AXET_TOKEN_KEY = 'access_token';
 
 const AuthGateContext = createContext<AuthGateContextValue>({
     devLoginEnabled: false,
@@ -25,6 +17,113 @@ const AuthGateContext = createContext<AuthGateContextValue>({
     refresh: () => { },
 });
 
+/**
+ * aXet.flows injects AXET_CONFIG when the SPA is served.
+ * If flowsBaseUrl exists, we are running inside the Flows runtime.
+ */
+function getAxetFlowsBaseUrl(): string {
+    if (typeof window === 'undefined') {
+        return '';
+    }
+
+    const value = (window as any).AXET_CONFIG?.flowsBaseUrl;
+
+    return typeof value === 'string'
+        ? value.trim().replace(/\/+$/, '')
+        : '';
+}
+
+export function isAxetFlowsRuntime(): boolean {
+    return !!getAxetFlowsBaseUrl();
+}
+
+/**
+ * NemoGuard internally exposes /api/v2/*.
+ *
+ * In aXet.flows the public gateway is:
+ *
+ *   /backend/api/*
+ *
+ * and the python-gateway rewrites that prefix to:
+ *
+ *   /api/v2/*
+ *
+ * Therefore:
+ *
+ *   /api/v2/incidents
+ *
+ * becomes:
+ *
+ *   <flowsBaseUrl>/backend/api/incidents
+ */
+export function resolveApiUrl(url: string): string {
+    const flowsBaseUrl = getAxetFlowsBaseUrl();
+
+    if (!flowsBaseUrl) {
+        return url;
+    }
+
+    if (url.startsWith('/api/v2')) {
+        const suffix = url.slice('/api/v2'.length);
+        return `${flowsBaseUrl}/backend/api${suffix}`;
+    }
+
+    return url;
+}
+
+/**
+ * Reads the aXet access_token using the same contract as the aXet seed.
+ *
+ * The value may be:
+ *   - a raw JWT
+ *   - JSON containing access_token
+ */
+function getAxetAccessToken(): string {
+    if (typeof window === 'undefined') {
+        return '';
+    }
+
+    const raw = window.localStorage.getItem(AXET_TOKEN_KEY);
+
+    if (!raw) {
+        return '';
+    }
+
+    if (raw.trim().startsWith('{')) {
+        try {
+            const parsed = JSON.parse(raw);
+            return parsed?.access_token ?? '';
+        } catch {
+            return raw;
+        }
+    }
+
+    const payload = decodeJwtPayload(raw);
+
+    return payload?.access_token ?? raw;
+}
+
+/**
+ * Returns the token appropriate for the current runtime.
+ *
+ * aXet.flows:
+ *   localStorage.access_token
+ *
+ * Existing standalone/local NemoGuard:
+ *   localStorage.nemoguard_token
+ */
+export function getCurrentAuthToken(): string {
+    if (isAxetFlowsRuntime()) {
+        return getAxetAccessToken();
+    }
+
+    if (typeof window === 'undefined') {
+        return '';
+    }
+
+    return window.localStorage.getItem(NEMOGUARD_TOKEN_KEY) || '';
+}
+
 export function AuthGateProvider({ children }: { children: React.ReactNode }) {
     const [devLoginEnabled, setDevLoginEnabled] = useState(false);
     const [credentialLoginEnabled, setCredentialLoginEnabled] = useState(false);
@@ -32,8 +131,16 @@ export function AuthGateProvider({ children }: { children: React.ReactNode }) {
 
     const load = useCallback(() => {
         setLoading(true);
-        fetch('/api/v2/auth/config')
-            .then((r) => (r.ok ? r.json() : { dev_login_enabled: false, credential_login_enabled: false }))
+
+        fetch(resolveApiUrl('/api/v2/auth/config'))
+            .then((r) =>
+                r.ok
+                    ? r.json()
+                    : {
+                        dev_login_enabled: false,
+                        credential_login_enabled: false,
+                    }
+            )
             .then((data) => {
                 setDevLoginEnabled(!!data.dev_login_enabled);
                 setCredentialLoginEnabled(!!data.credential_login_enabled);
@@ -50,7 +157,14 @@ export function AuthGateProvider({ children }: { children: React.ReactNode }) {
     }, [load]);
 
     return (
-        <AuthGateContext.Provider value={{ devLoginEnabled, credentialLoginEnabled, loading, refresh: load }}>
+        <AuthGateContext.Provider
+            value={{
+                devLoginEnabled,
+                credentialLoginEnabled,
+                loading,
+                refresh: load,
+            }}
+        >
             {children}
         </AuthGateContext.Provider>
     );
@@ -61,85 +175,153 @@ export function useAuthGate() {
 }
 
 /**
- * Decodes a JWT's payload without verifying its signature -- purely so the
- * frontend can inspect claims like `exp` for expiry-check purposes. The
- * backend is always the source of truth for actual verification.
+ * Decode JWT payload for frontend expiry inspection only.
+ * Authentication/authorization remains a backend responsibility.
  */
 function decodeJwtPayload(token: string): any | null {
     try {
         const parts = token.split('.');
-        if (parts.length < 2) return null;
-        const payload = parts[1].replace(/-/g, '+').replace(/_/g, '/');
-        const padded = payload + '='.repeat((4 - (payload.length % 4)) % 4);
+
+        if (parts.length < 2) {
+            return null;
+        }
+
+        const payload = parts[1]
+            .replace(/-/g, '+')
+            .replace(/_/g, '/');
+
+        const padded =
+            payload +
+            '='.repeat((4 - (payload.length % 4)) % 4);
+
         return JSON.parse(atob(padded));
     } catch {
         return null;
     }
 }
 
-/**
- * True if `token` is a well-formed JWT whose `exp` claim is still in the
- * future (with a 30s safety buffer).
- */
 function isTokenValid(token: string): boolean {
     const payload = decodeJwtPayload(token);
-    if (!payload || typeof payload.exp !== 'number') return false;
+
+    if (!payload || typeof payload.exp !== 'number') {
+        return false;
+    }
+
     const nowSeconds = Date.now() / 1000;
+
     return payload.exp - 30 > nowSeconds;
 }
 
 /**
- * Silently mints a development-only token via the mock-login endpoint. Only
- * ever succeeds when the API's ENV is development/dev/local (the endpoint
- * 404s otherwise) -- this is NOT a way to bypass authentication in a real
- * deployment.
+ * Existing NemoGuard development authentication.
+ *
+ * This is intentionally disabled when running inside aXet.flows because
+ * aXet/Okta already owns authentication there.
  */
-export async function acquireDemoToken(role: string = 'commander'): Promise<string | null> {
-    const existing = localStorage.getItem(TOKEN_KEY);
-    if (existing && isTokenValid(existing)) return existing;
-    if (existing) localStorage.removeItem(TOKEN_KEY);
+export async function acquireDemoToken(
+    role: string = 'commander'
+): Promise<string | null> {
+    if (isAxetFlowsRuntime()) {
+        return null;
+    }
+
+    const existing =
+        localStorage.getItem(NEMOGUARD_TOKEN_KEY);
+
+    if (existing && isTokenValid(existing)) {
+        return existing;
+    }
+
+    if (existing) {
+        localStorage.removeItem(NEMOGUARD_TOKEN_KEY);
+    }
+
     try {
-        const res = await fetch(`/api/v2/auth/mock-login?role=${encodeURIComponent(role)}`);
+        const res = await fetch(
+            resolveApiUrl(
+                `/api/v2/auth/mock-login?role=${encodeURIComponent(role)}`
+            )
+        );
+
         if (res.ok) {
             const data = await res.json();
-            localStorage.setItem(TOKEN_KEY, data.access_token);
+
+            localStorage.setItem(
+                NEMOGUARD_TOKEN_KEY,
+                data.access_token
+            );
+
             return data.access_token;
         }
     } catch {
-        // ignore
+        // Ignore development mock-login failure.
     }
+
     return null;
 }
 
 /**
- * Wraps `fetch` for authenticated API calls: attaches the current bearer
- * token, and if the backend rejects the request with 401 (token expired
- * mid-session, or the underlying JWT_SECRET rotated), tries once to obtain
- * a fresh token before giving up. In production deployments (no dev login
- * available) this refresh is only possible by the user signing in again --
- * acquireDemoToken() itself will simply fail closed since the mock-login
- * endpoint is unreachable, and the caller will surface the resulting 401.
+ * Central authenticated HTTP wrapper.
+ *
+ * Local/standalone NemoGuard:
+ *   /api/v2/... + nemoguard_token
+ *
+ * aXet.flows:
+ *   <flowsBaseUrl>/backend/api/... + access_token
  */
-export async function authFetch(url: string, init: RequestInit = {}): Promise<Response> {
+export async function authFetch(
+    url: string,
+    init: RequestInit = {}
+): Promise<Response> {
+    const axetFlows = isAxetFlowsRuntime();
+    const resolvedUrl = resolveApiUrl(url);
+
     const attempt = async (token: string) => {
         const headers = new Headers(init.headers);
-        if (token) headers.set('Authorization', `Bearer ${token}`);
-        return fetch(url, { ...init, headers });
+
+        if (token) {
+            headers.set('Authorization', `Bearer ${token}`);
+        }
+
+        return fetch(resolvedUrl, {
+            ...init,
+            headers,
+        });
     };
 
-    let token = localStorage.getItem(TOKEN_KEY) || '';
-    if (!token || !isTokenValid(token)) {
+    let token = getCurrentAuthToken();
+
+    /**
+     * Only NemoGuard's standalone/local mode is allowed to mint a
+     * replacement development token.
+     *
+     * In Flows, token lifecycle belongs to aXet/Okta.
+     */
+    if (!axetFlows && (!token || !isTokenValid(token))) {
         const refreshed = await acquireDemoToken();
-        if (refreshed) token = refreshed;
+
+        if (refreshed) {
+            token = refreshed;
+        }
     }
 
     let res = await attempt(token);
-    if (res.status === 401) {
-        localStorage.removeItem(TOKEN_KEY);
+
+    /**
+     * Existing NemoGuard refresh behaviour remains for local/dev.
+     *
+     * In aXet.flows we must NOT call mock-login when the corporate
+     * token expires or is rejected.
+     */
+    if (res.status === 401 && !axetFlows) {
+        localStorage.removeItem(NEMOGUARD_TOKEN_KEY);
+
         const refreshed = await acquireDemoToken();
+
         if (refreshed) {
             res = await attempt(refreshed);
         }
     }
+
     return res;
 }
