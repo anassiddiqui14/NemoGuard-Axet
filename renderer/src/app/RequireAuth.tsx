@@ -16,10 +16,12 @@ export function RequireAuth({ children }: { children: React.ReactNode }) {
     useEffect(() => {
     if (authGateLoading) return;
 
-    // In aXet.flows, authentication is owned by the platform.
-    // We only need to confirm that the platform supplied access_token exists.
+    // In aXet Flows, authentication is owned by the platform.
+    // The current aXet runtime uses its HttpOnly session/token cookies,
+    // so the frontend must not require localStorage.access_token.
+    // Protected backend APIs still enforce the authenticated aXet identity.
     if (isAxetFlowsRuntime()) {
-        setHasToken(!!getCurrentAuthToken());
+        setHasToken(true);
         setReady(true);
         return;
     }
