@@ -105,25 +105,17 @@ class BaseAgent:
                 ],
                 temperature=0.1,
                 max_tokens=16384,
-                stream=True,
+                stream=False,
             )
 
-            full_content = ""
+            content = completion.choices[0].message.content or ""
 
-            async for chunk in completion:
-                if not chunk.choices:
-                    continue
+            if content:
+                print(content, flush=True)
 
-                delta = chunk.choices[0].delta
-                content = getattr(delta, "content", None)
+            print(f"[{self.agent_name}] aXet LLM call complete.")
 
-                if content:
-                    print(content, end="", flush=True)
-                    full_content += content
-
-            print(f"\n[{self.agent_name}] aXet LLM call complete.")
-
-            return self._parse_json_content(full_content)
+            return self._parse_json_content(content)
 
         except Exception as e:
             print(f"{self.agent_name} aXet LLM Error: {e}")
