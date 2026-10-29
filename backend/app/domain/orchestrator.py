@@ -10,7 +10,7 @@ import re
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List
 
-from app.store.postgres_database import PostgresDatabase
+from app.store.database_factory import get_database
 from app.domain.enums import IncidentState
 from app.domain.agents.rca_agent import RCAAgent
 from app.domain.agents.dependency_agent import DependencyAgent
@@ -23,9 +23,23 @@ from app.domain.models import (
 )
 
 class IncidentOrchestrator:
-    def __init__(self, db_path: str = os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db")):
-        self.db_path = db_path
-        self.db = PostgresDatabase(db_path)
+    def __init__(self, db_path: str = None):
+        # `db_path` is accepted for backward compatibility with existing
+        # call sites that pass an explicit Postgres connection string
+        # (e.g. `IncidentOrchestrator(self.db.db_path)` in
+        # commander/conversation.py) -- when omitted, the backend-aware
+        # factory is used instead, so this class works unmodified under
+        # either Postgres or SQLite. A caller that explicitly passes
+        # db_path is assumed to want a PostgresDatabase (the only backend
+        # that uses a connection-string db_path); the factory path is
+        # used whenever db_path is not supplied.
+        if db_path is not None:
+            from app.store.postgres_database import PostgresDatabase
+            self.db_path = db_path
+            self.db = PostgresDatabase(db_path)
+        else:
+            self.db = get_database()
+            self.db_path = self.db.db_path
         # NVIDIA_API_KEY MUST be provided via environment (.env / secrets manager).
         # No hardcoded fallback key is used — see docs/IMPROVEMENT_PLAN.md (Security §1).
         if not os.environ.get("NVIDIA_API_KEY"):
@@ -1070,14 +1084,19 @@ class IncidentOrchestrator:
 
     async def process_webhook(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Processes incoming webhooks via the WatcherAgent to determine if it's a valid alert and if it correlates."""
-        import psycopg2.extras
-        
-        # 1. Fetch active incidents
+        # 1. Fetch active incidents. Uses plain conn.execute()+zip(cols,row)
+        # instead of cursor_factory=psycopg2.extras.DictCursor (a
+        # Postgres-only API SqliteDatabase's cursor wrapper does not
+        # implement) -- dict(zip(cols, row)) works identically against
+        # both backends' cursor.description.
         active_incidents = []
         with self.db.get_connection() as conn:
-            cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-            cursor.execute("SELECT incident_id, title, summary, primary_run_id, status FROM incident WHERE status NOT IN ('RESOLVED', 'CLOSED', 'CANCELLED', 'FAILED')")
-            active_incidents = [dict(row) for row in cursor.fetchall()]
+            cursor = conn.execute(
+                "SELECT incident_id, title, summary, primary_run_id, status FROM incident "
+                "WHERE status NOT IN ('RESOLVED', 'CLOSED', 'CANCELLED', 'FAILED')"
+            )
+            cols = [c[0] for c in cursor.description]
+            active_incidents = [dict(zip(cols, row)) for row in cursor.fetchall()]
 
         watcher = WatcherAgent()
         analysis = await watcher.analyze(payload, active_incidents)

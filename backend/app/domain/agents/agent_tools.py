@@ -1,7 +1,6 @@
 import json
 import os
-import psycopg2.extras
-from app.store.postgres_database import PostgresDatabase
+from app.store.database_factory import get_database, get_db_backend_name
 
 # When enabled, agents get access to the real-AWS observability + data
 # integrity tools (query_cloudwatch_logs, list_s3_objects, read_s3_object,
@@ -12,78 +11,92 @@ from app.store.postgres_database import PostgresDatabase
 # needed) is completely unaffected.
 LOCALSTACK_LAB_ENABLED = os.environ.get("NEMOGUARD_LOCALSTACK_LAB", "0") == "1"
 
+def _ilike_op() -> str:
+    """ILIKE is Postgres-only (case-insensitive LIKE); SQLite's LIKE is
+    already case-insensitive for ASCII by default, so the two are
+    interchangeable for this codebase's identifiers (job_id/job_name/
+    runbook title, all plain-ASCII strings)."""
+    return "LIKE" if get_db_backend_name() == "sqlite" else "ILIKE"
+
+
 def query_logs(incident_id: str, keyword: str = "") -> str:
     """Queries the log_event table for the primary_run_id associated with an incident."""
-    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    db = get_database()
     with db.get_connection() as conn:
-        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        
-        # Get primary run ID
-        cursor.execute("SELECT primary_run_id FROM incident WHERE incident_id = %s", (incident_id,))
+        # Uses plain conn.execute() + dict(zip(cols,row)) instead of
+        # cursor_factory=psycopg2.extras.DictCursor (a Postgres-only API
+        # the SQLite cursor wrapper does not implement).
+        cursor = conn.execute("SELECT primary_run_id FROM incident WHERE incident_id = %s", (incident_id,))
         row = cursor.fetchone()
         if not row:
             return f"Incident {incident_id} not found."
-        
-        run_id = row['primary_run_id']
+
+        run_id = row[0]
         if not run_id:
             return f"No primary_run_id associated with incident {incident_id}."
-            
+
         # Get logs
         # NOTE: log_event's actual column is `component`, not `source` (see migrations/002_domain_model.sql
         # and src/store/schema.sql). Using `source` here previously caused a hard Postgres error
         # ('column "source" does not exist'), which silently broke RCA investigation for every incident
         # and caused the Grounding Critic to correctly (but unhelpfully) flag every plan as NEEDS_REVIEW.
         if keyword:
-            cursor.execute(
+            cursor = conn.execute(
                 "SELECT timestamp, level, component, message FROM log_event WHERE run_id = %s AND (message LIKE %s OR component LIKE %s) ORDER BY timestamp ASC LIMIT 50",
                 (run_id, f"%{keyword}%", f"%{keyword}%")
             )
         else:
-            cursor.execute(
+            cursor = conn.execute(
                 "SELECT timestamp, level, component, message FROM log_event WHERE run_id = %s AND level IN ('ERROR', 'WARN') ORDER BY timestamp ASC LIMIT 50",
                 (run_id,)
             )
-            
-        logs = [dict(r) for r in cursor.fetchall()]
+
+        cols = [c[0] for c in cursor.description]
+        logs = [dict(zip(cols, r)) for r in cursor.fetchall()]
         if not logs:
             return f"No logs found matching criteria for run {run_id}."
-            
+
         return json.dumps(logs, indent=2)
 
 
 def get_cmdb_context(service_name: str) -> str:
     """Fetches downstream/upstream dependencies from the CMDB database."""
-    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    db = get_database()
+    ilike = _ilike_op()
     with db.get_connection() as conn:
-        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        
         # We find jobs that match the service_name, then get their asset_dependencies
-        cursor.execute("SELECT job_id, job_name FROM job WHERE job_id ILIKE %s OR job_name ILIKE %s", (f"%{service_name}%", f"%{service_name}%"))
-        jobs = cursor.fetchall()
-        
+        cursor = conn.execute(
+            f"SELECT job_id, job_name FROM job WHERE job_id {ilike} %s OR job_name {ilike} %s",
+            (f"%{service_name}%", f"%{service_name}%"),
+        )
+        job_cols = [c[0] for c in cursor.description]
+        jobs = [dict(zip(job_cols, r)) for r in cursor.fetchall()]
+
         if not jobs:
             # Fallback: if no exact match, return recent assets to ensure LLM has context
-            cursor.execute("SELECT asset_name, owner, sla_minutes FROM business_asset LIMIT 5")
-            assets = cursor.fetchall()
+            cursor = conn.execute("SELECT asset_name, owner, sla_minutes FROM business_asset LIMIT 5")
+            asset_cols = [c[0] for c in cursor.description]
+            assets = [dict(zip(asset_cols, a)) for a in cursor.fetchall()]
             if not assets:
                 return f"Service {service_name} not found in CMDB, and CMDB is empty."
-            return json.dumps({"query": service_name, "note": "Exact match not found, showing available downstream assets in CMDB", "downstream_assets": [dict(a) for a in assets]}, indent=2)
-            
+            return json.dumps({"query": service_name, "note": "Exact match not found, showing available downstream assets in CMDB", "downstream_assets": assets}, indent=2)
+
         job_id = jobs[0]['job_id']
-        cursor.execute('''
+        cursor = conn.execute('''
             SELECT b.asset_name, b.asset_type, b.owner, b.sla_minutes, b.criticality 
             FROM asset_dependency a
             JOIN business_asset b ON a.asset_id = b.asset_id
             WHERE a.job_id = %s
         ''', (job_id,))
-        assets = cursor.fetchall()
-        
+        dep_cols = [c[0] for c in cursor.description]
+        assets = [dict(zip(dep_cols, a)) for a in cursor.fetchall()]
+
         results = {
             jobs[0]['job_name']: {
-                "downstream": [dict(a) for a in assets]
+                "downstream": assets
             }
         }
-        
+
         return json.dumps({"query": service_name, "matches": results}, indent=2)
 
 # Real runbook DOCUMENTS (not just DB rows): Word/PDF files an agent can
@@ -161,20 +174,26 @@ def read_runbook_document(query: str) -> str:
 
 def get_runbook(service_name: str) -> str:
     """Fetches Runbook based on service name from the database."""
-    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    db = get_database()
+    ilike = _ilike_op()
     with db.get_connection() as conn:
-        cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        cursor.execute("SELECT title, incident_type, prerequisites_json, verification_json, rollback_json FROM runbook WHERE title ILIKE %s OR runbook_id ILIKE %s", (f"%{service_name}%", f"%{service_name}%"))
-        rbs = cursor.fetchall()
+        cursor = conn.execute(
+            f"SELECT title, incident_type, prerequisites_json, verification_json, rollback_json "
+            f"FROM runbook WHERE title {ilike} %s OR runbook_id {ilike} %s",
+            (f"%{service_name}%", f"%{service_name}%"),
+        )
+        cols = [c[0] for c in cursor.description]
+        rbs = [dict(zip(cols, r)) for r in cursor.fetchall()]
         if rbs:
-            return json.dumps([dict(r) for r in rbs], indent=2)
-            
+            return json.dumps(rbs, indent=2)
+
         # Fallback: return any available runbook in the demo environment
-        cursor.execute("SELECT title, incident_type, prerequisites_json, verification_json, rollback_json FROM runbook LIMIT 3")
-        rbs = cursor.fetchall()
+        cursor = conn.execute("SELECT title, incident_type, prerequisites_json, verification_json, rollback_json FROM runbook LIMIT 3")
+        cols = [c[0] for c in cursor.description]
+        rbs = [dict(zip(cols, r)) for r in cursor.fetchall()]
         if rbs:
-            return json.dumps([dict(r) for r in rbs], indent=2)
-            
+            return json.dumps(rbs, indent=2)
+
     return f"No runbook found for service {service_name}. Default recommendation: Escalate to L3."
 
 # The OpenAI JSON schema definitions for the tools

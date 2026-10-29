@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from app.store.postgres_database import PostgresDatabase
+from app.store.database_factory import get_database
 from app.domain.commander.status_projector import StatusProjector
 from app.domain.agents.commander_live_agent import CommanderLiveAgent
 
@@ -69,10 +69,8 @@ class IncidentNotFoundError(Exception):
 
 
 class CommanderConversation:
-    def __init__(self, db: Optional[PostgresDatabase] = None):
-        self.db = db or PostgresDatabase(
-            os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db")
-        )
+    def __init__(self, db=None):
+        self.db = db or get_database()
         self.projector = StatusProjector(self.db)
         self.agent = CommanderLiveAgent()
 
@@ -337,7 +335,13 @@ class CommanderConversation:
 
             async def _run_reinvestigation():
                 try:
-                    result = await IncidentOrchestrator(self.db.db_path).reinvestigate_from_commander_guidance(
+                    # No db_path passed -- IncidentOrchestrator() uses the
+                    # backend-aware factory by default. Previously this
+                    # passed `self.db.db_path` explicitly, assuming it was
+                    # always a Postgres connection string; under SQLite,
+                    # `self.db.db_path` is a filesystem path, which would
+                    # have been wrongly fed into PostgresDatabase(...).
+                    result = await IncidentOrchestrator().reinvestigate_from_commander_guidance(
                         incident_id, text, is_fact, guidance_id,
                     )
                     print(f"Commander-triggered reinvestigation for {incident_id}: {result}")

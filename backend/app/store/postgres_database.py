@@ -38,6 +38,21 @@ class PostgresDatabase:
         finally:
             conn.close()
 
+    def table_exists(self, table_name: str) -> bool:
+        """
+        Postgres-native catalog check -- counterpart to
+        SqliteDatabase.table_exists(), so callers (e.g. the API startup
+        schema-exists probe) can call `db.table_exists("incident")`
+        without branching on backend type themselves.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT tablename FROM pg_tables "
+                "WHERE schemaname = 'public' AND tablename = %s",
+                (table_name,),
+            )
+            return cursor.fetchone() is not None
+
     def init_schema(self):
         schema_path = os.path.join(os.path.dirname(__file__), 'schema.sql')
         with open(schema_path, 'r') as f:

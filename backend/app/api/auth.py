@@ -1,14 +1,70 @@
 import os
 import hashlib
 import hmac
+import json
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 from fastapi import Request, HTTPException, Depends
-from app.store.postgres_database import PostgresDatabase
+from app.store.database_factory import get_database, get_db_backend_name
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
 from pydantic import BaseModel
+
+
+def serialize_roles(roles: List[str], db=None) -> object:
+    """
+    Serializes a Python list[str] of roles into whatever shape the
+    TARGET backend's `platform_user.roles` column expects:
+      - Postgres: a real TEXT[] array -- psycopg2 accepts a Python list
+        directly for an ARRAY column, so no transformation is needed.
+      - SQLite: a TEXT column containing a JSON array (see
+        schema_sqlite.sql's platform_user.roles DEFAULT '["viewer"]').
+
+    The target backend is determined, in order:
+      1. From the concrete type of `db` (a SqliteDatabase/PostgresDatabase
+         instance) if provided -- this is authoritative and avoids any
+         risk of disagreeing with `NEMOGUARD_DB_BACKEND` in edge cases
+         (e.g. tests, or a caller holding a db instance constructed
+         before an env var change).
+      2. Falling back to get_db_backend_name() (the env var) only when
+         no `db` instance is available to inspect.
+
+    This is the ONLY place roles are serialized for a DB write; every
+    other part of the app (RBAC checks, JWT claims, API responses)
+    continues to work with a plain list[str].
+    """
+    is_sqlite = (
+        db.__class__.__name__ == "SqliteDatabase" if db is not None
+        else get_db_backend_name() == "sqlite"
+    )
+    if is_sqlite:
+        return json.dumps(list(roles))
+    return list(roles)
+
+
+def deserialize_roles(raw_roles) -> List[str]:
+    """
+    Converts whatever `platform_user.roles` came back as from the
+    CURRENT backend into a plain Python list[str]:
+      - Postgres: psycopg2 already returns a real Python list for a
+        TEXT[] column -- pass through unchanged.
+      - SQLite: the column is a JSON-encoded TEXT string -- parse it.
+        Guards against None/empty/already-a-list values defensively so
+        a malformed or legacy row never raises here.
+    """
+    if raw_roles is None:
+        return ["viewer"]
+    if isinstance(raw_roles, list):
+        return raw_roles
+    if isinstance(raw_roles, str):
+        try:
+            parsed = json.loads(raw_roles)
+            if isinstance(parsed, list):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return ["viewer"]
 
 SECRET_KEY = os.environ.get("JWT_SECRET")
 if not SECRET_KEY:
@@ -83,12 +139,7 @@ def _decode_axet_identity(token: str) -> tuple[str, str]:
 def _get_axet_user(token: str) -> User:
     okta_id, email = _decode_axet_identity(token)
 
-    db = PostgresDatabase(
-        os.environ.get(
-            "POSTGRES_URL",
-            "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db",
-        )
-    )
+    db = get_database()
 
     with db.get_connection() as conn:
         cursor = conn.execute(
@@ -173,7 +224,7 @@ def _get_axet_user(token: str) -> User:
     return User(
         user_id=user_id,
         email=user_email,
-        roles=list(roles or ["viewer"]),
+        roles=deserialize_roles(roles),
         tenant_id=tenant_id,
         workspace_id=workspace_id,
     )

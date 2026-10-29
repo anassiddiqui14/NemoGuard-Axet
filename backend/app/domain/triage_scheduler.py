@@ -40,15 +40,19 @@ import asyncio
 import os
 from typing import Optional
 
-from app.store.postgres_database import PostgresDatabase
+from app.store.database_factory import get_database, get_db_backend_name
 from app.domain.enums import IncidentState
 from app.domain.orchestrator import IncidentOrchestrator
 
 
-def _db_url() -> str:
-    return os.environ.get(
-        "POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"
-    )
+def _get_db():
+    """
+    Returns a fresh backend-aware database instance (Postgres or
+    SQLite, per NEMOGUARD_DB_BACKEND) -- replaces the old
+    `PostgresDatabase(_db_url())` construction used throughout this
+    module so triage scheduling works unmodified under either backend.
+    """
+    return get_database()
 
 
 # Fire-and-forget direct-triage background tasks, keyed by incident_id so a
@@ -97,7 +101,7 @@ def _register_background_task(incident_id: str, task: "asyncio.Task") -> None:
     task.add_done_callback(_on_done)
 
 
-def _restore_if_still_investigating(db: PostgresDatabase, incident_id: str, previous_status: str) -> bool:
+def _restore_if_still_investigating(db, incident_id: str, previous_status: str) -> bool:
     """
     Atomically restores `incident.status` to `previous_status` in a
     SINGLE `UPDATE ... WHERE status = 'INVESTIGATING'` statement -- not a
@@ -146,8 +150,8 @@ async def _run_direct_triage(incident_id: str, previous_status: str) -> None:
     explicitly states whether the restoration actually happened or
     whether the incident had already moved on by the time this ran.
     """
-    db = PostgresDatabase(_db_url())
-    orchestrator = IncidentOrchestrator(_db_url())
+    db = _get_db()
+    orchestrator = IncidentOrchestrator()
     try:
         result = await asyncio.to_thread(orchestrator.triage_incident, incident_id)
         if not result or not result.get("saved_plan"):
@@ -210,7 +214,7 @@ def _log_scheduling_failure_audit(incident_id: str) -> None:
     immediately before this).
     """
     try:
-        IncidentOrchestrator(_db_url())._log_audit(
+        IncidentOrchestrator()._log_audit(
             incident_id, "SYSTEM", "TRIAGE_FAILED",
             "Triage could not be scheduled because of an internal error "
             "while starting the investigation workflow.",
@@ -258,28 +262,83 @@ async def schedule_triage(temporal_client, incident_id: str) -> dict:
       {"accepted": False, "incident_id": ..., "status": "INCIDENT_NOT_FOUND"}
       {"accepted": False, "incident_id": ..., "status": "TEMPORAL_START_FAILED", "restored": True|False}
     """
-    db = PostgresDatabase(_db_url())
-    with db.get_connection() as conn:
-        cursor = conn.execute(
-            "SELECT status FROM incident WHERE incident_id = %s FOR UPDATE",
-            (incident_id,),
-        )
-        row = cursor.fetchone()
-        if not row:
-            return {"accepted": False, "incident_id": incident_id, "status": "INCIDENT_NOT_FOUND"}
+    db = _get_db()
+    backend = get_db_backend_name()
+    if backend == "sqlite":
+        # SQLite has no row-level locking (`SELECT ... FOR UPDATE` is a
+        # Postgres-only construct) -- the equivalent atomic
+        # check-and-set guarantee under SQLite is achieved with an
+        # explicit `BEGIN IMMEDIATE` transaction, which acquires a
+        # RESERVED (write) lock on the WHOLE DATABASE FILE immediately,
+        # before the SELECT even runs. Because SQLite's own default
+        # connection/transaction handling (used by
+        # SqliteDatabase.get_connection()) only acquires locks lazily
+        # when a write actually happens, a second near-simultaneous
+        # caller's own `BEGIN IMMEDIATE` will block until the first
+        # transaction commits or rolls back -- giving the exact same
+        # "only one caller can pass the check-and-set for this
+        # incident" guarantee as Postgres's row lock, just at a coarser
+        # (whole-database, not row) granularity. This is acceptable
+        # here: NemoGuard's SQLite deployment target (aXet Cloud) is a
+        # single-process deployment with no concurrent worker
+        # processes sharing the same file, so whole-database
+        # serialization of this specific atomic step has no real
+        # throughput impact and preserves the intended dedup semantics
+        # exactly.
+        raw_conn = db.get_connection()
+        conn = raw_conn.__enter__()
+        try:
+            conn.conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                "SELECT status FROM incident WHERE incident_id = ?".replace("?", "%s"),
+                (incident_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                conn.conn.rollback()
+                raw_conn.__exit__(None, None, None)
+                return {"accepted": False, "incident_id": incident_id, "status": "INCIDENT_NOT_FOUND"}
 
-        previous_status = row[0]
-        if previous_status in _ACTIVE_STATUSES:
-            return {"accepted": False, "incident_id": incident_id, "status": "TRIAGE_ALREADY_ACTIVE"}
+            previous_status = row[0]
+            if previous_status in _ACTIVE_STATUSES:
+                conn.conn.rollback()
+                raw_conn.__exit__(None, None, None)
+                return {"accepted": False, "incident_id": incident_id, "status": "TRIAGE_ALREADY_ACTIVE"}
 
-        conn.execute(
-            "UPDATE incident SET status = %s WHERE incident_id = %s",
-            (IncidentState.INVESTIGATING.value, incident_id),
-        )
-    # The transaction above has committed (PostgresDatabase.get_connection()
-    # commits on clean exit), releasing the row lock -- any concurrent
+            conn.execute(
+                "UPDATE incident SET status = %s WHERE incident_id = %s",
+                (IncidentState.INVESTIGATING.value, incident_id),
+            )
+            raw_conn.__exit__(None, None, None)  # commits
+        except Exception:
+            raw_conn.__exit__(None, None, None)
+            raise
+    else:
+        with db.get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT status FROM incident WHERE incident_id = %s FOR UPDATE",
+                (incident_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return {"accepted": False, "incident_id": incident_id, "status": "INCIDENT_NOT_FOUND"}
+
+            previous_status = row[0]
+            if previous_status in _ACTIVE_STATUSES:
+                return {"accepted": False, "incident_id": incident_id, "status": "TRIAGE_ALREADY_ACTIVE"}
+
+            conn.execute(
+                "UPDATE incident SET status = %s WHERE incident_id = %s",
+                (IncidentState.INVESTIGATING.value, incident_id),
+            )
+    # The transaction above has committed (get_connection() commits on
+    # clean exit for both backends), releasing the lock -- any concurrent
     # caller for this SAME incident_id will now see INVESTIGATING and be
-    # rejected; a caller for a DIFFERENT incident_id was never blocked.
+    # rejected; a caller for a DIFFERENT incident_id was never blocked
+    # under Postgres (row-level lock), and under SQLite is blocked only
+    # for the brief duration of this atomic check-and-set (not for the
+    # caller's entire subsequent Temporal/direct-triage work, which all
+    # happens AFTER this transaction has already committed).
 
     if temporal_client:
         try:
@@ -343,7 +402,7 @@ async def schedule_triage_for_new_incident(temporal_client, incident_id: str, fa
             return {"accepted": True, "incident_id": incident_id, "status": "QUEUED_TEMPORAL"}
         except Exception as e:
             print(f"schedule_triage_for_new_incident: Temporal start_workflow() failed for {incident_id}: {e}")
-            db = PostgresDatabase(_db_url())
+            db = _get_db()
             restored = _restore_if_still_investigating(db, incident_id, fallback_status)
             _log_scheduling_failure_audit(incident_id)
             return {

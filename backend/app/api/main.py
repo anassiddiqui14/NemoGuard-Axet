@@ -9,7 +9,7 @@ import os
 import json
 import uuid
 
-from app.store.postgres_database import PostgresDatabase
+from app.store.database_factory import get_database, get_db_backend_name
 from app.domain.enums import IncidentState
 from app.domain.orchestrator import IncidentOrchestrator
 from app.domain.correlator import CorrelatorEngine
@@ -18,6 +18,7 @@ from app.utils.telemetry import setup_telemetry
 from app.api.auth import (
     get_current_user, require_role, User, get_mock_token,
     LoginRequest, verify_password, issue_token_for_user, IS_DEV_ENV,
+    serialize_roles, deserialize_roles, hash_password,
 )
 
 from temporalio.client import Client
@@ -27,6 +28,63 @@ app = FastAPI(title="NemoGuard - Pipeline Incident Commander", version="2.0.0")
 setup_telemetry("nemoguard_api")
 
 temporal_client = None
+
+
+def _bootstrap_admin_if_configured(db) -> None:
+    """
+    Provisions exactly one admin platform_user on startup when
+    NEMOGUARD_BOOTSTRAP_ADMIN_EMAIL is set -- the ONLY way to get a first
+    account into a brand-new, empty platform_user table (e.g. a fresh
+    SQLite file on aXet Cloud). Without this, AXET_FLOWS_AUTH=true against
+    an empty platform_user table means _get_axet_user() can never match
+    any okta_id/email and NOBODY can ever sign in.
+
+    Idempotent and safe to run on every startup:
+      - If a platform_user with this email already exists, it is left
+        completely untouched (no password/roles/okta_id overwrite) --
+        this bootstrap only ever CREATES the account once; it is not a
+        mechanism for repeatedly resetting it on every restart.
+      - If the email is unset, this is a complete no-op (existing
+        deployments that have never set this variable are unaffected).
+
+    The provisioned account has roles=["admin"] and a random, never-
+    logged password (the account is expected to authenticate via
+    AXET_FLOWS_AUTH's Okta-backed flow, which looks up by okta_id/email,
+    not by password) -- but a real PBKDF2 hash is still stored so the
+    standalone email/password login path also works if ever needed.
+    """
+    bootstrap_email = os.environ.get("NEMOGUARD_BOOTSTRAP_ADMIN_EMAIL", "").strip().lower()
+    if not bootstrap_email:
+        return
+
+    import secrets
+    import uuid as _uuid
+
+    try:
+        with db.get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT user_id FROM platform_user WHERE email = %s", (bootstrap_email,),
+            )
+            if cursor.fetchone():
+                print("Bootstrap admin account already provisioned; skipping.")
+                return
+
+            user_id = f"USR-{_uuid.uuid4().hex[:8]}"
+            random_password = secrets.token_urlsafe(32)
+            password_hash = hash_password(random_password)
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "INSERT INTO platform_user (user_id, email, password_hash, display_name, roles, "
+                "tenant_id, workspace_id, is_active, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    user_id, bootstrap_email, password_hash, "Bootstrap Admin",
+                    serialize_roles(["admin"], db=db), "default_tenant", "default_workspace", 1, now,
+                ),
+            )
+        print("Bootstrap admin account provisioned.")
+    except Exception as e:
+        print(f"Failed to provision bootstrap admin account: {e}")
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -55,7 +113,7 @@ def auth_config():
     as an option the moment a real deployment has real accounts, without any
     client-side toggle able to re-enable it.
     """
-    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    db = get_database()
     has_real_users = False
     try:
         with db.get_connection() as conn:
@@ -77,7 +135,7 @@ def login(req: LoginRequest):
     mock-login flow where any typed password worked and the "role" was
     whatever the operator happened to click in a dropdown.
     """
-    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    db = get_database()
     with db.get_connection() as conn:
         cursor = conn.execute(
             "SELECT user_id, email, password_hash, roles, tenant_id, workspace_id, is_active FROM platform_user WHERE email = %s",
@@ -96,7 +154,7 @@ def login(req: LoginRequest):
     token = issue_token_for_user({
         "user_id": user_id,
         "email": email,
-        "roles": roles,
+        "roles": deserialize_roles(roles),
         "tenant_id": tenant_id,
         "workspace_id": workspace_id,
     })
@@ -112,50 +170,90 @@ def login(req: LoginRequest):
 @app.on_event("startup")
 async def startup_event():
     global temporal_client
-    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    db = get_database()
     try:
         # Initialize the base schema only for a brand-new database.
-        with db.get_connection() as conn:
-            cursor = conn.execute(
-                "SELECT tablename FROM pg_tables "
-                "WHERE schemaname = 'public' AND tablename = 'incident'"
-            )
-            schema_exists = cursor.fetchone() is not None
+        # table_exists() is backend-agnostic (PostgresDatabase queries
+        # pg_tables; SqliteDatabase queries sqlite_master) -- this route
+        # no longer embeds Postgres-only catalog SQL directly.
+        schema_exists = db.table_exists("incident")
 
         if not schema_exists:
             print("Initializing database schema...")
             db.init_schema()
         else:
-            # Existing deployments still need any newly-added migrations.
+            # Existing deployments still need any newly-added migrations
+            # (Postgres only -- SqliteDatabase.apply_pending_migrations()
+            # is an intentional no-op for Phase 1; see its docstring).
             print("Applying pending database migrations...")
             db.apply_pending_migrations()
 
     except Exception as e:
-        print(f"Failed to initialize database: {e}")
+        print(f"Failed to initialize database (backend={get_db_backend_name()}): {e}")
+        raise
 
-    try:
-        temporal_url = os.getenv("TEMPORAL_URL", "localhost:7233")
-        temporal_client = await Client.connect(temporal_url)
-        print(f"Connected to Temporal server at {temporal_url}")
-    except Exception as e:
-        print(f"Failed to connect to Temporal: {e}")
+    _bootstrap_admin_if_configured(db)
+
+    # NEMOGUARD_TEMPORAL_ENABLED defaults to "true" so EXISTING local/
+    # standalone deployments keep attempting a Temporal connection exactly
+    # as before. aXet Cloud (which has no Temporal service at all) sets
+    # this to "false" explicitly, so startup never wastes time attempting
+    # an unreachable localhost:7233 connection -- temporal_client simply
+    # stays None, and every existing "if temporal_client: ... else:
+    # direct-background fallback" code path already handles that exactly
+    # the same way it does today when the optional Temporal connection
+    # attempt below merely fails.
+    temporal_enabled = os.getenv("NEMOGUARD_TEMPORAL_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
+    if not temporal_enabled:
+        temporal_client = None
+        print("Temporal is disabled (NEMOGUARD_TEMPORAL_ENABLED=false); deterministic direct-triage/direct-execution fallback remains available.")
+    else:
+        try:
+            temporal_url = os.getenv("TEMPORAL_URL", "localhost:7233")
+            temporal_client = await Client.connect(temporal_url)
+            print(f"Connected to Temporal server at {temporal_url}")
+        except Exception as e:
+            print(f"Failed to connect to Temporal: {e}")
 
 # --- 12.1 Overview endpoints ---
 
 @app.get("/api/v2/status")
 def get_status():
+    """
+    Reports real runtime state -- never leaks database paths, connection
+    strings, tokens, or credentials. `database` is probed with a cheap
+    live query (never just "assumed healthy") so a genuinely broken
+    database connection is surfaced as "unhealthy" rather than always
+    reporting "healthy" regardless of actual state.
+    """
+    database_backend = get_db_backend_name()
+    database_status = "healthy"
+    try:
+        db = get_database()
+        with db.get_connection() as conn:
+            conn.execute("SELECT 1")
+    except Exception:
+        database_status = "unhealthy"
+
+    temporal_status = "connected" if temporal_client else (
+        "disabled" if os.getenv("NEMOGUARD_TEMPORAL_ENABLED", "true").strip().lower() in ("false", "0", "no", "off")
+        else "disconnected"
+    )
+
     return {
-        "environment": "development",
-        "inference_provider": "nvidia_nim",
+        "environment": os.environ.get("ENV", "production"),
+        "database_backend": database_backend,
+        "database": database_status,
         "orchestrator": "healthy",
         "policy_engine": "active",
-        "database": "healthy",
-        "last_checked_at": datetime.now(timezone.utc).isoformat()
+        "temporal": temporal_status,
+        "inference_provider": "axet",
+        "last_checked_at": datetime.now(timezone.utc).isoformat(),
     }
 
 @app.get("/api/v2/overview")
 def get_overview():
-    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    db = get_database()
     try:
         with db.get_connection() as conn:
             cur = conn.execute("SELECT COUNT(*) FROM incident WHERE status != 'RESOLVED'")
@@ -181,7 +279,7 @@ def get_overview():
 
 @app.get("/api/v2/incidents")
 def list_incidents(state: str = "open"):
-    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    db = get_database()
     with db.get_connection() as conn:
         # Include resolved_at so the frontend can show "time to resolve" for
         # resolved incidents instead of a live-ticking elapsed-time clock that
@@ -205,7 +303,7 @@ def list_incidents(state: str = "open"):
 
 @app.get("/api/v2/incidents/{incident_id}")
 def get_incident(incident_id: str):
-    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    db = get_database()
     with db.get_connection() as conn:
         cursor = conn.execute("SELECT * FROM incident WHERE incident_id = %s", (incident_id,))
         row = cursor.fetchone()
@@ -221,7 +319,7 @@ def get_incident_summary(incident_id: str):
 
 @app.get("/api/v2/incidents/{incident_id}/hypotheses")
 def get_hypotheses(incident_id: str):
-    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    db = get_database()
     with db.get_connection() as conn:
         cursor = conn.execute("SELECT * FROM hypothesis WHERE incident_id = %s ORDER BY confidence DESC", (incident_id,))
         cols = [col[0] for col in cursor.description]
@@ -233,7 +331,7 @@ def get_hypotheses(incident_id: str):
 
 @app.get("/api/v2/incidents/{incident_id}/evidence")
 def get_evidence(incident_id: str):
-    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    db = get_database()
     with db.get_connection() as conn:
         cursor = conn.execute("SELECT * FROM evidence WHERE incident_id = %s ORDER BY collected_at ASC", (incident_id,))
         cols = [col[0] for col in cursor.description]
@@ -241,7 +339,7 @@ def get_evidence(incident_id: str):
 
 @app.get("/api/v2/incidents/{incident_id}/impact")
 def get_impact(incident_id: str):
-    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    db = get_database()
     with db.get_connection() as conn:
         cursor = conn.execute("""
             SELECT i.*, d.name as asset_name, d.freshness_sla_minutes 
@@ -258,7 +356,7 @@ def get_impact(incident_id: str):
 @app.get("/api/v2/incidents/{incident_id}/plans")
 def get_plans(incident_id: str):
     from app.domain.plan_hash import compute_plan_hash
-    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    db = get_database()
     with db.get_connection() as conn:
         cursor = conn.execute("SELECT * FROM action_plan WHERE incident_id = %s ORDER BY created_at DESC", (incident_id,))
         cols = [col[0] for col in cursor.description]
@@ -274,7 +372,7 @@ def get_plans(incident_id: str):
 
 @app.get("/api/v2/incidents/{incident_id}/events")
 def get_events(incident_id: str):
-    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    db = get_database()
     with db.get_connection() as conn:
         cursor = conn.execute("SELECT * FROM audit_event WHERE incident_id = %s ORDER BY created_at ASC", (incident_id,))
         cols = [col[0] for col in cursor.description]
@@ -282,7 +380,7 @@ def get_events(incident_id: str):
 
 @app.get("/api/v2/incidents/{incident_id}/alerts")
 def get_incident_alerts(incident_id: str):
-    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    db = get_database()
     with db.get_connection() as conn:
         cursor = conn.execute("""
             SELECT a.* FROM alert a
@@ -294,7 +392,7 @@ def get_incident_alerts(incident_id: str):
 
 @app.get("/api/v2/alerts")
 def get_all_alerts():
-    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    db = get_database()
     with db.get_connection() as conn:
         cursor = conn.execute("SELECT * FROM alert ORDER BY opened_ts DESC")
         cols = [col[0] for col in cursor.description]
@@ -304,7 +402,7 @@ def get_all_alerts():
 
 @app.get("/api/v2/context/alerts/{incident_id}")
 def get_incident_alerts_context(incident_id: str):
-    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    db = get_database()
     with db.get_connection() as conn:
         cursor = conn.execute("""
             SELECT a.alert_id, a.alert_type, a.source_system, a.message, a.opened_ts 
@@ -317,7 +415,7 @@ def get_incident_alerts_context(incident_id: str):
 
 @app.get("/api/v2/context/logs/{incident_id}")
 def get_incident_logs_context(incident_id: str):
-    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    db = get_database()
     with db.get_connection() as conn:
         cursor = conn.execute("SELECT primary_run_id FROM incident WHERE incident_id = %s", (incident_id,))
         run_id_row = cursor.fetchone()
@@ -499,7 +597,7 @@ async def approve_plan(incident_id: str, plan_id: str, req: ApprovalRequest, cur
         )
 
     # Validate the plan_hash actually matches the current plan content (defense against stale/tampered approvals).
-    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    db = get_database()
     from app.domain.plan_hash import compute_plan_hash
     with db.get_connection() as conn:
         # Bound to BOTH action_plan_id AND incident_id (from the URL path):
@@ -608,7 +706,7 @@ async def execute_plan(incident_id: str, plan_id: str, current_user: User = Depe
     bypassed -- none of which exists today, so no such bypass is permitted
     through this route.
     """
-    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    db = get_database()
     with db.get_connection() as conn:
         # Bound to BOTH action_plan_id AND incident_id (from the URL path)
         # so a plan belonging to a DIFFERENT incident cannot satisfy this
@@ -714,7 +812,7 @@ def auth_me(current_user: User = Depends(get_current_user)):
 # CommanderConversation's own equivalent check.
 # ---------------------------------------------------------------------------
 
-def _require_incident_in_tenant(db: PostgresDatabase, incident_id: str, tenant_id: str) -> None:
+def _require_incident_in_tenant(db, incident_id: str, tenant_id: str) -> None:
     """
     Verifies `incident_id` exists AND belongs to `tenant_id`, raising 404 if
     not (never 403 -- "doesn't exist" and "wrong tenant" are intentionally
@@ -733,7 +831,7 @@ def _require_incident_in_tenant(db: PostgresDatabase, incident_id: str, tenant_i
 @app.get("/api/v2/incidents/{incident_id}/commander/status")
 def get_commander_pulse(incident_id: str, current_user: User = Depends(get_current_user)):
     from app.domain.commander.status_projector import StatusProjector
-    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    db = get_database()
     _require_incident_in_tenant(db, incident_id, current_user.tenant_id)
     return StatusProjector(db).get_pulse(incident_id)
 
@@ -803,7 +901,7 @@ async def stream_events(
 ):
     async def event_generator():
         yield ": ping\n\n"
-        db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+        db = get_database()
         last_ts = ""
         # Elapsed-time heartbeat timer: in addition to polling the audit table
         # roughly every second, emit an SSE comment heartbeat (": ping\n\n")

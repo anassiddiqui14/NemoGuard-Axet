@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from app.store.postgres_database import PostgresDatabase
+from app.store.database_factory import get_database, get_db_backend_name
 
 
 def _generate_id(prefix: str) -> str:
@@ -129,11 +129,8 @@ def _template(event_type: str, summary: str, actor: str) -> Optional[Dict[str, A
 
 
 class StatusProjector:
-    def __init__(self, db: Optional[PostgresDatabase] = None):
-        import os
-        self.db = db or PostgresDatabase(
-            os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db")
-        )
+    def __init__(self, db=None):
+        self.db = db or get_database()
 
     def project_audit_event(
         self, audit_event_id: str, incident_id: str, event_type: str, event_summary: str, actor_id: str,
@@ -149,6 +146,17 @@ class StatusProjector:
 
         update_id = _generate_id("CUPD")
         now = datetime.now(timezone.utc).isoformat()
+        # `RETURNING` after `ON CONFLICT ... DO NOTHING` is Postgres-only
+        # syntax (SQLite's RETURNING clause, even where supported by
+        # newer SQLite versions, does not return a row for a no-op
+        # ON CONFLICT DO NOTHING the same way). Instead: perform the
+        # INSERT (ON CONFLICT DO NOTHING is itself fully SQLite-compatible
+        # since 3.24+) without RETURNING, then explicitly check
+        # cursor.rowcount -- backend-agnostic and avoids a second SELECT
+        # round-trip. A rowcount of 0 means the unique index on
+        # source_audit_event_id already had a matching row (idempotent
+        # no-op), exactly the same case RETURNING returning no row would
+        # have indicated.
         with self.db.get_connection() as conn:
             cursor = conn.execute(
                 """
@@ -157,7 +165,6 @@ class StatusProjector:
                     created_at, headline, summary, severity, notify_external
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (source_audit_event_id) DO NOTHING
-                RETURNING update_id
                 """,
                 (
                     update_id, incident_id, audit_event_id, template["update_type"],
@@ -165,8 +172,8 @@ class StatusProjector:
                     int(template["notify_external"]),
                 ),
             )
-            row = cursor.fetchone()
-        return row[0] if row else None
+            inserted = cursor.rowcount == 1
+        return update_id if inserted else None
 
     def project_unprojected_events(self, incident_id: str) -> int:
         """Catches up any audit_event rows for this incident that don't yet
