@@ -180,12 +180,50 @@ class SqliteDatabase:
 
     @contextmanager
     def get_connection(self):
-        conn = sqlite3.connect(self.db_path)
+        """
+        aXet Cloud note: WAL mode requires persistent `-wal` and `-shm`
+        sidecar files next to the main .db file, plus shared-memory
+        locking semantics between whatever connections/processes touch
+        the database. On the aXet Cloud mounted storage path
+        (/internal-storage-files/files/nemoguard/), this was observed to
+        fail specifically when executing `PRAGMA journal_mode = WAL`
+        itself, raising a hard startup failure:
+        `sqlite3.OperationalError: database is locked`. NemoGuard
+        therefore intentionally does NOT enable WAL on aXet Cloud SQLite
+        connections (or anywhere else in this class).
+
+        SQLite instead remains on its default rollback-journal
+        behavior. This is NOT the same as "only the main .db file is
+        ever touched": rollback-journal mode may still temporarily
+        create a `<database>.db-journal` file during an active write
+        transaction, which is deleted again once that transaction
+        commits or rolls back. The important distinction from WAL is
+        that rollback-journal mode does not require the persistent
+        `-wal`/`-shm` sidecar files or WAL's shared-memory locking
+        protocol that caused the aXet Cloud storage layer to fail --
+        the transient `-journal` file it may create is a normal,
+        short-lived part of SQLite's default behavior and was never
+        the source of the observed failure.
+
+        `timeout=30` (seconds) is passed directly to `sqlite3.connect()`
+        so this Python-level connect call itself will wait for an
+        exclusive lock to clear rather than raising immediately;
+        `PRAGMA busy_timeout = 30000` (milliseconds) sets the same wait
+        behavior for every individual statement run on this connection
+        after it's open. Both are set generously (30s) given aXet
+        Cloud's storage layer may have higher I/O latency than local
+        disk. `check_same_thread=False` allows this connection to be
+        used from whatever thread ends up running the request (FastAPI/
+        Starlette may run sync route handlers in a worker thread pool) --
+        safe here because each `get_connection()` call opens its own,
+        never-shared connection and this context manager's try/finally
+        always closes it before returning.
+        """
+        conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
         try:
             conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 30000;")
             conn.execute("PRAGMA foreign_keys = ON;")
-            conn.execute("PRAGMA journal_mode = WAL;")
-            conn.execute("PRAGMA busy_timeout = 5000;")
             wrapper = _SqliteConnectionWrapper(conn)
             yield wrapper
             conn.commit()

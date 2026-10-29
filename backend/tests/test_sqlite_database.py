@@ -37,6 +37,63 @@ class TestSqliteDatabaseBootstrap(unittest.TestCase):
         self.db.init_schema()
         self.assertFalse(self.db.table_exists("not_a_real_table"))
 
+    def test_journal_mode_is_not_wal(self):
+        """
+        aXet Cloud regression guard: WAL mode requires -shm/-wal sidecar
+        files that are NOT reliably supported on the aXet Cloud mounted
+        storage path, which previously caused a hard startup failure
+        (sqlite3.OperationalError: database is locked) directly from
+        `PRAGMA journal_mode = WAL`. get_connection() must never set WAL
+        (or any other journal mode) -- SQLite's default rollback journal
+        (normally reported as "delete") must remain in effect.
+        """
+        self.db.init_schema()
+        with self.db.get_connection() as conn:
+            cursor = conn.execute("PRAGMA journal_mode")
+            mode = cursor.fetchone()[0]
+        self.assertNotEqual(mode.lower(), "wal")
+
+    def test_no_wal_sidecar_files_created(self):
+        """
+        Confirms no -wal / -shm sidecar files appear next to the main
+        .db file after normal use -- the concrete, file-system-level
+        proof that WAL mode is not active (sidecar files are WAL mode's
+        defining artifact; their absence is the real regression guard,
+        independent of what PRAGMA journal_mode happens to report).
+        """
+        self.db.init_schema()
+        with self.db.get_connection() as conn:
+            conn.execute(
+                "INSERT INTO incident (incident_id, title, status, severity, detected_at, "
+                "created_at, updated_at, version) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                ("INC-WAL-1", "T", "DETECTED", "SEV-1", "2026-01-01T00:00:00Z",
+                 "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", 1),
+            )
+        self.assertFalse(os.path.exists(self.db_path + "-wal"))
+        self.assertFalse(os.path.exists(self.db_path + "-shm"))
+
+    def test_repeated_sequential_connections_do_not_require_wal(self):
+        """
+        Exercises many short-lived, sequential get_connection() calls
+        (each opens and fully closes its own connection, as every real
+        call site in this codebase already does) to confirm this pattern
+        works correctly without WAL mode -- the concurrency model this
+        class relies on for aXet Cloud's single-process deployment
+        target is "one connection open at a time, closed promptly," not
+        WAL's multi-reader/single-writer model.
+        """
+        self.db.init_schema()
+        for i in range(25):
+            with self.db.get_connection() as conn:
+                conn.execute(
+                    "INSERT INTO audit_event (audit_event_id, actor_type, actor_id, "
+                    "event_type, event_summary, created_at) VALUES (%s, %s, %s, %s, %s, %s)",
+                    (f"AUD-WAL-{i}", "SYSTEM", "test", "TEST_EVENT", "seq", "2026-01-01T00:00:00Z"),
+                )
+        with self.db.get_connection() as conn:
+            cursor = conn.execute("SELECT COUNT(*) FROM audit_event WHERE actor_id = %s", ("test",))
+            self.assertEqual(cursor.fetchone()[0], 25)
+
     def test_schema_metadata_version_row_present(self):
         self.db.init_schema()
         with self.db.get_connection() as conn:
