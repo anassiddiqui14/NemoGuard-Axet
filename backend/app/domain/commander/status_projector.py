@@ -49,6 +49,23 @@ def _template(event_type: str, summary: str, actor: str) -> Optional[Dict[str, A
         "SAFETY_VALIDATION_FAILED": (
             "CRITIC_REVIEW_COMPLETED", "Safety review flagged a concern", summary, "warning", False,
         ),
+        # Phase 12: a genuinely INCONCLUSIVE safety review (the Grounding
+        # Critic could not complete its evaluation at all -- LLM/tool
+        # error, even after the forced final-synthesis turn) must NEVER
+        # be worded as if the critic found a problem. "Safety review
+        # flagged a concern" (used for a real FAILED verdict above)
+        # implies the critic actually judged the plan unsafe; this
+        # headline is deliberately different so operators can tell the
+        # two cases apart at a glance.
+        "SAFETY_VALIDATION_INCONCLUSIVE": (
+            "CRITIC_REVIEW_COMPLETED", "Safety review could not complete", summary, "warning", False,
+        ),
+        "TRIAGE_STARTED": (
+            "TRIAGE_STARTED", "Triage started", summary, None, False,
+        ),
+        "TRIAGE_FAILED": (
+            "TRIAGE_FAILED", "Triage could not complete", summary, "warning", True,
+        ),
         "PLAN_CREATED": (
             "PLAN_READY", "Recovery plan is ready for review", summary, None, True,
         ),

@@ -35,7 +35,16 @@ export function GreetingBar({ activeCount, approvalCount }: Props) {
             >
                 <div>
                     <h2 className="text-[15px] font-semibold text-text-primary tracking-tight">
-                        {greeting}, <span className="text-primary">{user.displayName}</span>
+                        {/* Phase 13: never render "Signed out" merely because
+                            /auth/me is still in flight -- only once the hook
+                            has explicitly resolved to status==='unauthenticated'.
+                            During 'loading' OR 'error' (a transient
+                            verification failure, not a confirmed sign-out),
+                            show a neutral greeting-only placeholder instead
+                            of asserting the (likely false) "Signed out" state. */}
+                        {user.status === 'loading' || user.status === 'error'
+                            ? greeting
+                            : <>{greeting}, <span className="text-primary">{user.displayName}</span></>}
                     </h2>
                     <AnimatePresence>
                         {!collapsed && (

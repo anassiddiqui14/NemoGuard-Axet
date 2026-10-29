@@ -25,6 +25,16 @@ class InvestigationState(TypedDict):
     runbook_result: Dict[str, Any]
     
     critic_passed: bool
+    # Explicit three-way safety-review outcome, distinct from the boolean
+    # `critic_passed` above (which is retained for backward compatibility
+    # with existing callers/consumers). "FAILED" means the Grounding
+    # Critic actually evaluated the plan and rejected it (a genuine safety
+    # judgment); "INCONCLUSIVE" means the critic could not complete its
+    # review at all (LLM/tool-budget/transport failure) -- this must NEVER
+    # be treated as equivalent to a real safety rejection, but a plan with
+    # an inconclusive review must also never be treated as PASSED. See
+    # GroundingCritic.analyze()/run_critic() below for how this is derived.
+    critic_status: str  # "PASSED" | "FAILED" | "INCONCLUSIVE"
     critic_feedback: str
     final_plan: Dict[str, Any]
 
@@ -228,6 +238,35 @@ class LangGraphInvestigator:
             )
 
             final_plan = res.get("final_plan") or {}
+
+            # Three-way safety-review outcome (Phase 11): distinguish a
+            # GENUINE safety rejection (the critic actually evaluated the
+            # plan and returned "passed": false) from an INCONCLUSIVE
+            # review (the critic call itself failed/errored -- LLM
+            # timeout, malformed response even after the forced final
+            # synthesis turn, tool/runtime exception -- so no real safety
+            # judgment was ever rendered). An inconclusive review must
+            # NEVER be reported as "the critic found this unsafe"; it must
+            # also never be treated as PASSED. Both FAILED and
+            # INCONCLUSIVE keep critic_passed=False for backward
+            # compatibility with any existing boolean consumers, but
+            # critic_status lets callers (orchestrator audit logging,
+            # Commander messaging) react correctly to the difference.
+            critic_errored = "error" in res
+            if critic_errored:
+                critic_status = "INCONCLUSIVE"
+                critic_feedback = (
+                    res.get("feedback", "")
+                    or "Grounding Critic could not complete its safety review (LLM/tool error); "
+                       "no safety verdict was rendered. Plan was synthesized from raw agent findings as a fallback."
+                )
+            elif res.get("passed", False):
+                critic_status = "PASSED"
+                critic_feedback = res.get("feedback", "")
+            else:
+                critic_status = "FAILED"
+                critic_feedback = res.get("feedback", "") or "Grounding Critic evaluated the plan and rejected it."
+
             # The critic call can fail outright (LLM error, malformed/truncated JSON — see
             # BaseAgent.call_llm_json) or return valid JSON but with an empty/missing
             # final_plan. Either way we'd otherwise silently persist a plan with a blank
@@ -247,8 +286,9 @@ class LangGraphInvestigator:
                 }
 
             return {
-                "critic_passed": res.get("passed", False),
-                "critic_feedback": res.get("feedback", "") or ("Grounding Critic response was unavailable or incomplete; plan was synthesized from raw agent findings as a fallback." if "error" in res else ""),
+                "critic_passed": critic_status == "PASSED",
+                "critic_status": critic_status,
+                "critic_feedback": critic_feedback,
                 "final_plan": final_plan
             }
             
@@ -286,6 +326,7 @@ class LangGraphInvestigator:
             "impact_result": {},
             "runbook_result": {},
             "critic_passed": False,
+            "critic_status": "INCONCLUSIVE",
             "critic_feedback": "",
             "final_plan": {}
         }
@@ -305,9 +346,18 @@ class LangGraphInvestigator:
                     elif node_name == "runbook":
                         audit_callback(incident_id, "Runbook Agent", "RUNBOOK_RETRIEVED", "Runbook Agent matched incident to standard recovery steps.")
                     elif node_name == "critic":
-                        if updates.get("critic_passed"):
+                        # Three-way audit emission: a genuine FAILED verdict
+                        # (the critic actually evaluated and rejected the
+                        # plan) is reported distinctly from an INCONCLUSIVE
+                        # review (the critic could not complete its
+                        # evaluation at all) -- the latter must never be
+                        # logged/worded as if the critic found a problem.
+                        critic_status = updates.get("critic_status", "INCONCLUSIVE")
+                        if critic_status == "PASSED":
                             audit_callback(incident_id, "Safety Agent", "SAFETY_VALIDATION_PASSED", "Safety Agent validated plan parameters and verified blast radius is contained.")
-                        else:
+                        elif critic_status == "FAILED":
                             audit_callback(incident_id, "Safety Agent", "SAFETY_VALIDATION_FAILED", f"Safety Agent rejected plan: {updates.get('critic_feedback')}")
+                        else:
+                            audit_callback(incident_id, "Safety Agent", "SAFETY_VALIDATION_INCONCLUSIVE", f"Safety Agent could not complete its review: {updates.get('critic_feedback')}")
 
         return final_state

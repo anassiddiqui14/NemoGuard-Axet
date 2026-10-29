@@ -114,7 +114,17 @@ class IncidentOrchestrator:
         import uuid
         from datetime import datetime, timezone
         from app.domain.agents.langgraph_investigator import LangGraphInvestigator
-        
+
+        # Phase 5: explicit investigation-run boundary. Emitted at the very
+        # start of a first-pass (non-Commander) triage run so the frontend
+        # can determine "the current investigation window" as the latest
+        # of TRIAGE_STARTED / REINVESTIGATION_TRIGGERED, and ignore older
+        # RCA/Impact/Runbook/Safety progression events from a PRIOR run of
+        # the same incident when deriving current Agent Constellation
+        # state. This is purely an additive audit marker -- no historical
+        # events are deleted or altered.
+        self._log_audit(incident_id, "Commander", "TRIAGE_STARTED", "Triage started for this incident.")
+
         investigator = LangGraphInvestigator()
         
         alerts_data = []
@@ -167,12 +177,19 @@ class IncidentOrchestrator:
                 }
             }
             
-            # If the Grounding Critic (Safety Agent) rejected the plan, don't silently present
-            # it as a normal PENDING_APPROVAL plan — surface it to the operator as NEEDS_REVIEW
-            # with the critic's specific feedback attached, so the safety gate actually matters.
-            critic_passed = final_state.get("critic_passed", True)
+            # Phase 11 fail-closed semantics: a genuine safety FAILURE and
+            # an INCONCLUSIVE review (the critic could not complete its
+            # evaluation at all) both route the plan to NEEDS_REVIEW --
+            # neither is auto-approved as PENDING_APPROVAL -- but they are
+            # tracked/reported distinctly (see save_agent_findings()'s
+            # critic_status handling below) so operators are never told
+            # the critic "rejected" a plan it never actually evaluated.
+            critic_status = final_state.get("critic_status", "INCONCLUSIVE")
             critic_feedback = final_state.get("critic_feedback", "")
-            self.save_agent_findings(incident_id, llm_response, critic_passed=critic_passed, critic_feedback=critic_feedback)
+            self.save_agent_findings(
+                incident_id, llm_response,
+                critic_status=critic_status, critic_feedback=critic_feedback,
+            )
             saved_plan = True
         except Exception as e:
             print(f"LangGraph execution failed: {e}")
@@ -267,9 +284,9 @@ class IncidentOrchestrator:
         self._log_audit(incident_id, "Commander", "PLAN_CREATED", f"Formulated {len(steps)}-step recovery plan {plan_id} (risk: {plan_risk}).")
         
     def save_agent_findings(
-        self, incident_id: str, llm_response: Dict[str, Any], critic_passed: bool = True,
+        self, incident_id: str, llm_response: Dict[str, Any], critic_passed: bool = None,
         critic_feedback: str = "", parent_plan_id: str = None, feedback_reference: str = None,
-        plan_version: int = 1,
+        plan_version: int = 1, critic_status: str = None,
     ) -> Dict[str, Any]:
         """
         Saves the JSON output from the NemoClaw agents into the database.
@@ -282,7 +299,49 @@ class IncidentOrchestrator:
         being indistinguishable from a first-pass plan. All existing
         callers default to plan_version=1 with no parent/feedback link,
         preserving current behavior exactly.
+
+        `critic_status` (Phase 11) is the preferred, explicit three-way
+        safety-review outcome: "PASSED" | "FAILED" | "INCONCLUSIVE".
+        `critic_passed` (legacy boolean) is still accepted for backward
+        compatibility with any caller that hasn't been updated -- if
+        `critic_status` is not supplied, it is derived from
+        `critic_passed` using a FAIL-CLOSED mapping:
+            critic_passed is True  -> "PASSED"
+            critic_passed is False -> "FAILED"
+            critic_passed is None  -> "INCONCLUSIVE"  (no verdict at all,
+                e.g. an unset/omitted legacy argument -- this must NEVER
+                be treated as an implicit PASS; the absence of a safety
+                verdict is itself a reason to require manual review)
+        Any explicitly supplied `critic_status` value outside the three
+        valid strings ("PASSED" | "FAILED" | "INCONCLUSIVE") is also
+        treated as fail-closed and coerced to "INCONCLUSIVE" rather than
+        allowed to propagate as an unrecognized value with unpredictable
+        downstream behavior (e.g. silently failing the `== "PASSED"`
+        check in a way that happens to still land on NEEDS_REVIEW today,
+        but offers no guarantee against a future refactor).
+
+        FAILED and INCONCLUSIVE both route the plan to NEEDS_REVIEW
+        (fail-closed -- neither is ever auto-approved as
+        PENDING_APPROVAL), but they are logged with distinct audit event
+        types and distinct operator-facing rationale text so an
+        inconclusive review is never mis-reported as "the safety critic
+        found a problem."
         """
+        _VALID_CRITIC_STATUSES = {"PASSED", "FAILED", "INCONCLUSIVE"}
+        if critic_status is None:
+            if critic_passed is True:
+                critic_status = "PASSED"
+            elif critic_passed is False:
+                critic_status = "FAILED"
+            else:
+                critic_status = "INCONCLUSIVE"
+        elif critic_status not in _VALID_CRITIC_STATUSES:
+            print(
+                f"save_agent_findings: received unrecognized critic_status "
+                f"{critic_status!r} for incident {incident_id}; failing "
+                "closed to INCONCLUSIVE."
+            )
+            critic_status = "INCONCLUSIVE"
         now = datetime.now(timezone.utc).isoformat()
         
         if "error" in llm_response:
@@ -366,13 +425,23 @@ class IncidentOrchestrator:
             # 4. Insert Action Plan
             plan_data = llm_response.get("action_plan", {})
             plan_id = self._generate_id("PLN")
-            # If the Safety Agent (Grounding Critic) flagged this plan, mark it NEEDS_REVIEW
-            # instead of PENDING_APPROVAL so the frontend can gate the Approve button behind
-            # an explicit acknowledgement of the safety concern.
-            plan_status = "NEEDS_REVIEW" if not critic_passed else "PENDING_APPROVAL"
+            # Fail-closed (Phase 11): BOTH a genuine safety FAILURE and an
+            # INCONCLUSIVE review (the critic could not complete its
+            # evaluation at all) route this plan to NEEDS_REVIEW instead
+            # of PENDING_APPROVAL -- neither is ever auto-approved. The
+            # operator-facing rationale text, however, is worded
+            # distinctly for each case so an inconclusive review is never
+            # presented as "the safety critic found this unsafe."
+            plan_status = "PENDING_APPROVAL" if critic_status == "PASSED" else "NEEDS_REVIEW"
             rationale = plan_data.get("rationale", "")
-            if not critic_passed and critic_feedback:
+            if critic_status == "FAILED" and critic_feedback:
                 rationale = f"[SAFETY REVIEW REQUIRED] {critic_feedback}\n\n{rationale}"
+            elif critic_status == "INCONCLUSIVE":
+                rationale = (
+                    f"[SAFETY REVIEW INCOMPLETE] The automated safety review could not complete "
+                    f"({critic_feedback or 'no further detail available'}). This plan has NOT been "
+                    f"evaluated for safety and remains pending manual review.\n\n{rationale}"
+                )
             conn.execute("""
                 INSERT INTO action_plan (action_plan_id, incident_id, agent_run_id, plan_version, status, overall_risk, rationale, expected_outcome, rollback_summary, created_at, parent_plan_id, feedback_reference)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
@@ -431,7 +500,13 @@ class IncidentOrchestrator:
         else:
             self._log_audit(incident_id, "Commander", "PLAN_CREATED", f"Commander synthesized multi-agent findings into recovery plan {plan_id}.")
 
-        return {"status": "success", "plan_id": plan_id}
+        # critic_status is included in the return value so callers (e.g.
+        # Commander's reinvestigate_from_commander_guidance(), whose return
+        # value is forwarded as-is to the chat-outcome messaging in
+        # commander/conversation.py) can distinguish a plan whose safety
+        # review genuinely FAILED from one where it was merely
+        # INCONCLUSIVE, without needing a second round-trip.
+        return {"status": "success", "plan_id": plan_id, "critic_status": critic_status}
 
     def triage_fallback(self, incident_id: str) -> Dict[str, Any]:
         """Generates high-quality triage data by invoking the native Python Tool-Calling Agents. Used when TS-nemoclaw agent is unavailable."""
@@ -498,12 +573,25 @@ class IncidentOrchestrator:
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """, (incident_id, asset_id, imp.get("impact_type"), imp.get("status"), imp.get("reason"), 0.9, "[]"))
 
-            # Action Plan
+            # Action Plan. This fallback path NEVER runs the real
+            # Grounding Critic (GroundingCritic.analyze()) -- it exists to
+            # produce a reviewable recovery proposal when the full
+            # LangGraph investigation itself failed/errored, not to render
+            # an independent safety judgment. It must therefore be
+            # fail-closed: status is NEEDS_REVIEW (never PENDING_APPROVAL)
+            # so it cannot be mistaken for an operator-approvable,
+            # critic-cleared plan.
             plan_id = self._generate_id("PLN")
+            fallback_rationale = (
+                "[SAFETY REVIEW INCOMPLETE] This plan was generated through the deterministic "
+                "fallback path (used because the primary multi-agent investigation could not "
+                "complete) and has NOT been evaluated by the automated Grounding Critic safety "
+                f"review. It remains pending manual review.\n\n{plan_rationale}"
+            )
             conn.execute("""
                 INSERT INTO action_plan (action_plan_id, incident_id, agent_run_id, plan_version, status, overall_risk, rationale, expected_outcome, rollback_summary, created_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (plan_id, incident_id, "Commander", 1, "PENDING_APPROVAL", plan_risk, plan_rationale, plan_outcome,
+            """, (plan_id, incident_id, "Commander", 1, "NEEDS_REVIEW", plan_risk, fallback_rationale, plan_outcome,
                   "Restore schema mapping v118 and re-deploy with backward compatibility flag enabled", now))
             
             steps = [
@@ -526,10 +614,19 @@ class IncidentOrchestrator:
         self._log_audit(incident_id, "RCA Agent", "HYPOTHESIS_CREATED", f"RCA Agent isolated root cause using tools with {confidence*100}% confidence.")
         self._log_audit(incident_id, "Impact Agent", "IMPACT_CALCULATED", f"Impact Agent identified {len(impacts_from_agent)} affected downstream assets from CMDB.")
         self._log_audit(incident_id, "Runbook Agent", "RUNBOOK_RETRIEVED", "Runbook Agent matched incident to standard recovery steps.")
-        self._log_audit(incident_id, "Safety Agent", "SAFETY_VALIDATION_PASSED", "Safety Agent validated plan parameters and verified blast radius is contained.")
-        self._log_audit(incident_id, "Commander", "PLAN_CREATED", f"Commander formulated 4-step recovery plan {plan_id} (risk: {plan_risk}). Human approval required for MEDIUM-risk steps.")
+        # Fail-closed: no Grounding Critic review ran in this fallback
+        # path, so this must NEVER emit SAFETY_VALIDATION_PASSED -- doing
+        # so would falsely tell operators a safety judgment was rendered
+        # when none was. INCONCLUSIVE accurately reflects "no valid critic
+        # verdict exists."
+        self._log_audit(
+            incident_id, "Safety Agent", "SAFETY_VALIDATION_INCONCLUSIVE",
+            "This plan was generated through the deterministic fallback path; the automated "
+            "Grounding Critic safety review did not run and did not complete.",
+        )
+        self._log_audit(incident_id, "Commander", "PLAN_CREATED", f"Commander formulated 4-step recovery plan {plan_id} (risk: {plan_risk}) via fallback logic. Safety review incomplete -- human review required before any approval/execution.")
         
-        return {"status": "success", "plan_id": plan_id}
+        return {"status": "success", "plan_id": plan_id, "critic_status": "INCONCLUSIVE"}
 
     def execute_plan(self, incident_id: str, plan_id: str):
         """
@@ -557,6 +654,47 @@ class IncidentOrchestrator:
         now = datetime.now(timezone.utc).isoformat()
 
         with self.db.get_connection() as conn:
+            # Authoritative execution guard: this is the lowest shared
+            # execution service, so the invariant "a plan may only execute
+            # when its current status is APPROVED" is enforced HERE, not
+            # only at the API layer -- any future caller (API route,
+            # background job, CLI tool, etc.) that reaches execute_plan()
+            # is automatically protected and cannot accidentally bypass
+            # this check by skipping an API-layer-only guard. A plan in
+            # NEEDS_REVIEW (safety FAILED/INCONCLUSIVE/fallback/legacy
+            # origin), PENDING_APPROVAL (not yet approved), SUPERSEDED,
+            # REJECTED, or any other non-APPROVED status must never reach
+            # the capability execution engine below.
+            # Bound to BOTH action_plan_id AND incident_id: action_plan_id
+            # is a unique primary key, but an approved plan that actually
+            # belongs to a DIFFERENT incident must never satisfy this
+            # guard just because its plan_id happened to be passed in
+            # alongside an unrelated incident_id (e.g. a caller/route bug,
+            # or a crafted request mixing a valid plan_id with the wrong
+            # incident_id in the URL). Requiring the pair to match means a
+            # mismatched (incident_id, plan_id) is rejected exactly the
+            # same way as "plan not found" -- no partial/cross-incident
+            # information is read or acted upon.
+            cursor = conn.execute(
+                "SELECT status FROM action_plan WHERE action_plan_id = %s AND incident_id = %s",
+                (plan_id, incident_id),
+            )
+            status_row = cursor.fetchone()
+            if not status_row:
+                raise ValueError(
+                    f"execute_plan: plan {plan_id} not found for incident {incident_id} "
+                    "(either the plan does not exist or it belongs to a different incident)"
+                )
+            current_plan_status = status_row[0]
+            if current_plan_status != "APPROVED":
+                raise ValueError(
+                    f"execute_plan: refusing to execute plan {plan_id} for incident "
+                    f"{incident_id}: current status is '{current_plan_status}', not "
+                    "APPROVED. Plans in NEEDS_REVIEW have not passed an automated "
+                    "safety review and must be investigated/revised before approval; "
+                    "only an APPROVED plan may be executed."
+                )
+
             cursor = conn.execute(
                 "SELECT action_step_id, sequence_no, action_type, tool_name, parameters_json FROM action_step "
                 "WHERE action_plan_id = %s ORDER BY sequence_no ASC",
@@ -697,7 +835,20 @@ class IncidentOrchestrator:
         if "error" in llm_response:
             return llm_response
 
-        # Update the database
+        # Update the database. This legacy path (NVIDIA Nemotron direct
+        # call via call_llm_json(), not the LangGraph/aXet investigation)
+        # revises a rejected plan WITHOUT running the Grounding Critic.
+        # It must therefore be fail-closed: NEEDS_REVIEW (never
+        # PENDING_APPROVAL) until this flow is migrated to the full
+        # investigation path. The legacy LLM call/feedback-generation
+        # behavior itself is intentionally left unchanged here -- only
+        # the resulting plan's safety status is corrected.
+        revised_rationale = (
+            "[SAFETY REVIEW INCOMPLETE] This plan was revised from operator feedback via the "
+            "legacy feedback path and has NOT been evaluated by the automated Grounding Critic "
+            "safety review. It remains pending manual review.\n\n"
+            + llm_response.get("rationale", "")
+        )
         with self.db.get_connection() as conn:
             # Delete old steps
             conn.execute("DELETE FROM action_step WHERE action_plan_id = %s", (plan_id,))
@@ -705,11 +856,11 @@ class IncidentOrchestrator:
             # Update plan
             conn.execute("""
                 UPDATE action_plan 
-                SET rationale = %s, expected_outcome = %s, overall_risk = %s, plan_version = plan_version + 1, status = 'PENDING_APPROVAL'
+                SET rationale = %s, expected_outcome = %s, overall_risk = %s, plan_version = plan_version + 1, status = 'NEEDS_REVIEW'
                 WHERE action_plan_id = %s
             """, (
-                llm_response.get("rationale", ""), 
-                llm_response.get("expected_outcome", ""), 
+                revised_rationale,
+                llm_response.get("expected_outcome", ""),
                 llm_response.get("risk", "MEDIUM"),
                 plan_id
             ))
@@ -723,8 +874,16 @@ class IncidentOrchestrator:
                 """, (self._generate_id("STP"), plan_id, i, step.get("action", ""), step.get("tool", "manual"), risk, 1 if risk in ["MEDIUM", "HIGH"] else 0, "{}", "{}", "{}", "PENDING"))
 
         self._log_audit(incident_id, "Feedback Agent", "PLAN_REVISED", f"Action plan {plan_id} revised based on user feedback.")
+        # Fail-closed: no Grounding Critic review ran on this revised
+        # plan, so this must NEVER emit SAFETY_VALIDATION_PASSED.
+        self._log_audit(
+            incident_id, "Safety Agent", "SAFETY_VALIDATION_INCONCLUSIVE",
+            "The revised plan from operator feedback has not undergone an automated Grounding "
+            "Critic safety review (legacy feedback path). Human review is required before any "
+            "approval or execution.",
+        )
         
-        return {"status": "success", "plan_id": plan_id}
+        return {"status": "success", "plan_id": plan_id, "critic_status": "INCONCLUSIVE"}
 
     async def reinvestigate_from_commander_guidance(
         self, incident_id: str, guidance_text: str, is_fact: bool, guidance_id: str,
@@ -877,7 +1036,7 @@ class IncidentOrchestrator:
         try:
             result = self.save_agent_findings(
                 incident_id, llm_response,
-                critic_passed=final_state.get("critic_passed", True),
+                critic_status=final_state.get("critic_status", "INCONCLUSIVE"),
                 critic_feedback=final_state.get("critic_feedback", ""),
                 parent_plan_id=rejected_plan_id,
                 feedback_reference=guidance_id,

@@ -24,6 +24,17 @@ export function UserMenu() {
 
     const primaryRole = user.roles[0] || 'viewer';
 
+    // During 'loading' or 'error' (a transient /auth/me verification
+    // failure, NOT a confirmed sign-out), show neutral placeholders
+    // rather than an empty initials bubble (loading) or a misleading
+    // identity. 'error' must never look like 'unauthenticated' here --
+    // the trigger button simply shows a neutral "?" rather than any
+    // claim about sign-in state one way or the other.
+    const isPending = user.status === 'loading' || user.status === 'error';
+    const triggerInitials = isPending ? '…' : user.initials;
+    const triggerLabel = isPending ? 'Account menu' : `Account menu for ${user.displayName}`;
+    const triggerTitle = isPending ? undefined : user.displayName;
+
     return (
         <Dropdown
             width="w-72"
@@ -37,27 +48,38 @@ export function UserMenu() {
                 // actual purpose explicit regardless of the user's
                 // initials.
                 <button
-                    aria-label={`Account menu for ${user.displayName}`}
-                    title={user.displayName}
+                    aria-label={triggerLabel}
+                    title={triggerTitle}
                     className="w-8 h-8 rounded-full bg-gradient-to-br from-agent-active to-primary flex items-center justify-center text-[11px] font-semibold text-white cursor-pointer shadow-md press-scale"
                 >
-                    {user.initials}
+                    {triggerInitials}
                 </button>
             }
             header={
                 <div className="px-4 py-3.5 border-b border-white/[0.06]">
-                    <div className="text-[13px] font-semibold text-text-primary truncate">{user.displayName}</div>
-                    <div className="text-[11.5px] text-text-muted truncate">{user.email}</div>
-                    <div className="flex items-center gap-1.5 mt-2 flex-wrap">
-                        <span className="text-[9.5px] font-bold px-2 py-0.5 rounded-full bg-primary/15 text-primary uppercase tracking-wide">
-                            {primaryRole}
-                        </span>
-                        <span className="text-[10px] font-mono text-text-muted">{user.tenantId}</span>
-                    </div>
-                    <div className="mt-2.5 flex items-center gap-2 text-[12px] text-text-secondary">
-                        <ShieldCheck className="w-3.5 h-3.5 text-text-muted flex-shrink-0" />
-                        Authenticated session
-                    </div>
+                    {isPending ? (
+                        // Neutral placeholder for 'loading'/'error' -- never
+                        // claims the user is signed in OR signed out while
+                        // the real identity hasn't been confirmed yet.
+                        <div className="text-[13px] font-semibold text-text-secondary">
+                            {user.status === 'error' ? 'Profile unavailable' : 'Loading profile…'}
+                        </div>
+                    ) : (
+                        <>
+                            <div className="text-[13px] font-semibold text-text-primary truncate">{user.displayName}</div>
+                            <div className="text-[11.5px] text-text-muted truncate">{user.email}</div>
+                            <div className="flex items-center gap-1.5 mt-2 flex-wrap">
+                                <span className="text-[9.5px] font-bold px-2 py-0.5 rounded-full bg-primary/15 text-primary uppercase tracking-wide">
+                                    {primaryRole}
+                                </span>
+                                <span className="text-[10px] font-mono text-text-muted">{user.tenantId}</span>
+                            </div>
+                            <div className="mt-2.5 flex items-center gap-2 text-[12px] text-text-secondary">
+                                <ShieldCheck className="w-3.5 h-3.5 text-text-muted flex-shrink-0" />
+                                {user.status === 'unauthenticated' ? 'Signed out' : 'Authenticated session'}
+                            </div>
+                        </>
+                    )}
                 </div>
             }
             items={[

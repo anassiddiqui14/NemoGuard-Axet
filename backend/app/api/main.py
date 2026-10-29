@@ -355,45 +355,103 @@ async def ingest_webhook(payload: dict):
     if result.get("status") == "ingested_and_incident_created":
         incident_id = result.get("incident_id")
         global temporal_client
-        if temporal_client:
-            from app.domain.workflows.incident_workflow import IncidentLifecycleWorkflow
-            await temporal_client.start_workflow(
-                IncidentLifecycleWorkflow.run,
-                incident_id,
-                id=f"incident-{incident_id}",
-                task_queue="incident-task-queue",
-            )
-        
+        # Unified scheduling: schedule_triage_for_new_incident() owns
+        # BOTH the Temporal start_workflow() call (with failure handling
+        # and conditional atomic status restoration) AND the no-Temporal
+        # direct-background path, for a brand-new incident that
+        # process_webhook() has already inserted with status
+        # INVESTIGATING. This incident never existed before this request,
+        # so schedule_triage()'s same-incident "already active" dedup
+        # check is correctly skipped entirely -- there was nothing prior
+        # to deduplicate against. `fallback_status` is the incident's
+        # real pre-INVESTIGATING lifecycle state (DETECTED), taken from
+        # the IncidentState enum rather than a hardcoded raw string.
+        from app.domain.triage_scheduler import schedule_triage_for_new_incident
+        schedule_result = await schedule_triage_for_new_incident(
+            temporal_client, incident_id, fallback_status=IncidentState.DETECTED.value,
+        )
+
+        # The alert/incident itself WAS successfully ingested and created
+        # regardless of what happens next -- that part of `result` is
+        # never altered. Only the *automatic triage scheduling* outcome
+        # is surfaced separately, so a caller cannot mistake a scheduling
+        # failure for an ingestion failure (and vice versa). No raw
+        # exception text is included -- schedule_triage_for_new_incident()
+        # already logs the detailed exception server-side only.
+        if schedule_result.get("status") == "TEMPORAL_START_FAILED":
+            result = {
+                **result,
+                "triage_scheduling_status": "TEMPORAL_START_FAILED",
+                "triage_scheduling_restored": schedule_result.get("restored", False),
+            }
+        else:
+            result = {**result, "triage_scheduling_status": schedule_result.get("status")}
+
     return result
 
 @app.post("/api/v2/incidents/{incident_id}/triage")
 async def triage_incident(incident_id: str, current_user: User = Depends(get_current_user)):
     """
-    Triage can take a long time, so we schedule it in Temporal.
+    Manual "Start Triage" entry point. Delegates the ENTIRE scheduling
+    decision (Temporal vs. direct background execution, the actual
+    `start_workflow()` call and its failure handling, same-incident
+    deduplication via a DB-level `SELECT ... FOR UPDATE`, and background
+    task lifetime tracking) to the single shared
+    app.domain.triage_scheduler.schedule_triage() -- an `async def` --
+    so the webhook ingestion path can use the exact same logic rather
+    than duplicating it, and so a Temporal start_workflow() failure is
+    caught and the incident's status restored inside schedule_triage()
+    itself rather than left to this route to handle separately.
     """
     global temporal_client
-    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
-    with db.get_connection() as conn:
-        conn.execute(
-            "UPDATE incident SET status = %s WHERE incident_id = %s",
-            (IncidentState.INVESTIGATING.value, incident_id),
-        )
+    from app.domain.triage_scheduler import schedule_triage
+    result = await schedule_triage(temporal_client, incident_id)
 
-    if temporal_client:
-        await temporal_client.start_workflow(
-            IncidentLifecycleWorkflow.run,
-            incident_id,
-            id=f"incident-{incident_id}",
-            task_queue="incident-task-queue",
+    if result["status"] == "INCIDENT_NOT_FOUND":
+        raise HTTPException(status_code=404, detail="Incident not found")
+    if result["status"] == "TRIAGE_ALREADY_ACTIVE":
+        raise HTTPException(status_code=409, detail="Triage already in progress for this incident")
+    if result["status"] == "TEMPORAL_START_FAILED":
+        # Truthful detail text: only claim restoration happened if the
+        # scheduler's atomic conditional restore actually reported success
+        # (result["restored"]). If the incident had already moved on to a
+        # different status by the time the restore ran, do not falsely
+        # tell the operator their incident was reset.
+        detail = (
+            "Failed to schedule triage via Temporal; incident status restored"
+            if result.get("restored")
+            else "Failed to schedule triage via Temporal; incident status may require manual review"
         )
-        return {"accepted": True, "incident_id": incident_id, "status": "QUEUED_TEMPORAL"}
-    else:
-        return {"accepted": False, "incident_id": incident_id, "status": "NO_TEMPORAL_CLIENT"}
+        raise HTTPException(status_code=502, detail=detail)
+
+    return result
 
 @app.post("/api/v2/incidents/{incident_id}/agent-findings")
 def agent_findings(incident_id: str, payload: dict, current_user: User = Depends(get_current_user)):
+    """
+    Accepts externally-supplied agent findings (e.g. from a legacy/
+    external TS-nemoclaw-style pipeline) and persists them. No in-process
+    Grounding Critic safety review runs anywhere in this route -- the
+    payload is an arbitrary, externally-supplied dict. Any critic_status/
+    critic_passed-like field embedded inside `payload` is intentionally
+    IGNORED and never forwarded to save_agent_findings(): there is
+    currently no strongly-typed, authenticated, validated safety-verdict
+    contract for this route, so trusting a self-reported verdict inside
+    an arbitrary payload would let an external caller claim its own
+    findings "passed" safety review without any real review ever having
+    occurred. The safety status is therefore forced to INCONCLUSIVE here,
+    which save_agent_findings() routes to NEEDS_REVIEW (never
+    PENDING_APPROVAL) and logs as SAFETY_VALIDATION_INCONCLUSIVE.
+    """
     orchestrator = IncidentOrchestrator()
-    res = orchestrator.save_agent_findings(incident_id, payload)
+    res = orchestrator.save_agent_findings(
+        incident_id, payload,
+        critic_status="INCONCLUSIVE",
+        critic_feedback=(
+            "External agent findings were persisted without an in-process "
+            "Grounding Critic safety review."
+        ),
+    )
     return res
 
 @app.get("/api/v2/incidents/{incident_id}/agent-logs")
@@ -422,17 +480,42 @@ def submit_feedback(incident_id: str, req: FeedbackRequest, current_user: User =
     return res
 
 @app.post("/api/v2/incidents/{incident_id}/plans/{plan_id}/approve")
-async def approve_plan(incident_id: str, plan_id: str, req: ApprovalRequest, current_user: User = Depends(get_current_user)):
+async def approve_plan(incident_id: str, plan_id: str, req: ApprovalRequest, current_user: User = Depends(require_role("commander"))):
     global temporal_client
+
+    # Decision validation: this endpoint exists ONLY to record an
+    # approval -- any other decision value (reject/rejected/yes/true/
+    # execute/approved/etc.) must be rejected outright rather than
+    # silently proceeding through the approval mutation below. Rejection/
+    # revision of a plan goes through the separate feedback/re-plan flow
+    # (POST .../feedback), not this endpoint.
+    if req.decision.lower() != "approve":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This endpoint only accepts decision='approve'. "
+                "Use the feedback/re-plan flow to reject or revise a plan."
+            ),
+        )
 
     # Validate the plan_hash actually matches the current plan content (defense against stale/tampered approvals).
     db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
     from app.domain.plan_hash import compute_plan_hash
     with db.get_connection() as conn:
-        cursor = conn.execute("SELECT * FROM action_plan WHERE action_plan_id = %s", (plan_id,))
+        # Bound to BOTH action_plan_id AND incident_id (from the URL path):
+        # action_plan_id alone is a unique primary key, but a plan
+        # belonging to a DIFFERENT incident must never be validated,
+        # approved, or launched into execution just because its plan_id
+        # happened to be supplied alongside the wrong incident_id in this
+        # route's URL. Missing predicate here would be the ownership gap
+        # this check closes.
+        cursor = conn.execute(
+            "SELECT * FROM action_plan WHERE action_plan_id = %s AND incident_id = %s",
+            (plan_id, incident_id),
+        )
         plan_row = cursor.fetchone()
         if not plan_row:
-            raise HTTPException(status_code=404, detail="Plan not found")
+            raise HTTPException(status_code=404, detail="Plan not found for this incident")
         plan_cols = [c[0] for c in cursor.description]
         plan_dict = dict(zip(plan_cols, plan_row))
         cursor = conn.execute("SELECT * FROM action_step WHERE action_plan_id = %s ORDER BY sequence_no ASC", (plan_id,))
@@ -444,6 +527,27 @@ async def approve_plan(incident_id: str, plan_id: str, req: ApprovalRequest, cur
         raise HTTPException(
             status_code=409,
             detail="Plan hash mismatch — the plan changed since it was presented for approval. Re-fetch and retry."
+        )
+
+    # Safety-correction guard: plan_hash matching alone does NOT establish
+    # that this plan is actually approvable. A plan sitting in
+    # NEEDS_REVIEW (set when the Grounding Critic genuinely FAILED the
+    # plan, could not complete its review at all, or when this plan was
+    # produced via a fallback/legacy path that never ran the critic) must
+    # never be approvable through this route -- doing so would let an
+    # operator (or any caller with a valid plan_hash) silently convert an
+    # un-reviewed or rejected plan into APPROVED, bypassing the fail-closed
+    # semantics enforced when the plan was created. Only PENDING_APPROVAL
+    # (a plan the critic actually PASSED) may be approved here.
+    if plan_dict.get("status") != "PENDING_APPROVAL":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Plan cannot be approved: current status is "
+                f"'{plan_dict.get('status')}', not PENDING_APPROVAL. Plans in "
+                "NEEDS_REVIEW have not passed an automated safety review and "
+                "require investigation/revision before they can be approved."
+            ),
         )
 
     now = datetime.now(timezone.utc).isoformat()
@@ -481,7 +585,53 @@ async def approve_plan(incident_id: str, plan_id: str, req: ApprovalRequest, cur
 
 @app.post("/api/v2/incidents/{incident_id}/plans/{plan_id}/execute")
 async def execute_plan(incident_id: str, plan_id: str, current_user: User = Depends(require_role("commander"))):
-    # Manual override / direct execution path (also used as fallback by /approve).
+    """
+    Direct execution path (also used as the automatic fallback inside
+    /approve when no live Temporal workflow can be signaled). Role
+    authorization alone (require_role("commander")) is NOT sufficient to
+    permit execution -- this route previously had no status check at all,
+    meaning a commander could execute a plan sitting in NEEDS_REVIEW
+    (safety FAILED/INCONCLUSIVE/fallback/legacy origin), PENDING_APPROVAL
+    (never actually approved), SUPERSEDED, or any other non-APPROVED
+    status. That implicit bypass is removed here: this route now performs
+    an early, API-level check for a clean HTTP 409 response, and the
+    authoritative enforcement lives in IncidentOrchestrator.execute_plan()
+    itself (the lowest shared execution service), so no caller -- this
+    route, the /approve fallback, or any future caller -- can execute a
+    plan that is not APPROVED.
+
+    No new emergency-override mechanism is introduced. If a genuine
+    emergency bypass of automated safety review is ever required, it must
+    be designed separately with an explicit override action, mandatory
+    operator justification, a privileged role, a prominent audit event,
+    and explicit acknowledgement that automated safety approval is being
+    bypassed -- none of which exists today, so no such bypass is permitted
+    through this route.
+    """
+    db = PostgresDatabase(os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db"))
+    with db.get_connection() as conn:
+        # Bound to BOTH action_plan_id AND incident_id (from the URL path)
+        # so a plan belonging to a DIFFERENT incident cannot satisfy this
+        # pre-check just because its plan_id was supplied alongside the
+        # wrong incident_id in the route.
+        cursor = conn.execute(
+            "SELECT status FROM action_plan WHERE action_plan_id = %s AND incident_id = %s",
+            (plan_id, incident_id),
+        )
+        row = cursor.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Plan not found for this incident")
+    if row[0] != "APPROVED":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Plan cannot be executed: current status is '{row[0]}', not "
+                "APPROVED. Plans in NEEDS_REVIEW have not passed an automated "
+                "safety review and must be investigated/revised and explicitly "
+                "approved before execution."
+            ),
+        )
+
     orchestrator = IncidentOrchestrator()
     orchestrator.execute_plan(incident_id, plan_id)
     return {"status": "EXECUTING"}

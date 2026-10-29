@@ -361,7 +361,20 @@ class CommanderConversation:
                             "The previous plan remains available for review."
                         )
                     elif result.get("plan_id"):
+                        # Phase 12: a plan whose safety review was
+                        # INCONCLUSIVE (the critic could not complete its
+                        # evaluation, as opposed to a genuine FAILED
+                        # verdict) must be worded so the operator never
+                        # reads it as "Safety rejected this" -- the plan
+                        # was never auto-approved either way, but the
+                        # distinction matters for how the operator should
+                        # read the situation.
+                        plan_version = result.get("plan_version")
                         outcome = (
+                            f"Re-investigation completed and a revised plan was generated "
+                            f"({result['plan_id']}), but the automated safety review could not complete. "
+                            "The plan remains available for manual review and has not been approved."
+                        ) if result.get("critic_status") == "INCONCLUSIVE" else (
                             f"Re-investigation complete. I've produced a revised recovery plan "
                             f"({result['plan_id']}) based on your input -- check the Recovery plan tab to review it."
                         )

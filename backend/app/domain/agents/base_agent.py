@@ -127,7 +127,39 @@ class BaseAgent:
         tools: list,
         execute_tool_fn,
     ) -> Dict[str, Any]:
-        """Call the aXet LLM iteratively and execute requested tools."""
+        """
+        Call the aXet LLM iteratively and execute requested tools.
+
+        Tool-budget exhaustion fix: previously, if the LAST allowed
+        iteration (max_iterations) itself returned tool_calls, those tools
+        WERE executed and their results appended to `messages`, but the
+        `while` loop then exited on its next condition check WITHOUT ever
+        giving the model a turn to synthesize a final answer from that
+        freshly-fetched evidence -- the method fell straight through to a
+        generic "LLM exceeded maximum allowed tool iterations" error, even
+        though the model may have been perfectly able to produce a valid
+        final response given one more turn. This surfaced concretely as a
+        false SAFETY_VALIDATION_FAILED for the Grounding Critic: the critic
+        never actually rendered a safety judgment, yet the caller treated
+        the resulting error dict as if "passed" were False.
+
+        Fix: when the loop's tool budget is exhausted AND the final
+        iteration's response still contained tool_calls (meaning those
+        tools were executed and their results appended), make exactly ONE
+        additional LLM call with NO `tools` parameter at all (so the
+        OpenAI-compatible API cannot return tool_calls again), explicitly
+        telling the model the diagnostic tool budget is exhausted and it
+        must produce its final answer now from the evidence already
+        gathered. The full existing message history (system prompt, user
+        prompt, every prior assistant/tool turn including the final tool
+        round's results) is reused verbatim; only one new user message is
+        appended. The response is parsed through the same
+        `_parse_json_content()` used everywhere else, so malformed JSON on
+        this forced final turn still degrades gracefully into the same
+        existing error-dict shape callers already handle. `stream=False`
+        is preserved, matching the rest of this already-proven-reliable
+        aXet integration.
+        """
         messages = [
             {
                 "role": "system",
@@ -142,6 +174,7 @@ class BaseAgent:
         try:
             iteration_count = 0
             max_iterations = 5
+            tool_budget_exhausted_with_pending_tools = False
 
             while iteration_count < max_iterations:
                 iteration_count += 1
@@ -158,6 +191,7 @@ class BaseAgent:
                     tools=tools,
                     temperature=0.1,
                     max_tokens=4096,
+                    stream=False,
                 )
 
                 choice = completion.choices[0]
@@ -205,6 +239,13 @@ class BaseAgent:
                             }
                         )
 
+                    # If this was the LAST allowed iteration and the model
+                    # still requested tools (now executed above), fall
+                    # through after the loop to the forced final synthesis
+                    # turn rather than silently erroring.
+                    if iteration_count >= max_iterations:
+                        tool_budget_exhausted_with_pending_tools = True
+
                 else:
                     print(
                         f"\n[{self.agent_name}] "
@@ -214,6 +255,55 @@ class BaseAgent:
                     return self._parse_json_content(
                         message.content or ""
                     )
+
+            if tool_budget_exhausted_with_pending_tools:
+                print(
+                    f"[{self.agent_name}] Tool budget exhausted after "
+                    f"{max_iterations} iterations with pending tool "
+                    "results -- requesting one final tools-disabled "
+                    "synthesis turn."
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "The diagnostic tool budget for this request has been "
+                            "exhausted -- you may NOT call any more tools. Using "
+                            "only the evidence already gathered in this conversation "
+                            "(including the most recent tool results above), produce "
+                            "your final answer now, in the exact format required by "
+                            "your system prompt."
+                        ),
+                    }
+                )
+                final_completion = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0.1,
+                    max_tokens=4096,
+                    stream=False,
+                )
+                final_message = final_completion.choices[0].message
+
+                # Defensive: if the model somehow still attempts a tool
+                # call (it should be structurally unable to, since no
+                # `tools` were supplied), do not silently accept it as a
+                # valid final answer -- treat it the same as "no content".
+                if getattr(final_message, "tool_calls", None):
+                    print(
+                        f"[{self.agent_name}] Forced final synthesis turn "
+                        "unexpectedly returned tool_calls despite no tools "
+                        "being supplied; treating as incomplete."
+                    )
+                    return {
+                        "error": (
+                            "LLM attempted another tool call after the tool "
+                            "budget was exhausted; no valid final answer was "
+                            "produced."
+                        )
+                    }
+
+                return self._parse_json_content(final_message.content or "")
 
             return {
                 "error": (

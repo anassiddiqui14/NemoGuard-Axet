@@ -127,6 +127,15 @@ export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParen
             const res = await authFetch(`/api/v2/incidents/${incidentId}/triage`, {
                 method: 'POST',
             });
+            // Phase 9: 409 (TRIAGE_ALREADY_ACTIVE) and 404 (INCIDENT_NOT_FOUND)
+            // are expected, specific rejections from the backend's
+            // schedule_triage() dedup check -- surface them with their own
+            // clear message rather than the generic HTTP-failure branch.
+            if (res.status === 409) {
+                ngToast.info('Triage is already in progress for this incident.');
+                onRefreshParent();
+                return;
+            }
             if (!res.ok) {
                 let detail = `HTTP ${res.status}`;
                 try {
@@ -138,6 +147,43 @@ export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParen
                 ngToast.error(`Failed to start triage: ${detail}`);
                 return;
             }
+
+            // Parse the response body instead of only trusting res.ok --
+            // the backend's schedule_triage() can return HTTP 200 with
+            // `status: "QUEUED_TEMPORAL"` or `"QUEUED_DIRECT"` (both real
+            // success), so both are treated as success here. Any other/
+            // unexpected status value in an HTTP-200 body is treated as a
+            // soft failure rather than silently assumed successful.
+            let body: { status?: string; accepted?: boolean } = {};
+            try {
+                body = await res.json();
+            } catch {
+                // Non-JSON 200 response -- fall through to the generic
+                // success path below rather than failing outright.
+            }
+
+            // Only these two explicit status values constitute confirmed,
+            // successful scheduling. Any other value -- including
+            // `accepted === true` with an unrecognized/missing `status`, or
+            // any other unexpected body shape -- is NOT treated as proof of
+            // success merely because the HTTP status was 200. There is no
+            // optimistic/forward-compatibility fallback: an unknown status
+            // is always surfaced as an explicit error and the function
+            // returns without refreshing the parent as if triage had
+            // actually started.
+            if (body.status === 'QUEUED_TEMPORAL' || body.status === 'QUEUED_DIRECT') {
+                ngToast.success(
+                    body.status === 'QUEUED_DIRECT'
+                        ? 'Triage started -- investigating now.'
+                        : 'Triage queued.'
+                );
+            } else {
+                ngToast.error(
+                    `Triage was not started: ${body.status || 'unexpected response from server'}`
+                );
+                return;
+            }
+
             onRefreshParent();
         } catch (e) {
             ngToast.error(`Failed to start triage: ${e instanceof Error ? e.message : 'network error'}`);
