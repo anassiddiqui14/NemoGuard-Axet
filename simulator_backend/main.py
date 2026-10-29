@@ -36,11 +36,16 @@ app.add_middleware(
 DATABASE_URL = os.environ.get("POSTGRES_URL", "postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db")
 
 # --- Real-AWS "Scenario Cockpit" lab integration -----------------------
-# Bundled into this image at build time (see Dockerfile.simulator) so the
-# cockpit's "real AWS lab" scenarios can reuse localstack_lab's exact
-# resource-naming conventions and boto3 client factory instead of a second,
-# inevitably-drifting copy of that logic.
-sys.path.insert(0, os.path.dirname(__file__))
+# Bundled into this image at build time (see Dockerfile.simulator, which
+# now builds from the REPOSITORY ROOT so both `localstack_lab/` and
+# `backend/` are available as top-level packages alongside
+# `simulator_backend/` itself) so the cockpit's "real AWS lab" scenarios
+# can reuse localstack_lab's exact resource-naming conventions and boto3
+# client factory instead of a second, inevitably-drifting copy of that
+# logic. The repo root (parent of this file's own directory) is inserted
+# on sys.path -- NOT dirname(__file__) itself, since localstack_lab/ is a
+# SIBLING of simulator_backend/, not nested inside it.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from localstack_lab.aws_clients import client as aws_client  # type: ignore
     LOCALSTACK_LAB_IMPORTABLE = True
@@ -800,32 +805,14 @@ def lab_trigger_pipeline(req: LabTriggerRequest):
     }
 
 
-import openai
-from openai import AsyncOpenAI
 import asyncio
+from backend.app.domain.agents.base_agent import BaseAgent
 
 class PromptRequest(BaseModel):
     prompt: str
 
-async def generate_and_inject_ai(prompt: str):
-    yield "status: Initializing run context...\n"
-    run_id = f"RUN-SIM-{uuid.uuid4().hex[:6].upper()}"
-    now = datetime.now(timezone.utc).isoformat()
-    
-    generate_noise_logs(run_id, 150)
-    
-    yield "status: Generating AI mock incidents from NVIDIA Nemotron...\n"
-    
-    api_key = os.environ.get("NVIDIA_API_KEY")
-    if not api_key:
-        yield "status: ERROR - NVIDIA_API_KEY is not configured on the simulator service.\n"
-        return
-    client = AsyncOpenAI(
-        api_key=api_key,
-        base_url="https://integrate.api.nvidia.com/v1"
-    )
-    
-    system_prompt = '''You are a mock incident generator for NemoGuard.
+
+_SCENARIO_GENERATOR_SYSTEM_PROMPT = '''You are a mock incident generator for NemoGuard.
 The user will describe a scenario. Generate a strictly formatted JSON response containing mock data.
 Format:
 {
@@ -864,35 +851,104 @@ Format:
 }
 Generate 5-10 failure_logs, 2-4 webhook_payloads, 2-4 business_assets, and 1-2 runbooks.
 Ensure that the tags in webhook_payloads include service:service_name that matches the component in failure_logs, depends_on_service in business_assets, and service_name in runbooks. This is critical for agents to correlate everything.
+Respond with ONLY the JSON object -- no markdown fencing, no commentary.
 '''
-    try:
-        completion = await client.chat.completions.create(
-            model="nvidia/nemotron-3-super-120b-a12b",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            response_format={"type": "json_object"}
-        )
-        result = json.loads(completion.choices[0].message.content)
-        failure_logs = result.get("failure_logs", [])
-        webhook_payloads = result.get("webhook_payloads", [])
-        business_assets = result.get("business_assets", [])
-        runbooks = result.get("runbooks", [])
-    except Exception as e:
-        yield f"status: LLM generation failed: {e}\n"
+
+
+def _validate_generated_scenario(result: Any) -> str | None:
+    """
+    Returns None if `result` is structurally valid, otherwise a short,
+    user-safe reason string. Never writes anything to the database --
+    this is a pure validation step that MUST run before any DB mutation
+    or webhook delivery is attempted, so a malformed/empty LLM response
+    leaves no synthetic incident-supporting database residue behind.
+    """
+    if not isinstance(result, dict):
+        return "The generated response was not a JSON object."
+
+    failure_logs = result.get("failure_logs")
+    webhook_payloads = result.get("webhook_payloads")
+    business_assets = result.get("business_assets")
+    runbooks = result.get("runbooks")
+
+    if not isinstance(failure_logs, list) or not isinstance(webhook_payloads, list) \
+            or not isinstance(business_assets, list) or not isinstance(runbooks, list):
+        return "The generated response was missing one or more required arrays (failure_logs, webhook_payloads, business_assets, runbooks)."
+
+    if len(webhook_payloads) < 1:
+        return "The generated response contained no webhook_payloads (at least one alert is required)."
+
+    if len(failure_logs) < 1:
+        return "The generated response contained no failure_logs (at least one log entry is required)."
+
+    return None
+
+
+async def generate_and_inject_ai(prompt: str):
+    """
+    Generates a synthetic incident scenario via the NTT aXet-managed LLM
+    (through the same proven BaseAgent integration every real NemoGuard
+    agent already uses) and injects it into NemoGuard.
+
+    Ordering is intentionally: validate prompt -> call aXet LLM -> parse
+    JSON -> validate generated structure -> ONLY THEN create any
+    synthetic supporting DB records -> inject webhook payloads -> confirm
+    delivery -> report success. A failed/invalid LLM generation (or a
+    failed webhook delivery) leaves NO synthetic incident-supporting
+    database residue and NEVER reports success.
+    """
+    yield "status: Initializing scenario generation...\n"
+
+    if not prompt or not prompt.strip():
+        yield "status: ERROR - A scenario prompt is required.\n"
         return
-        
-    yield f"status: Generated {len(webhook_payloads)} alerts, {len(failure_logs)} logs, {len(business_assets)} assets, and {len(runbooks)} runbooks. Injecting...\n"
-        
+
+    run_id = f"RUN-SIM-{uuid.uuid4().hex[:6].upper()}"
+    now = datetime.now(timezone.utc).isoformat()
+
+    yield "status: Generating incident using the aXet-managed model...\n"
+
+    generator = BaseAgent(
+        agent_name="ScenarioGenerator",
+        system_prompt=_SCENARIO_GENERATOR_SYSTEM_PROMPT,
+    )
+    result = await generator.call_llm_json(prompt)
+
+    # BaseAgent.call_llm_json() returns {"error": "..."} on any LLM/
+    # network/parse failure -- never a traceback. Detailed diagnostics
+    # (already printed server-side by BaseAgent itself, with no secrets)
+    # stay out of the user-visible stream; only a safe, generic message
+    # is surfaced here.
+    if isinstance(result, dict) and "error" in result:
+        yield "status: ERROR - aXet LLM could not generate a valid incident scenario.\n"
+        return
+
+    invalid_reason = _validate_generated_scenario(result)
+    if invalid_reason:
+        yield f"status: ERROR - {invalid_reason}\n"
+        return
+
+    failure_logs = result.get("failure_logs", [])
+    webhook_payloads = result.get("webhook_payloads", [])
+    business_assets = result.get("business_assets", [])
+    runbooks = result.get("runbooks", [])
+
+    yield (
+        f"status: Generated {len(webhook_payloads)} alerts, {len(failure_logs)} logs, "
+        f"{len(business_assets)} assets, and {len(runbooks)} runbooks.\n"
+    )
+
+    # Only now -- after the generated output has been confirmed valid --
+    # do we create any database residue for this run.
+    generate_noise_logs(run_id, 150)
+
     for payload in webhook_payloads:
         payload["run_id"] = run_id
-        
+
     logs_to_insert = []
     for log in failure_logs:
         logs_to_insert.append((f"LOG-{uuid.uuid4().hex[:6]}", run_id, now, log.get("level", "ERROR"), log.get("component", "unknown"), None, log.get("message", "error")))
-        
+
     assets_to_insert = []
     asset_dependencies_to_insert = []
     for idx, asset in enumerate(business_assets):
@@ -906,13 +962,14 @@ Ensure that the tags in webhook_payloads include service:service_name that match
         rb_id = f"RBK-{uuid.uuid4().hex[:6]}"
         job_name = f"JOB_{rb.get('service_name', 'SIMULATOR_JOB').upper()}"
         title = rb.get("title", f"Runbook for {job_name}")
-        steps_str = "\n".join([f"{i+1}. {s}" for i, s in enumerate(rb.get("steps", []))])
         runbooks_to_insert.append((
             1, "default", "default", rb_id, title, "synthetic", "active", "Ops", "none",
             rb.get("prerequisites_json", "[]"), rb.get("verification_json", "[]"), rb.get("rollback_json", "[]"),
             now, "default", now
         ))
-        
+
+    yield "status: Injecting generated alerts into NemoGuard...\n"
+
     with psycopg2.connect(DATABASE_URL) as conn:
         with conn.cursor() as cursor:
             # We must create jobs for all the dependencies generated so foreign keys work
@@ -930,7 +987,7 @@ Ensure that the tags in webhook_payloads include service:service_name that match
                 VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (run_id) DO NOTHING
             ''', (run_id, 'SIMULATOR_JOB', now, now, now, 'failed'))
-            
+
             cursor.executemany('''
                 INSERT INTO log_event (log_id, run_id, timestamp, level, component, error_code, message)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
@@ -955,19 +1012,98 @@ Ensure that the tags in webhook_payloads include service:service_name that match
             ''', runbooks_to_insert)
 
         conn.commit()
-        
-    # Fire webhooks
-    yield "status: Firing webhooks to NemoGuard Commander...\n"
+
+    # Fire webhooks -- webhook delivery is authoritative: every response
+    # is inspected and a non-2xx or network exception counts as a failed
+    # delivery. `/api/v2/ingest/webhook` does not expose a reliable
+    # `accepted` field in its success response (its status values are
+    # "ingested"/"ingested_and_correlated"/"ingested_and_incident_created"/
+    # "ingested_and_incident_auto_resolved", with no boolean field at all);
+    # it only signals failure via a non-2xx HTTP status (500, with a
+    # `detail` body) per backend/app/api/main.py's ingest_webhook(). HTTP
+    # success is therefore the acceptance signal used here.
+    accepted_count = 0
+    failed_count = 0
     async with httpx.AsyncClient() as client:
         for payload in webhook_payloads:
             try:
                 response = await client.post(f"{NEMOGUARD_API_BASE}/api/v2/ingest/webhook", json=payload, timeout=60.0)
-                yield f"status: Sent webhook to NemoGuard: {response.status_code}\n"
-                await asyncio.sleep(1)
-            except Exception as e:
-                yield f"status: Failed to send webhook to NemoGuard: {str(e)}\n"
-                
-    yield "status: Successfully injected AI Incident into NemoGuard!\n"
+                if response.is_success:
+                    accepted_count += 1
+                    yield f"status: Injected alert successfully: HTTP {response.status_code}\n"
+                else:
+                    failed_count += 1
+                    yield f"status: ERROR - NemoGuard rejected generated alert with HTTP {response.status_code}\n"
+            except Exception:
+                failed_count += 1
+                yield "status: ERROR - Failed to deliver generated alert to NemoGuard.\n"
+            await asyncio.sleep(1)
+
+    total = len(webhook_payloads)
+
+    if accepted_count == 0:
+        # Zero alerts were ever accepted -- nothing from this run can
+        # possibly be in-flight inside NemoGuard's processing pipeline,
+        # so it is safe to compensate by deleting ONLY the rows this
+        # specific generation request just created (scoped by `run_id`
+        # for log_event/execution, and by the exact IDs generated above
+        # for business_asset/asset_dependency/runbook -- never touching
+        # any pre-existing job/asset/runbook that happened to already
+        # exist). SIMULATOR_JOB and any shared `unique_jobs` job rows are
+        # intentionally NOT deleted: they are a shared dependency row
+        # that may be referenced by other runs/executions, and
+        # ON CONFLICT DO NOTHING means this run may not even "own" it.
+        try:
+            with psycopg2.connect(DATABASE_URL) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("DELETE FROM log_event WHERE run_id = %s", (run_id,))
+                    cursor.execute("DELETE FROM execution WHERE run_id = %s", (run_id,))
+                    if assets_to_insert:
+                        cursor.executemany(
+                            "DELETE FROM asset_dependency WHERE asset_id = %s AND job_id = %s",
+                            asset_dependencies_to_insert,
+                        )
+                        cursor.executemany(
+                            "DELETE FROM business_asset WHERE asset_id = %s",
+                            [(a[0],) for a in assets_to_insert],
+                        )
+                    if runbooks_to_insert:
+                        cursor.executemany(
+                            "DELETE FROM runbook WHERE runbook_id = %s",
+                            [(rb[3],) for rb in runbooks_to_insert],
+                        )
+                conn.commit()
+            yield (
+                f"status: ERROR - NemoGuard rejected every generated alert "
+                f"(0 of {total} accepted). Synthetic supporting records for "
+                f"this run have been removed.\n"
+            )
+        except Exception as cleanup_exc:
+            # Cleanup is best-effort -- if it fails, do not claim zero
+            # residue; report accurately instead of silently pretending
+            # the compensating delete succeeded.
+            print(f"[generate_and_inject_ai] compensating cleanup failed for {run_id}: {cleanup_exc}")
+            yield (
+                f"status: ERROR - NemoGuard rejected every generated alert "
+                f"(0 of {total} accepted). Cleanup of synthetic supporting "
+                f"records for this run failed; some residual data for "
+                f"run_id={run_id} may remain.\n"
+            )
+        return
+
+    if failed_count > 0:
+        # Partial success: at least one alert was genuinely accepted and
+        # may already be processing inside NemoGuard, so the supporting
+        # data must NOT be deleted (a real in-flight alert may depend on
+        # it), but this is explicitly NOT a full success either.
+        yield (
+            f"status: ERROR - Generated scenario was only partially injected: "
+            f"{accepted_count} of {total} alerts were accepted.\n"
+        )
+        return
+
+    yield "status: Successfully injected AI incident into NemoGuard.\n"
+
 
 @app.post("/trigger/ai")
 async def trigger_scenario_ai(req: PromptRequest):
@@ -1235,4 +1371,3 @@ def reset_database():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8001)
-

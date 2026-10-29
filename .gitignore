@@ -37,6 +37,14 @@ ENV/
 env.bak/
 venv.bak/
 
+# The bare `lib/` pattern above is intended only for Python virtualenv
+# internals (e.g. venv/lib/), but as an unanchored pattern it also
+# matches renderer/src/lib/ -- a genuine frontend source directory
+# (TypeScript helper modules). Explicitly un-ignore it rather than
+# weakening/removing the venv pattern itself.
+!renderer/src/lib/
+!renderer/src/lib/**
+
 # SQLite databases (generated data)
 data/generated/*.db
 data/generated/*.sqlite

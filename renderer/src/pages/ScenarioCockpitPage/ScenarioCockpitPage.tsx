@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import { ngToast } from '../../design-system/toast';
+import { clearDashboardCache } from '../../lib/dashboardCache';
 import {
     Rocket, Cloud, Sparkles, RotateCcw, Database, Mail, GitBranch,
     AlertTriangle, CheckCircle2, XCircle, Loader2, PlayCircle, BellRing, Network,
@@ -175,7 +176,16 @@ export function ScenarioCockpitPage() {
     const runLab = (key: string, endpoint: string, scenario: string, label: string) =>
         run(key, `/lab/trigger/${endpoint}`, { scenario }, `${label} — real AWS lab invocation completed. Alarm forwarding may take up to ~15s.`);
 
-    const runReset = () => run('reset', '/reset', undefined, 'Cleared all incidents and alerts.');
+    const runReset = () =>
+        run('reset', '/reset', undefined, 'Cleared all incidents and alerts.').then(() => {
+            // Explicitly invalidate the Dashboard's stale-while-revalidate
+            // cache so a returning Command Center mount cannot show
+            // stale pre-reset incidents even for one frame -- the next
+            // authoritative refresh (which always runs on mount) would
+            // clear them anyway, but this avoids that one extra stale
+            // render.
+            clearDashboardCache();
+        });
 
     const runCorrelationCheck = async (check: 'same_alarm' | 'different_alarm') => {
         try {
@@ -192,31 +202,95 @@ export function ScenarioCockpitPage() {
     const runAi = async () => {
         if (!prompt.trim()) return;
         setAiRunning(true);
-        setAiStreamStatus('Contacting LLM...');
+        setAiStreamStatus('Contacting aXet-managed model...');
+
+        // HTTP 200 + stream-ended is NOT sufficient to conclude success:
+        // StreamingResponse sends HTTP 200 as soon as the generator starts,
+        // long before it's known whether generation/validation/injection
+        // will actually succeed. The generator can still emit a line
+        // beginning with "status: ERROR - ..." partway through. Both an
+        // explicit error line and the explicit final success marker
+        // ("Successfully injected AI incident into NemoGuard.") are
+        // tracked here; the stream ending with neither is itself treated
+        // as an incomplete/unconfirmed result, never a false success.
+        let streamError: string | null = null;
+        let sawSuccess = false;
+
         try {
             const res = await fetch(`${SIM_BASE}/trigger/ai`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ prompt }),
             });
-            if (res.ok && res.body) {
-                const reader = res.body.getReader();
-                const decoder = new TextDecoder('utf-8');
-                while (true) {
-                    const { value, done } = await reader.read();
-                    if (done) break;
-                    const text = decoder.decode(value);
-                    for (const line of text.split('\n')) {
-                        if (line.startsWith('status: ')) setAiStreamStatus(line.replace('status: ', ''));
-                    }
+
+            if (!res.ok) {
+                let detail = `HTTP ${res.status}`;
+                try {
+                    const body = await res.json();
+                    detail = body?.detail || detail;
+                } catch {
+                    // not JSON; fall back to the status code above
                 }
+                ngToast.error(`Failed to generate custom scenario: ${detail}`);
+                return;
+            }
+
+            if (!res.body) {
+                ngToast.error('Failed to generate custom scenario: empty response stream.');
+                return;
+            }
+
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+            // A ReadableStream chunk may split a logical "status: ..." line
+            // across two reads -- buffer across reads and only process
+            // complete, newline-terminated records, never process a raw
+            // chunk on its own.
+            let buffer = '';
+
+            const processLine = (line: string) => {
+                if (!line.startsWith('status: ')) return;
+                const message = line.slice('status: '.length);
+                setAiStreamStatus(message);
+                if (message.startsWith('ERROR')) {
+                    streamError = message;
+                } else if (message.startsWith('Successfully injected AI incident into NemoGuard')) {
+                    sawSuccess = true;
+                }
+            };
+
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                // The last element may be an incomplete line -- keep it in
+                // the buffer for the next read instead of processing it
+                // prematurely.
+                buffer = lines.pop() ?? '';
+                for (const line of lines) processLine(line);
+            }
+            // Flush the decoder and process anything left in the buffer
+            // (covers a final line with no trailing newline).
+            buffer += decoder.decode();
+            if (buffer) processLine(buffer);
+
+            if (streamError) {
+                ngToast.error(streamError);
+                // Preserve the prompt so the operator can retry/adjust it.
+            } else if (!sawSuccess) {
+                ngToast.error('Scenario generation ended before injection completed.');
+                // Preserve the prompt -- the run did not confirm success.
+            } else {
                 setPrompt('');
                 ngToast.success('Custom scenario injected into NemoGuard.');
-            } else {
-                ngToast.error('Failed to generate custom scenario.');
             }
-        } catch {
-            ngToast.error('Network error reaching the simulator.');
+        } catch (e) {
+            ngToast.error(
+                e instanceof Error
+                    ? `Network error reaching the simulator: ${e.message}`
+                    : 'Network error reaching the simulator.'
+            );
         } finally {
             setAiRunning(false);
             setTimeout(() => setAiStreamStatus(null), 4000);
@@ -547,4 +621,3 @@ export function ScenarioCockpitPage() {
         </div>
     );
 }
-

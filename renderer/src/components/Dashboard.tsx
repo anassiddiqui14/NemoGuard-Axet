@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { IncidentQueue } from './dashboard/IncidentQueue';
@@ -7,21 +7,37 @@ import { GreetingBar } from './shell/GreetingBar';
 import type { IncidentSummary } from './dashboard/shared';
 import { needsAttention } from './dashboard/shared';
 import { authFetch } from '../contexts/AuthGateContext';
+import { readDashboardCache, writeDashboardCache } from '../lib/dashboardCache';
 
 export function Dashboard() {
   const [searchParams, setSearchParams] = useSearchParams();
   const focusIncidentId = searchParams.get('incident');
-  const [activeIncidentId, setActiveIncidentId] = useState<string | null>(null);
-  const [openIncidents, setOpenIncidents] = useState<IncidentSummary[]>([]);
-  const [resolvedIncidents, setResolvedIncidents] = useState<IncidentSummary[]>([]);
-  // Tracks whether the incident queue has completed its FIRST fetch. Without
-  // this, navigating here with a specific incident already selected (e.g.
-  // from the Incidents page or a notification) raced against the initial
-  // refreshQueue() call: openIncidents/resolvedIncidents both start as `[]`,
-  // so the "does the active incident still exist" check below would run
-  // against two empty arrays on mount and immediately null out the
-  // just-selected incident before the real data ever arrived.
-  const [queueLoaded, setQueueLoaded] = useState(false);
+
+  // Stale-while-revalidate: read the last known-good state synchronously
+  // on mount (lazy initializer, not a useEffect) so the VERY FIRST render
+  // after returning from another route already shows real data instead
+  // of an empty queue / "No incident selected" while the authoritative
+  // refresh is still in flight. This is what eliminates the multi-second
+  // blank flash the operator saw on every Command Center revisit.
+  const cached = useMemo(() => readDashboardCache(), []);
+
+  const [activeIncidentId, setActiveIncidentId] = useState<string | null>(
+    () => cached?.selectedIncidentId ?? null,
+  );
+  const [openIncidents, setOpenIncidents] = useState<IncidentSummary[]>(
+    () => cached?.openIncidents ?? [],
+  );
+  const [resolvedIncidents, setResolvedIncidents] = useState<IncidentSummary[]>(() => {
+    const all = cached?.allIncidents ?? [];
+    return all.filter((i) => i.status?.toUpperCase() === 'RESOLVED');
+  });
+
+  // Separate "have we EVER successfully loaded real data" (either from
+  // cache or from the network) from "is a background refresh currently in
+  // flight". Only the former gates a first-load skeleton; a background
+  // refresh must NEVER blank or dim the existing content.
+  const [hasLoadedSuccessfully, setHasLoadedSuccessfully] = useState(!!cached);
+
   // UI MODERNIZATION (Phase 6, spec Section 31/62): a failed poll
   // previously wiped BOTH incident arrays to empty in the catch block --
   // identical in appearance to the legitimate "zero active incidents"
@@ -33,7 +49,33 @@ export function Dashboard() {
   // banner instead of silently discarding state.
   const [queueError, setQueueError] = useState<string | null>(null);
 
+  // Guards against out-of-order overlapping refreshes: if request A starts,
+  // then request B starts before A finishes, and B's response arrives
+  // first, A's (now-stale) response must be discarded when it eventually
+  // arrives rather than overwriting B's newer state.
+  const refreshSeqRef = useRef(0);
+
+  // Tracks the operator's current selection synchronously (via a ref, not
+  // just state) so refreshQueue's selection-preservation logic always sees
+  // the up-to-date value even if several refreshes are reasoned about
+  // back-to-back before React re-renders.
+  const activeIncidentIdRef = useRef<string | null>(activeIncidentId);
+  activeIncidentIdRef.current = activeIncidentId;
+
+  // Guards against calling setState after this component has unmounted
+  // (e.g. the operator navigated away while a refresh was still in
+  // flight -- the fetch Promise resolves later, after unmount, and must
+  // not touch state at that point).
+  const isMountedRef = useRef(true);
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
   const refreshQueue = async () => {
+    const mySeq = ++refreshSeqRef.current;
     try {
       const [openRes, allRes] = await Promise.all([
         authFetch('/api/v2/incidents?state=open'),
@@ -42,18 +84,71 @@ export function Dashboard() {
       if (!openRes.ok || !allRes.ok) throw new Error(`HTTP ${openRes.status}/${allRes.status}`);
       const openData = (await openRes.json()) as IncidentSummary[];
       const allData = (await allRes.json()) as IncidentSummary[];
-      setOpenIncidents(Array.isArray(openData) ? openData : []);
-      setResolvedIncidents(
-        Array.isArray(allData) ? allData.filter((i) => i.status?.toUpperCase() === 'RESOLVED') : [],
-      );
+
+      // Fetch into local variables first; only replace state after the
+      // response has fully, successfully resolved. Never clear/replace
+      // state mid-flight.
+      const nextOpen = Array.isArray(openData) ? openData : [];
+      const nextAll = Array.isArray(allData) ? allData : [];
+      const nextResolved = nextAll.filter((i) => i.status?.toUpperCase() === 'RESOLVED');
+
+      // Discard this result if a NEWER refresh has already started (and
+      // will therefore also finish and apply its own, more current
+      // result) -- prevents an older in-flight request that happens to
+      // resolve later from clobbering newer state. Also bail out
+      // entirely if the component has been unmounted in the meantime.
+      if (mySeq !== refreshSeqRef.current || !isMountedRef.current) return;
+
+      setOpenIncidents(nextOpen);
+      setResolvedIncidents(nextResolved);
       setQueueError(null);
+      setHasLoadedSuccessfully(true);
+
+      // Selection-preservation rules, evaluated against the FRESH data:
+      // 1. If the current selection still exists anywhere (open or
+      //    resolved), keep it exactly as-is -- even if it moved from open
+      //    to resolved, so the workspace can show its new terminal state
+      //    instead of flashing empty.
+      // 2. If it no longer exists anywhere (e.g. after a Scenario
+      //    Cockpit "Reset All"), fall back to the first open incident.
+      // 3. If there are truly no incidents at all in the authoritative
+      //    response, selection becomes null -- this is the ONLY path
+      //    that is allowed to null out the selection.
+      const current = activeIncidentIdRef.current;
+      const currentStillExists =
+        !!current &&
+        (nextOpen.some((i) => i.incident_id === current) ||
+          nextResolved.some((i) => i.incident_id === current));
+
+      let nextSelected: string | null;
+      if (currentStillExists) {
+        nextSelected = current;
+      } else if (nextOpen.length > 0) {
+        nextSelected = nextOpen[0].incident_id;
+      } else {
+        nextSelected = null;
+      }
+
+      if (nextSelected !== current) {
+        setActiveIncidentId(nextSelected);
+      }
+
+      // Only an authoritative, SUCCESSFUL response is ever persisted --
+      // a transient/failed refresh (handled in the catch block below)
+      // never overwrites the cache with incomplete data.
+      writeDashboardCache({
+        openIncidents: nextOpen,
+        allIncidents: nextAll,
+        selectedIncidentId: nextSelected,
+      });
     } catch {
-      // Deliberately do NOT clear openIncidents/resolvedIncidents here --
-      // stale-but-real data is far more useful to an operator than an
-      // empty queue that looks like "all clear".
+      if (mySeq !== refreshSeqRef.current) return;
+      // Deliberately do NOT clear openIncidents/resolvedIncidents or the
+      // current selection here -- stale-but-real data is far more useful
+      // to an operator than an empty queue that looks like "all clear".
+      // A transient/network/auth-verification failure must never be
+      // interpreted as "there are zero incidents".
       setQueueError('Lost connection to the incident feed. Showing last known data.');
-    } finally {
-      setQueueLoaded(true);
     }
   };
 
@@ -84,34 +179,6 @@ export function Dashboard() {
     }
   }, [focusIncidentId]);
 
-  useEffect(() => {
-    // Wait for the FIRST successful queue fetch before doing any
-    // auto-correction. Previously this ran immediately on mount against two
-    // still-empty arrays, which meant navigating in with a specific incident
-    // pre-selected (e.g. clicking a row on the Incidents page, which sets
-    // ?incident=... and this component's activeIncidentId) got wiped back to
-    // null on the very next render, before the real queue data had a chance
-    // to arrive — making it look like clicking an incident "did nothing" and
-    // dumped the user back on an empty dashboard.
-    if (!queueLoaded) return;
-
-    // Only auto-correct the selection when the active incident no longer exists
-    // in EITHER the open or resolved lists — previously this only checked
-    // openIncidents, so selecting a resolved incident from the queue would
-    // immediately get snapped back to openIncidents[0] on the very next
-    // refresh tick, making resolved incidents impossible to actually view.
-    const activeExistsSomewhere =
-      !!activeIncidentId &&
-      (openIncidents.some((i) => i.incident_id === activeIncidentId) ||
-        resolvedIncidents.some((i) => i.incident_id === activeIncidentId));
-
-    if (!activeIncidentId && openIncidents.length > 0) {
-      setActiveIncidentId(openIncidents[0].incident_id);
-    } else if (activeIncidentId && !activeExistsSomewhere) {
-      setActiveIncidentId(openIncidents.length > 0 ? openIncidents[0].incident_id : null);
-    }
-  }, [activeIncidentId, openIncidents, resolvedIncidents, queueLoaded]);
-
   const sortedIncidents = useMemo(() => {
     return [...openIncidents].sort((a, b) => {
       const aAttn = needsAttention(a.status) ? 0 : 1;
@@ -119,6 +186,13 @@ export function Dashboard() {
       return aAttn - bAttn;
     });
   }, [openIncidents]);
+
+  // Only relevant if a consumer needs to distinguish "truly nothing to
+  // show yet" from "showing possibly-stale-but-real data while refreshing
+  // in the background" -- kept here (even though not currently passed
+  // down) so the distinction is explicit and future UI tweaks don't have
+  // to re-derive it.
+  void hasLoadedSuccessfully;
 
   return (
     <div className="flex h-full min-h-0 bg-app-bg text-text-primary overflow-hidden selection:bg-primary/30">

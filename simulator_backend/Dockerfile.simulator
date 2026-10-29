@@ -1,6 +1,32 @@
 FROM python:3.10-slim
 
 WORKDIR /app
-COPY . .
-RUN pip install fastapi uvicorn pydantic httpx psycopg2-binary openai
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
+
+# Build context is the repository root (see docker-compose.yml) so the
+# standalone simulator container has access to the real, shared
+# backend.app.domain.agents.base_agent.BaseAgent -- the exact same proven
+# aXet integration used by every real NemoGuard agent, and the SAME
+# module the aXet-mounted runtime already imports into its own process
+# (backend/app/main.py: `from simulator_backend.main import app as
+# simulator_app`). Both runtimes now import the identical module instead
+# of simulator_backend maintaining its own duplicate copy of the aXet
+# client.
+COPY backend/ ./backend/
+COPY simulator_backend/ ./simulator_backend/
+# Pre-existing optional "Real AWS Lab" feature (main.py:
+# `from localstack_lab.aws_clients import client as aws_client`, guarded
+# by try/except -> LOCALSTACK_LAB_IMPORTABLE). Copied here too so
+# switching the build context to the repo root doesn't regress this
+# already-existing bundling.
+COPY localstack_lab/ ./localstack_lab/
+COPY pyproject.toml README.md ./
+
+RUN pip install . fastapi uvicorn pydantic httpx psycopg2-binary openai
+
+# Run as `simulator_backend.main:app` (not `main:app` from inside the
+# simulator_backend/ directory) so the working directory stays /app --
+# this keeps BOTH top-level packages (`backend` and `simulator_backend`)
+# importable from the repo-root sys.path entry Python adds automatically
+# for the package containing the ASGI app, exactly like
+# backend/app/main.py's own existing cross-package import already does.
+CMD ["uvicorn", "simulator_backend.main:app", "--host", "0.0.0.0", "--port", "8001"]

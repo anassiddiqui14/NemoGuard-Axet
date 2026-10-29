@@ -78,14 +78,30 @@ services:
 
   simulator:
     build:
-      context: ./simulator_backend
-      dockerfile: Dockerfile.simulator
+      # Build context is the repository root (not ./simulator_backend)
+      # so this standalone container can COPY the shared backend/
+      # package -- giving it access to the real, proven
+      # backend.app.domain.agents.base_agent.BaseAgent aXet integration
+      # instead of maintaining a second, duplicated implementation.
+      context: .
+      dockerfile: simulator_backend/Dockerfile.simulator
     container_name: nemoguard-simulator
     ports:
       - "8001:8001"
     environment:
       - POSTGRES_URL=postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db
-      - NVIDIA_API_KEY=${NVIDIA_API_KEY:?NVIDIA_API_KEY must be set in .env}
+      # The Scenario Cockpit GenAI Incident Generator (generate_and_inject_ai)
+      # now calls the NTT aXet-managed LLM via the same BaseAgent integration
+      # used by every real NemoGuard agent, instead of the legacy NVIDIA
+      # Nemotron API -- these are injected by the aXet Python Agent runtime
+      # into every container's environment; no value is hardcoded here.
+      - AXET_LLM_BASE_URL=${AXET_LLM_BASE_URL:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - AXET_MODEL=${AXET_MODEL:-}
+      - AXET_PROJECT_ID=${AXET_PROJECT_ID:-}
+      - AXET_USER_ID=${AXET_USER_ID:-}
+      - DEPTAPPS_WEB_BACKEND_JWT_TOKEN=${DEPTAPPS_WEB_BACKEND_JWT_TOKEN:-}
+      - NEMOGUARD_API_BASE=${NEMOGUARD_API_BASE:-http://api:8000}
 
   # --- LocalStack lab (real-AWS-API simulation for effectiveness testing) ---
   # See localstack_lab/README.md. Provides real S3/Lambda/CloudWatch/SNS/SQS
