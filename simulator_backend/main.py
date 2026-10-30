@@ -806,7 +806,16 @@ def lab_trigger_pipeline(req: LabTriggerRequest):
 
 
 import asyncio
-from backend.app.domain.agents.base_agent import BaseAgent
+# NOTE: BaseAgent (and therefore the `openai` SDK it imports) is
+# deliberately NOT imported at module load time here -- it is only used
+# inside generate_and_inject_ai() below, and importing it eagerly at
+# top level was measured (via `python -X importtime`) to add roughly
+# 1.1s to the cold-start import of the whole mounted FastAPI app
+# (backend.app.main -> simulator_backend.main), contributing materially
+# toward exceeding aXet Cloud's 60s startup deadline. Moved to a lazy
+# import inside generate_and_inject_ai() itself -- no route, API
+# semantics, or behavior change; BaseAgent is constructed and used
+# identically, just imported a few lines later on first actual use.
 
 class PromptRequest(BaseModel):
     prompt: str
@@ -908,6 +917,7 @@ async def generate_and_inject_ai(prompt: str):
 
     yield "status: Generating incident using the aXet-managed model...\n"
 
+    from backend.app.domain.agents.base_agent import BaseAgent
     generator = BaseAgent(
         agent_name="ScenarioGenerator",
         system_prompt=_SCENARIO_GENERATOR_SYSTEM_PROMPT,

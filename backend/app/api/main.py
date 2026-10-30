@@ -11,9 +11,6 @@ import uuid
 
 from app.store.database_factory import get_database, get_db_backend_name
 from app.domain.enums import IncidentState
-from app.domain.orchestrator import IncidentOrchestrator
-from app.domain.correlator import CorrelatorEngine
-from app.domain.models import Incident, Alert
 from app.utils.telemetry import setup_telemetry
 from app.api.auth import (
     get_current_user, require_role, User, get_mock_token,
@@ -21,11 +18,32 @@ from app.api.auth import (
     serialize_roles, deserialize_roles, hash_password,
 )
 
-from temporalio.client import Client
-from app.domain.workflows.incident_workflow import IncidentLifecycleWorkflow
+# --- Import-time performance note (aXet Cloud 60s startup deadline) -------
+# IncidentOrchestrator (app.domain.orchestrator), CorrelatorEngine
+# (app.domain.correlator), Incident/Alert (app.domain.models),
+# temporalio.client.Client, and IncidentLifecycleWorkflow
+# (app.domain.workflows.incident_workflow) are DELIBERATELY NOT imported
+# at module load time here. IncidentOrchestrator alone transitively pulls
+# in the full agent stack (RCA/Dependency/Runbook/Commander/Watcher
+# agents -> `openai` SDK -> `langgraph`), and the temporalio imports pull
+# in its native bridge extension -- importtime profiling measured these
+# as the dominant cost of importing this module (see Phase-1-cloud-
+# startup investigation). None of these symbols are used anywhere at
+# module scope in this file; every real use is already inside a request
+# handler body or the startup() function below, so each is imported
+# lazily at its own first point of use instead, with ZERO change to
+# runtime behavior -- the same class/function objects, constructed and
+# called exactly the same way, just imported a few lines later (on first
+# use within that same function call) rather than at process import time.
+# This also means a FAILURE importing any one of these heavy stacks can
+# no longer prevent the whole ASGI app object (and therefore basic routes
+# like /api/v2/status) from loading at all.
 
 app = FastAPI(title="NemoGuard - Pipeline Incident Commander", version="2.0.0")
+
+_startup_t0 = __import__("time").perf_counter()
 setup_telemetry("nemoguard_api")
+print(f"[startup-timing] telemetry setup complete at +{__import__('time').perf_counter() - _startup_t0:.2f}s")
 
 temporal_client = None
 
@@ -192,7 +210,10 @@ async def startup_event():
         print(f"Failed to initialize database (backend={get_db_backend_name()}): {e}")
         raise
 
+    print(f"[startup-timing] database startup complete at +{__import__('time').perf_counter() - _startup_t0:.2f}s")
+
     _bootstrap_admin_if_configured(db)
+    print(f"[startup-timing] bootstrap admin complete at +{__import__('time').perf_counter() - _startup_t0:.2f}s")
 
     # NEMOGUARD_TEMPORAL_ENABLED defaults to "true" so EXISTING local/
     # standalone deployments keep attempting a Temporal connection exactly
@@ -202,18 +223,25 @@ async def startup_event():
     # stays None, and every existing "if temporal_client: ... else:
     # direct-background fallback" code path already handles that exactly
     # the same way it does today when the optional Temporal connection
-    # attempt below merely fails.
+    # attempt below merely fails. The `temporalio.client` import itself
+    # (which pulls in Temporal's native bridge extension) is deferred to
+    # this branch -- it is never imported at all when Temporal is
+    # disabled, which is the normal aXet Cloud configuration.
     temporal_enabled = os.getenv("NEMOGUARD_TEMPORAL_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
     if not temporal_enabled:
         temporal_client = None
         print("Temporal is disabled (NEMOGUARD_TEMPORAL_ENABLED=false); deterministic direct-triage/direct-execution fallback remains available.")
     else:
         try:
+            from temporalio.client import Client
             temporal_url = os.getenv("TEMPORAL_URL", "localhost:7233")
             temporal_client = await Client.connect(temporal_url)
             print(f"Connected to Temporal server at {temporal_url}")
         except Exception as e:
             print(f"Failed to connect to Temporal: {e}")
+
+    print(f"[startup-timing] temporal startup phase complete at +{__import__('time').perf_counter() - _startup_t0:.2f}s")
+    print(f"[startup-timing] FastAPI startup handler complete at +{__import__('time').perf_counter() - _startup_t0:.2f}s")
 
 # --- 12.1 Overview endpoints ---
 
@@ -444,6 +472,7 @@ async def ingest_webhook(payload: dict):
     Generic webhook endpoint for Datadog, PagerDuty, or Email-to-Webhook parsing.
     Passes the payload to the WatcherAgent to determine if it's a valid alert.
     """
+    from app.domain.orchestrator import IncidentOrchestrator
     orchestrator = IncidentOrchestrator()
     result = await orchestrator.process_webhook(payload)
     
@@ -541,6 +570,7 @@ def agent_findings(incident_id: str, payload: dict, current_user: User = Depends
     which save_agent_findings() routes to NEEDS_REVIEW (never
     PENDING_APPROVAL) and logs as SAFETY_VALIDATION_INCONCLUSIVE.
     """
+    from app.domain.orchestrator import IncidentOrchestrator
     orchestrator = IncidentOrchestrator()
     res = orchestrator.save_agent_findings(
         incident_id, payload,
@@ -571,6 +601,7 @@ class FeedbackRequest(BaseModel):
 
 @app.post("/api/v2/incidents/{incident_id}/feedback")
 def submit_feedback(incident_id: str, req: FeedbackRequest, current_user: User = Depends(get_current_user)):
+    from app.domain.orchestrator import IncidentOrchestrator
     orchestrator = IncidentOrchestrator()
     res = orchestrator.triage_feedback(incident_id, req.feedback)
     if "error" in res:
@@ -666,6 +697,7 @@ async def approve_plan(incident_id: str, plan_id: str, req: ApprovalRequest, cur
     signaled = False
     if temporal_client:
         try:
+            from app.domain.workflows.incident_workflow import IncidentLifecycleWorkflow
             handle = temporal_client.get_workflow_handle(f"incident-{incident_id}")
             await handle.signal(IncidentLifecycleWorkflow.approve_plan, {"decision": req.decision, "plan_id": plan_id})
             signaled = True
@@ -675,6 +707,7 @@ async def approve_plan(incident_id: str, plan_id: str, req: ApprovalRequest, cur
     # Fallback: if we couldn't reach a live Temporal workflow, execute directly so the incident
     # doesn't get stuck in APPROVED forever (closes the gap documented in the architecture doc §8.3).
     if not signaled and req.decision == "approve":
+        from app.domain.orchestrator import IncidentOrchestrator
         orchestrator = IncidentOrchestrator()
         orchestrator.execute_plan(incident_id, plan_id)
         return {"status": "executed_directly", "reason": "temporal_unavailable_or_stale"}
@@ -730,6 +763,7 @@ async def execute_plan(incident_id: str, plan_id: str, current_user: User = Depe
             ),
         )
 
+    from app.domain.orchestrator import IncidentOrchestrator
     orchestrator = IncidentOrchestrator()
     orchestrator.execute_plan(incident_id, plan_id)
     return {"status": "EXECUTING"}
