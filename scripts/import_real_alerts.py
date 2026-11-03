@@ -45,6 +45,8 @@ USAGE
 from __future__ import annotations
 
 import argparse
+import hashlib
+import os
 import json
 import re
 import sys
@@ -200,6 +202,11 @@ def main():
         print("Dry run complete (pass --send to actually POST these to the webhook endpoint).")
         return
 
+    secret = os.environ.get("NEMOGUARD_WEBHOOK_SECRET", "")
+    if not secret:
+        print("NEMOGUARD_WEBHOOK_SECRET is required for --send", file=sys.stderr)
+        sys.exit(2)
+
     print(f"\nSending {len(written)} payloads to {args.api_base}/api/v2/ingest/webhook (delay={args.delay}s)...")
     sent = 0
     failed = 0
@@ -208,7 +215,13 @@ def main():
             with open(out_path) as f:
                 payload = json.load(f)
             try:
-                r = client.post(f"{args.api_base}/api/v2/ingest/webhook", json=payload, timeout=60)
+                digest = hashlib.sha256(out_path.read_bytes()).hexdigest()
+                r = client.post(
+                    f"{args.api_base}/api/v2/ingest/webhook",
+                    json=payload,
+                    headers={"X-NemoGuard-Webhook-Secret": secret, "Idempotency-Key": f"import:{digest}"},
+                    timeout=60,
+                )
                 status = "OK" if r.status_code < 400 else f"HTTP {r.status_code}"
                 print(f"  -> {out_path.name}: {status}")
                 if r.status_code < 400:

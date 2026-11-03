@@ -22,6 +22,7 @@ Usage:
 
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -158,16 +159,34 @@ def main():
                     sns_envelope = json.loads(msg["Body"])
                     alarm_body = json.loads(sns_envelope.get("Message", "{}"))
 
-                    payload = cloudwatch_alarm_to_webhook_payload(alarm_body)
-                    r = http.post(f"{NEMOGUARD_API_BASE}/api/v2/ingest/webhook", json=payload)
-                    print(f"  -> forwarded alarm '{payload['alarm_name']}' "
-                          f"(state={payload['new_state']}): HTTP {r.status_code}")
+                    secret = os.environ.get("NEMOGUARD_WEBHOOK_SECRET", "")
+                    if not secret:
+                        raise RuntimeError("NEMOGUARD_WEBHOOK_SECRET is not configured")
+                    payload = {
+                        "source": "CloudWatch (LocalStack)",
+                        "type": "Alarm",
+                        "monitor_name": alarm_body.get("AlarmName", "Unknown Alarm"),
+                        "alarm_name": alarm_body.get("AlarmName"),
+                        "message": alarm_body.get("NewStateReason", ""),
+                        "alarm": alarm_body,
+                    }
+                    run_match = re.search(r"RUN-LOCALSTACK-[A-Za-z0-9_-]+", payload["message"])
+                    if run_match:
+                        payload["run_id"] = run_match.group(0)
+                    r = http.post(
+                        f"{NEMOGUARD_API_BASE}/api/v2/ingest/webhook",
+                        json=payload,
+                        headers={
+                            "X-NemoGuard-Webhook-Secret": secret,
+                            "Idempotency-Key": "sqs:" + msg["MessageId"],
+                        },
+                    )
+                    r.raise_for_status()
+                    sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+                    print(f"  -> forwarded alarm '{payload['alarm_name']}': HTTP {r.status_code}")
 
                 except Exception as e:
-                    print(f"  !! failed to process message: {e}")
-
-                finally:
-                    sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+                    print(f"  !! delivery failed; message remains queued: {e}")
 
             if not messages:
                 time.sleep(max(0, POLL_INTERVAL_SEC - 20))

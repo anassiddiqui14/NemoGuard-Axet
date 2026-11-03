@@ -46,6 +46,8 @@ services:
       - NVIDIA_API_KEY=${NVIDIA_API_KEY:?NVIDIA_API_KEY must be set in .env}
       - JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set in .env}
       - ENV=${ENV:-production}
+      - NEMOGUARD_WEBHOOK_SECRET=${NEMOGUARD_WEBHOOK_SECRET:-}
+      - NEMOGUARD_WEBHOOK_AUTO_RESOLVE=${NEMOGUARD_WEBHOOK_AUTO_RESOLVE:-false}
       # Opt-in: set to 1 (and run with --profile lab) to make
       # execute_simulated_action / verify_incident_recovery call into the
       # LocalStack lab for real remediation + verification instead of no-ops.
@@ -102,6 +104,7 @@ services:
       - AXET_USER_ID=${AXET_USER_ID:-}
       - DEPTAPPS_WEB_BACKEND_JWT_TOKEN=${DEPTAPPS_WEB_BACKEND_JWT_TOKEN:-}
       - NEMOGUARD_API_BASE=${NEMOGUARD_API_BASE:-http://api:8000}
+      - NEMOGUARD_WEBHOOK_SECRET=${NEMOGUARD_WEBHOOK_SECRET:-}
 
   # --- LocalStack lab (real-AWS-API simulation for effectiveness testing) ---
   # See localstack_lab/README.md. Provides real S3/Lambda/CloudWatch/SNS/SQS

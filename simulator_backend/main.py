@@ -63,6 +63,13 @@ LAB_ALERTS_TOPIC_NAME = "nemoguard-lab-alerts"
 LAB_STATE_MACHINE_NAME = "nemoguard-daily-pipeline"
 NEMOGUARD_API_BASE = os.environ.get("NEMOGUARD_API_BASE", "http://127.0.0.1:8200")
 
+
+def _webhook_headers(delivery_key: str) -> dict:
+    secret = os.environ.get("NEMOGUARD_WEBHOOK_SECRET", "")
+    if not secret:
+        raise RuntimeError("NEMOGUARD_WEBHOOK_SECRET must be configured for webhook delivery")
+    return {"X-NemoGuard-Webhook-Secret": secret, "Idempotency-Key": delivery_key}
+
 FUNCTION_NAME_TO_JOB_ID = {
     "nemoguard-ingest-job": "LOCALSTACK_INGEST_JOB",
     "nemoguard-order-events-job": "LOCALSTACK_ORDER_EVENTS_JOB",
@@ -106,10 +113,23 @@ def _lab_forwarder_loop():
                 try:
                     sns_envelope = json.loads(msg["Body"])
                     alarm_body = json.loads(sns_envelope.get("Message", "{}"))
-                    payload = _cloudwatch_alarm_to_webhook_payload(alarm_body)
+                    # Derive the body only from the immutable SQS message:
+                    # timestamps and database lookups change on redelivery.
+                    payload = {
+                        "source": "CloudWatch (LocalStack)",
+                        "type": "Alarm",
+                        "monitor_name": alarm_body.get("AlarmName", "Unknown Alarm"),
+                        "alarm_name": alarm_body.get("AlarmName"),
+                        "message": alarm_body.get("NewStateReason", ""),
+                        "alarm": alarm_body,
+                    }
+                    run_match = re.search(r"RUN-LOCALSTACK-[A-Za-z0-9_-]+", payload["message"])
+                    if run_match:
+                        payload["run_id"] = run_match.group(0)
                     response = httpx.post(
                         f"{NEMOGUARD_API_BASE}/api/v2/ingest/webhook",
                         json=payload,
+                        headers=_webhook_headers("sqs:" + msg["MessageId"]),
                         timeout=30.0,
                     )
                     response.raise_for_status()
@@ -1037,7 +1057,7 @@ async def generate_and_inject_ai(prompt: str):
     async with httpx.AsyncClient() as client:
         for payload in webhook_payloads:
             try:
-                response = await client.post(f"{NEMOGUARD_API_BASE}/api/v2/ingest/webhook", json=payload, timeout=60.0)
+                response = await client.post(f"{NEMOGUARD_API_BASE}/api/v2/ingest/webhook", json=payload, headers=_webhook_headers("sim:" + uuid.uuid4().hex), timeout=60.0)
                 if response.is_success:
                     accepted_count += 1
                     yield f"status: Injected alert successfully: HTTP {response.status_code}\n"
@@ -1358,7 +1378,7 @@ def simulate_failure(scenario_type: str):
     # 3. Fire the webhooks to NemoGuard
     for payload in webhook_payloads:
         try:
-            response = httpx.post(f"{NEMOGUARD_API_BASE}/api/v2/ingest/webhook", json=payload, timeout=60.0)
+            response = httpx.post(f"{NEMOGUARD_API_BASE}/api/v2/ingest/webhook", json=payload, headers=_webhook_headers("sim:" + uuid.uuid4().hex), timeout=60.0)
             print(f"Sent webhook to NemoGuard: {response.status_code}")
             time.sleep(1) # small delay between alerts
         except Exception as e:

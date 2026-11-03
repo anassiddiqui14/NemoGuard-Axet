@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 import os
 import json
 import uuid
+import hashlib
+import hmac
 
 from app.store.database_factory import get_database, get_db_backend_name
 from app.domain.enums import IncidentState
@@ -211,6 +213,17 @@ async def startup_event():
         raise
 
     print(f"[startup-timing] database startup complete at +{__import__('time').perf_counter() - _startup_t0:.2f}s")
+
+    # This table must also be created for existing SQLite databases, whose
+    # PostgreSQL migration runner is intentionally disabled.
+    with db.get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS webhook_delivery (
+                delivery_key VARCHAR(200) PRIMARY KEY,
+                payload_hash VARCHAR(64) NOT NULL,
+                result_json TEXT NOT NULL
+            )
+        """)
 
     _bootstrap_admin_if_configured(db)
     print(f"[startup-timing] bootstrap admin complete at +{__import__('time').perf_counter() - _startup_t0:.2f}s")
@@ -467,19 +480,33 @@ def get_runbooks_context():
 # --- 12.4 Workflow endpoints ---
 
 @app.post("/api/v2/ingest/webhook")
-async def ingest_webhook(payload: dict):
+async def ingest_webhook(payload: dict, request: Request):
     """
-    Generic webhook endpoint for Datadog, PagerDuty, or Email-to-Webhook parsing.
-    Passes the payload to the WatcherAgent to determine if it's a valid alert.
+    Ingest a webhook using a configured shared secret and a stable delivery ID.
+    The receipt and alert are committed atomically by the orchestrator.
     """
+    secret = os.environ.get("NEMOGUARD_WEBHOOK_SECRET", "")
+    if not secret:
+        raise HTTPException(status_code=503, detail="Webhook ingestion is not configured")
+    supplied = request.headers.get("X-NemoGuard-Webhook-Secret", "")
+    if not hmac.compare_digest(supplied.encode("utf-8"), secret.encode("utf-8")):
+        raise HTTPException(status_code=401, detail="Invalid webhook credentials")
+    delivery_key = request.headers.get("Idempotency-Key", "").strip()
+    if not delivery_key or len(delivery_key) > 200 or not delivery_key.isascii():
+        raise HTTPException(status_code=400, detail="A stable ASCII Idempotency-Key of at most 200 characters is required")
+    canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    payload_hash = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+
     from app.domain.orchestrator import IncidentOrchestrator
     orchestrator = IncidentOrchestrator()
-    result = await orchestrator.process_webhook(payload)
-    
+    result = await orchestrator.process_webhook(payload, delivery_key, payload_hash)
+
+    if result.get("status") == "idempotency_conflict":
+        raise HTTPException(status_code=409, detail="Idempotency-Key was already used with a different payload")
     if result.get("status") == "error":
         raise HTTPException(status_code=500, detail=result.get("message"))
         
-    if result.get("status") == "ingested_and_incident_created":
+    if result.get("status") == "ingested_and_incident_created" and not result.get("duplicate"):
         incident_id = result.get("incident_id")
         global temporal_client
         # Unified scheduling: schedule_triage_for_new_incident() owns

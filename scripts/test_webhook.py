@@ -1,61 +1,57 @@
-import asyncio
-import httpx
+"""Send one synthetic webhook. WARNING: this can create an incident."""
+import argparse
 import json
+import os
+import sys
 
-async def test_webhook():
-    print("Testing Datadog Webhook Payload...")
-    datadog_payload = {
-        "event_type": "monitor_alert",
-        "monitor": {
-            "name": "High Error Rate on customer_profile_ingestion",
-            "type": "query alert"
-        },
-        "event_title": "[Triggered] High Error Rate",
-        "event_msg": "The error rate for customer_profile_ingestion is above 5% for the last 10 minutes.",
-        "tags": "env:prod, service:customer_profile"
+import httpx
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Send a synthetic alert; this may create an incident and start triage."
+    )
+    parser.add_argument(
+        "--url", required=True,
+        help="Full webhook URL, e.g. http://localhost:20456/backend/api/ingest/webhook",
+    )
+    parser.add_argument(
+        "--idempotency-key", required=True,
+        help="Stable unique event ID; reuse it when retrying this exact payload.",
+    )
+    args = parser.parse_args()
+    secret = os.environ.get("NEMOGUARD_WEBHOOK_SECRET", "")
+    if not secret:
+        print("Set NEMOGUARD_WEBHOOK_SECRET in the environment first.", file=sys.stderr)
+        return 2
+
+    payload = {
+        "source": "Synthetic test",
+        "type": "Monitor Alert",
+        "monitor_name": "Synthetic pipeline failure",
+        "message": "Test pipeline failed its health check.",
+        "tags": ["service:test-pipeline", "severity:high"],
     }
-    
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    try:
+        response = httpx.post(
+            args.url,
+            json=payload,
+            headers={
+                "X-NemoGuard-Webhook-Secret": secret,
+                "Idempotency-Key": args.idempotency_key,
+            },
+            timeout=120.0,
+        )
+        print(f"HTTP {response.status_code}")
         try:
-            response = await client.post("http://127.0.0.1:8000/api/v1/ingest/webhook", json=datadog_payload)
-            print(f"Response: {response.status_code}")
             print(json.dumps(response.json(), indent=2))
-        except Exception as e:
-            print(f"Error: {e}")
+        except ValueError:
+            print("Response was not JSON.")
+        return 0 if response.is_success else 1
+    except httpx.RequestError as exc:
+        print(f"Request failed: {exc}", file=sys.stderr)
+        return 1
 
-    print("\nTesting Email-to-Webhook Payload...")
-    email_payload = {
-        "headers": {
-            "From": "noreply@snowflake.com",
-            "Subject": "Task Failure Notification: LOAD_CUSTOMER_DATA"
-        },
-        "text": "Task LOAD_CUSTOMER_DATA failed at 2026-08-06 09:30 UTC. Error: Division by zero."
-    }
-
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        try:
-            response = await client.post("http://127.0.0.1:8000/api/v1/ingest/webhook", json=email_payload)
-            print(f"Response: {response.status_code}")
-            print(json.dumps(response.json(), indent=2))
-        except Exception as e:
-            print(f"Error: {e}")
-            
-    print("\nTesting Noise/Spam Payload...")
-    spam_payload = {
-        "headers": {
-            "From": "marketing@newsletter.com",
-            "Subject": "Try our new features!"
-        },
-        "text": "We just launched our new dashboard UI."
-    }
-
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        try:
-            response = await client.post("http://127.0.0.1:8000/api/v1/ingest/webhook", json=spam_payload)
-            print(f"Response: {response.status_code}")
-            print(json.dumps(response.json(), indent=2))
-        except Exception as e:
-            print(f"Error: {e}")
 
 if __name__ == "__main__":
-    asyncio.run(test_webhook())
+    raise SystemExit(main())

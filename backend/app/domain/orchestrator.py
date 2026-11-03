@@ -1082,8 +1082,40 @@ class IncidentOrchestrator:
                 print(f"reinvestigate_from_commander_guidance: could not restore status for {incident_id}: {restore_exc}")
         return result
 
-    async def process_webhook(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Processes incoming webhooks via the WatcherAgent to determine if it's a valid alert and if it correlates."""
+    async def process_webhook(self, payload: Dict[str, Any], delivery_key: str, payload_hash: str) -> Dict[str, Any]:
+        """Process a webhook with a transactional, persistent delivery receipt."""
+        def claim(conn):
+            cursor = conn.execute(
+                "INSERT INTO webhook_delivery (delivery_key, payload_hash, result_json) "
+                "VALUES (%s, %s, %s) ON CONFLICT (delivery_key) DO NOTHING",
+                (delivery_key, payload_hash, "{}"),
+            )
+            if cursor.rowcount:
+                return None
+            row = conn.execute(
+                "SELECT payload_hash, result_json FROM webhook_delivery WHERE delivery_key = %s",
+                (delivery_key,),
+            ).fetchone()
+            if row[0] != payload_hash:
+                return {"status": "idempotency_conflict"}
+            return {**json.loads(row[1]), "duplicate": True}
+
+        def finish(conn, result):
+            conn.execute(
+                "UPDATE webhook_delivery SET result_json = %s WHERE delivery_key = %s",
+                (json.dumps(result), delivery_key),
+            )
+            return result
+
+        with self.db.get_connection() as conn:
+            row = conn.execute(
+                "SELECT payload_hash, result_json FROM webhook_delivery WHERE delivery_key = %s",
+                (delivery_key,),
+            ).fetchone()
+            if row:
+                if row[0] != payload_hash:
+                    return {"status": "idempotency_conflict"}
+                return {**json.loads(row[1]), "duplicate": True}
         # 1. Fetch active incidents. Uses plain conn.execute()+zip(cols,row)
         # instead of cursor_factory=psycopg2.extras.DictCursor (a
         # Postgres-only API SqliteDatabase's cursor wrapper does not
@@ -1101,28 +1133,49 @@ class IncidentOrchestrator:
         watcher = WatcherAgent()
         analysis = await watcher.analyze(payload, active_incidents)
         
+        if not isinstance(analysis, dict):
+            return {"status": "error", "message": "Watcher returned an invalid classification"}
         if "error" in analysis:
-            return {"status": "error", "message": analysis["error"]}
-            
-        if not analysis.get("is_valid"):
-            return {"status": "ignored", "reasoning": analysis.get("reasoning", "Classified as noise")}
+            return {"status": "error", "message": "Watcher classification failed"}
+        if not isinstance(analysis.get("is_valid"), bool):
+            return {"status": "error", "message": "Watcher returned an invalid classification"}
+
+        if not analysis["is_valid"]:
+            with self.db.get_connection() as conn:
+                existing = claim(conn)
+                if existing is not None:
+                    return existing
+                return finish(conn, {"status": "ignored", "reasoning": analysis.get("reasoning", "Classified as noise")})
             
         alert_data = analysis.get("normalized_alert")
-        if not alert_data:
+        if not isinstance(alert_data, dict):
             return {"status": "error", "message": "Valid alert but missing normalized_alert data"}
-            
+
         # Extract fields
-        severity = alert_data.get("severity", "info").lower()
+        severity_value = alert_data.get("severity", "info")
+        if not isinstance(severity_value, str) or severity_value.lower() not in ("info", "warning", "high", "critical"):
+            return {"status": "error", "message": "Watcher returned an invalid severity"}
+        severity = severity_value.lower()
         alert_type = alert_data.get("alert_type", "UNKNOWN")
         source_system = alert_data.get("source_system", "Webhook")
         message = alert_data.get("message", "No message provided")
         run_id = alert_data.get("run_id")
         
-        alert_id = self._generate_id("WEB-ALT")
+        alert_id = f"WEB-ALT-{uuid.uuid4().hex}"
         now = datetime.now(timezone.utc).isoformat()
         
-        # Insert the new alert into the DB
+        # Claim and persist the receipt in the same transaction as the alert.
         with self.db.get_connection() as conn:
+            existing = claim(conn)
+            if existing is not None:
+                return existing
+
+            def audit(incident_id, event_type, summary):
+                conn.execute("""
+                    INSERT INTO audit_event (audit_event_id, incident_id, actor_type, actor_id, event_type, event_summary, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (f"AUD-{uuid.uuid4().hex}", incident_id, "SYSTEM", "Watcher Agent", event_type, summary, now))
+
             conn.execute("""
                 INSERT INTO alert (alert_id, run_id, opened_ts, severity, alert_type, source_system, message, status)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, 'open')
@@ -1158,34 +1211,33 @@ class IncidentOrchestrator:
                 # incident, with an explicit audit trail noting it was resolved
                 # externally (not via an executed NemoGuard plan) so operators
                 # can tell the two cases apart.
-                if analysis.get("is_recovery_signal"):
+                if analysis.get("is_recovery_signal") and os.getenv("NEMOGUARD_WEBHOOK_AUTO_RESOLVE", "").lower() in ("1", "true", "yes", "on"):
                     conn.execute(
                         "UPDATE incident SET status = %s, resolved_at = %s, updated_at = %s WHERE incident_id = %s",
                         (IncidentState.RESOLVED.value, now, now, correlated_incident_id)
                     )
-                    self._log_audit(
+                    audit(
                         correlated_incident_id,
-                        "Watcher Agent",
                         "INCIDENT_AUTO_RESOLVED_EXTERNALLY",
                         f"Alert {alert_id} reported the underlying issue has recovered (source: {source_system}). "
                         f"Incident auto-resolved based on external recovery signal, not an executed NemoGuard plan. "
                         f"Reasoning: {analysis.get('reasoning')}"
                     )
-                    return {
+                    return finish(conn, {
                         "status": "ingested_and_incident_auto_resolved",
                         "alert_id": alert_id,
                         "incident_id": correlated_incident_id,
                         "reasoning": analysis.get("reasoning")
-                    }
+                    })
 
-                self._log_audit(correlated_incident_id, "Watcher Agent", "ALERT_CORRELATED", f"Alert {alert_id} dynamically correlated to this incident by AI. Reasoning: {analysis.get('reasoning')}")
+                audit(correlated_incident_id, "ALERT_CORRELATED", f"Alert {alert_id} dynamically correlated to this incident by AI. Reasoning: {analysis.get('reasoning')}")
 
-                return {
+                return finish(conn, {
                     "status": "ingested_and_correlated",
                     "alert_id": alert_id,
                     "incident_id": correlated_incident_id,
                     "reasoning": analysis.get("reasoning")
-                }
+                })
                 
             # Otherwise, Simple Correlation: For now, create a new incident immediately for HIGH or CRITICAL alerts.
             elif severity in ["high", "critical"]:
@@ -1232,15 +1284,15 @@ class IncidentOrchestrator:
                 
                 # Auto-start triage (Now handled in api/main.py by kicking off Temporal workflow)
                 
-                return {
-                    "status": "ingested_and_incident_created", 
-                    "alert_id": alert_id, 
+                return finish(conn, {
+                    "status": "ingested_and_incident_created",
+                    "alert_id": alert_id,
                     "incident_id": incident.incident_id,
                     "reasoning": analysis.get("reasoning")
-                }
-                
-        return {
-            "status": "ingested", 
-            "alert_id": alert_id, 
-            "reasoning": analysis.get("reasoning")
-        }
+                })
+
+            return finish(conn, {
+                "status": "ingested",
+                "alert_id": alert_id,
+                "reasoning": analysis.get("reasoning")
+            })
