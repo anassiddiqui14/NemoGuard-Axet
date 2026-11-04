@@ -28,6 +28,10 @@ class FakeMessage:
 
     subject = "Example subject"
     body = "Example body"
+    attachments = [
+        types.SimpleNamespace(longFilename="session.log", shortFilename=None, data=b"ERROR 1023"),
+        types.SimpleNamespace(longFilename="malware.exe", shortFilename=None, data=b"binary"),
+    ]
 
 
 def token(role):
@@ -63,7 +67,7 @@ class PreviewTests(unittest.TestCase):
 
     def test_replay_requires_operator_and_webhook_secret(self):
         import app.api.main as api
-        payload = {"source": "Outlook email export", "message": "fabricated"}
+        payload = {"source": "Outlook email export", "monitor_name": "failure", "message": "fabricated"}
         url = "/api/v2/ingest/email-replay"
         headers = {"X-NemoGuard-Webhook-Secret": "test-webhook-secret", "Idempotency-Key": "test"}
         self.assertEqual(self.client.post(url, json=payload, headers=headers).status_code, 401)
@@ -78,12 +82,25 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual(response.json()["status"], "ingested")
         ingest.assert_awaited_once()
 
+    def test_replay_rejects_unsupported_and_oversized_attachments(self):
+        url = "/api/v2/ingest/email-replay"
+        headers = {"Authorization": "Bearer " + token("operator"), "X-NemoGuard-Webhook-Secret": "test-webhook-secret", "Idempotency-Key": "test"}
+        payload = {"monitor_name": "failure", "message": "body", "attachments": [{"name": "bad.exe", "text": "content"}]}
+        self.assertEqual(self.client.post(url, json=payload, headers=headers).status_code, 400)
+        payload["attachments"] = [{"name": "huge.log", "text": "x" * 65537}]
+        self.assertEqual(self.client.post(url, json=payload, headers=headers).status_code, 400)
+        payload["attachments"] = [{"name": "ok.log", "text": "x"}] * 4
+        self.assertEqual(self.client.post(url, json=payload, headers=headers).status_code, 400)
+
     def test_preview_does_not_ingest(self):
         parser = types.SimpleNamespace(Message=FakeMessage)
         with patch.dict(sys.modules, {"extract_msg": parser}):
             response = self.post(MAGIC, "operator", "test-webhook-secret")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"subject": "Example subject", "body": "Example body"})
+        self.assertEqual(response.json()["subject"], "Example subject")
+        self.assertEqual(response.json()["body"], "Example body")
+        self.assertEqual(response.json()["attachments"][0]["text"], "ERROR 1023")
+        self.assertIsNone(response.json()["attachments"][1]["text"])
         self.assertEqual(response.headers["cache-control"], "no-store")
 
 

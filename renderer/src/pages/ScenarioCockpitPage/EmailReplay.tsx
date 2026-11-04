@@ -2,12 +2,14 @@ import { useRef, useState } from 'react';
 import { authFetch } from '../../contexts/AuthGateContext';
 
 type Delivery = { payload: string; key: string };
+type Attachment = { name: string; text: string | null; reason: string | null; selected: boolean };
 
 export function EmailReplay() {
     const [file, setFile] = useState<File | null>(null);
     const [secret, setSecret] = useState('');
     const [subject, setSubject] = useState('');
     const [body, setBody] = useState('');
+    const [attachments, setAttachments] = useState<Attachment[]>([]);
     const [previewed, setPreviewed] = useState(false);
     const [confirmed, setConfirmed] = useState(false);
     const [busy, setBusy] = useState(false);
@@ -38,9 +40,10 @@ export function EmailReplay() {
             const data = await response.json();
             setSubject(data.subject);
             setBody(data.body);
+            setAttachments((data.attachments ?? []).map((a: Omit<Attachment, 'selected'>) => ({ ...a, selected: false })));
             delivery.current = null;
             setPreviewed(true);
-            setMessage('Preview loaded. Review and redact before sending.');
+            setMessage(data.attachments_truncated ? 'Only the first 20 attachments are shown. Review and redact before sending.' : 'Preview loaded. Review and redact before sending.');
         } catch (error) {
             setMessage(error instanceof Error ? error.message : 'Preview failed.');
         } finally {
@@ -50,11 +53,18 @@ export function EmailReplay() {
 
     async function send() {
         if (!previewed || !confirmed || !secret || !file || busy) return;
+        const selected = attachments.filter(a => a.selected);
+        const size = (s: string) => new TextEncoder().encode(s).length;
+        if (size(body) > 65536 || selected.some(a => !a.text?.trim() || size(a.text) > 65536) || size(body) + selected.reduce((n, a) => n + size(a.text ?? ''), 0) > 131072) {
+            setMessage('Limit the email body and each selected attachment to 64 KiB, and their combined text to 128 KiB.');
+            return;
+        }
         const payload = JSON.stringify({
             source: 'Outlook email export',
             type: 'Email alert',
             monitor_name: subject,
             message: body,
+            attachments: attachments.filter(a => a.selected && a.text !== null).map(a => ({ name: a.name, text: a.text })),
         });
         setBusy(true);
         setMessage('');
@@ -103,7 +113,7 @@ export function EmailReplay() {
                 <h2 className="font-semibold text-text-primary">Email Alert Replay</h2>
                 <p className="text-sm text-text-muted">Preview one Outlook .msg export, redact it, then send the reviewed subject and body to NemoGuard.</p>
             </div>
-            <p className="text-sm text-warning">Preview uploads the entire file, including attachments, to NemoGuard for parsing. Only the subject and body are displayed; attachments are excluded from replay. Sending passes the reviewed text and incident context to the configured LLM; model output may appear in logs. Confirm your organization permits this data flow.</p>
+            <p className="text-sm text-warning">Preview uploads the entire file, including attachments, to NemoGuard for parsing. Sending stores the reviewed email and selected attachments and passes their contents and incident context to the configured LLM; model output may appear in logs. These are unverified external data, not trusted instructions. Confirm your organization permits this data flow.</p>
             <p className="text-sm text-text-muted">If delivery is uncertain, retry the same file and unchanged reviewed text. Editing changes the delivery key and may create a duplicate. Identical files with identical reviewed text are treated as the same delivery.</p>
             <label className="block text-sm">Webhook secret (kept in this page’s memory)
                 <input type="password" value={secret} onChange={e => setSecret(e.target.value)} autoComplete="off" className="block w-full mt-1 rounded-lg bg-black/20 p-2 ring-1 ring-white/10" />
@@ -119,9 +129,23 @@ export function EmailReplay() {
                 <label className="block text-sm">Body
                     <textarea value={body} maxLength={100000} disabled={busy} onChange={e => { setBody(e.target.value); setConfirmed(false); }} rows={12} className="block w-full mt-1 rounded-lg bg-black/20 p-2 ring-1 ring-white/10" />
                 </label>
+                {attachments.length > 0 && <div className="space-y-3">
+                    <h3 className="font-semibold">Attachments — select and review up to three</h3>
+                    {attachments.map((attachment, index) => <div key={index} className="rounded-lg p-3 ring-1 ring-white/10">
+                        <label className="flex gap-2 text-sm">
+                            <input type="checkbox" disabled={busy || attachment.text === null || (!attachment.selected && attachments.filter(a => a.selected).length >= 3)}
+                                checked={attachment.selected}
+                                onChange={e => { setAttachments(items => items.map((a, i) => i === index ? { ...a, selected: e.target.checked } : a)); setConfirmed(false); }} />
+                            {attachment.name} {attachment.reason && `— ${attachment.reason}`}
+                        </label>
+                        {attachment.selected && <textarea rows={10} value={attachment.text ?? ''} disabled={busy}
+                            onChange={e => { setAttachments(items => items.map((a, i) => i === index ? { ...a, text: e.target.value } : a)); setConfirmed(false); }}
+                            className="block w-full mt-2 rounded-lg bg-black/20 p-2 ring-1 ring-white/10" />}
+                    </div>)}
+                </div>}
                 <label className="flex items-start gap-2 text-sm">
                     <input type="checkbox" checked={confirmed} disabled={busy} onChange={e => setConfirmed(e.target.checked)} />
-                    I reviewed and redacted this text and am authorized to send it to the configured model.
+                    I reviewed and redacted the email and all selected attachments and am authorized to send them to the configured model.
                 </label>
                 <button type="button" disabled={!confirmed || !secret || busy || !body.trim()} onClick={send} className="rounded-lg px-4 py-2 ring-1 ring-primary/40 disabled:opacity-40">{busy ? 'Working…' : 'Send reviewed alert'}</button>
             </>}

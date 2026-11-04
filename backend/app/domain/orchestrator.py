@@ -387,17 +387,22 @@ class IncidentOrchestrator:
                 ON CONFLICT (agent_run_id) DO NOTHING
             """, ("SYSTEM", incident_id, "System Triage", "Triage Incident", "COMPLETED"))
             
+            # Model-generated evidence based on reviewed email is not direct telemetry.
+            reviewed_source = conn.execute(
+                "SELECT 1 FROM reviewed_alert_document d JOIN incident_alert ia ON ia.alert_id = d.alert_id "
+                "WHERE ia.incident_id = %s LIMIT 1", (incident_id,)
+            ).fetchone()
             # 1. Insert Evidence
             from app.domain.evidence_authority import classify_authority
             evidence_ids = []
             for ev in llm_response.get("evidence", []):
                 ev_id = self._generate_id("EVD")
                 evidence_ids.append(ev_id)
-                source = ev.get("source", "System")
+                source = "Email-derived model finding" if reviewed_source else ev.get("source", "System")
                 conn.execute("""
                     INSERT INTO evidence (evidence_id, incident_id, evidence_type, source_system, title, excerpt, collected_at, authority)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """, (ev_id, incident_id, ev.get("type", "Log"), source, ev.get("title", "Evidence"), ev.get("excerpt", ""), now, classify_authority(source)))
+                """, (ev_id, incident_id, ev.get("type", "Log"), source, ev.get("title", "Evidence"), ev.get("excerpt", ""), now, "LOW" if reviewed_source else classify_authority(source)))
             
             # 2. Insert Hypotheses
             primary_hypothesis = None
@@ -446,8 +451,22 @@ class IncidentOrchestrator:
             # operator-facing rationale text, however, is worded
             # distinctly for each case so an inconclusive review is never
             # presented as "the safety critic found this unsafe."
-            plan_status = "PENDING_APPROVAL" if critic_status == "PASSED" else "NEEDS_REVIEW"
+            reviewed_source = conn.execute(
+                "SELECT 1 FROM reviewed_alert_document d "
+                "JOIN incident_alert ia ON ia.alert_id = d.alert_id "
+                "WHERE ia.incident_id = %s LIMIT 1",
+                (incident_id,),
+            ).fetchone()
+            plan_status = "PENDING_APPROVAL" if critic_status == "PASSED" and not reviewed_source else "NEEDS_REVIEW"
             rationale = plan_data.get("rationale", "")
+            if reviewed_source:
+                rationale = (
+                    "[UNVERIFIED EMAIL EVIDENCE] This plan includes operator-reviewed "
+                    "email-supplied material that is not independently verified. "
+                    "It remains in NEEDS_REVIEW; independently verify the evidence "
+                    "and use an authorized review workflow before taking action.\n\n"
+                    + rationale
+                )
             if critic_status == "FAILED" and critic_feedback:
                 rationale = f"[SAFETY REVIEW REQUIRED] {critic_feedback}\n\n{rationale}"
             elif critic_status == "INCONCLUSIVE":
@@ -700,6 +719,15 @@ class IncidentOrchestrator:
                     "(either the plan does not exist or it belongs to a different incident)"
                 )
             current_plan_status = status_row[0]
+            reviewed_source = conn.execute(
+                "SELECT 1 FROM reviewed_alert_document d JOIN incident_alert ia ON ia.alert_id = d.alert_id "
+                "WHERE ia.incident_id = %s LIMIT 1", (incident_id,),
+            ).fetchone()
+            if reviewed_source:
+                raise ValueError(
+                    "execute_plan: reviewed email evidence requires independent review; "
+                    "no approval workflow is available yet"
+                )
             if current_plan_status != "APPROVED":
                 raise ValueError(
                     f"execute_plan: refusing to execute plan {plan_id} for incident "
@@ -1082,7 +1110,10 @@ class IncidentOrchestrator:
                 print(f"reinvestigate_from_commander_guidance: could not restore status for {incident_id}: {restore_exc}")
         return result
 
-    async def process_webhook(self, payload: Dict[str, Any], delivery_key: str, payload_hash: str) -> Dict[str, Any]:
+    async def process_webhook(
+        self, payload: Dict[str, Any], delivery_key: str, payload_hash: str,
+        reviewed_documents: List[Dict[str, str]] = None, submitted_by: str = "",
+    ) -> Dict[str, Any]:
         """Process a webhook with a transactional, persistent delivery receipt."""
         def claim(conn):
             cursor = conn.execute(
@@ -1176,11 +1207,41 @@ class IncidentOrchestrator:
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """, (f"AUD-{uuid.uuid4().hex}", incident_id, "SYSTEM", "Watcher Agent", event_type, summary, now))
 
+            def link_reviewed_evidence(incident_id):
+                if not reviewed_documents:
+                    return
+                cursor = conn.execute(
+                    "SELECT document_id, document_kind, title, content FROM reviewed_alert_document WHERE alert_id = %s",
+                    (alert_id,),
+                )
+                for document_id, kind, title, content in cursor.fetchall():
+                    conn.execute("""
+                        INSERT INTO evidence (evidence_id, incident_id, evidence_type, source_system, source_record_id, title, excerpt, collected_at, reliability, metadata_json, authority)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        f"EVD-{uuid.uuid4().hex}", incident_id, kind, "Reviewed email export",
+                        document_id, title, content, now, 0.2,
+                        json.dumps({"submitted_by": submitted_by, "verification": "unverified_external"}),
+                        "LOW",
+                    ))
+
             conn.execute("""
                 INSERT INTO alert (alert_id, run_id, opened_ts, severity, alert_type, source_system, message, status)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, 'open')
             """, (alert_id, run_id, now, severity, alert_type, source_system, message))
-            
+
+            # These are operator-reviewed but remain untrusted external claims.
+            # Store against the alert even when no incident is created yet.
+            for document in reviewed_documents or []:
+                conn.execute("""
+                    INSERT INTO reviewed_alert_document
+                        (document_id, alert_id, document_kind, title, content, submitted_by, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    f"DOC-{uuid.uuid4().hex}", alert_id, document["kind"],
+                    document["title"], document["content"], submitted_by, now,
+                ))
+
             # Check if AI correlated this to an existing incident
             correlated_incident_id = analysis.get("correlated_incident_id")
             
@@ -1190,6 +1251,7 @@ class IncidentOrchestrator:
                     INSERT INTO incident_alert (incident_id, alert_id, correlation_score, correlation_reasons_json, added_at)
                     VALUES (%s, %s, %s, %s, %s)
                 """, (correlated_incident_id, alert_id, analysis.get("confidence", 0.95), json.dumps([analysis.get("reasoning")]), now))
+                link_reviewed_evidence(correlated_incident_id)
 
                 # Update incident summary
                 conn.execute("""
@@ -1231,6 +1293,8 @@ class IncidentOrchestrator:
                     })
 
                 audit(correlated_incident_id, "ALERT_CORRELATED", f"Alert {alert_id} dynamically correlated to this incident by AI. Reasoning: {analysis.get('reasoning')}")
+                if reviewed_documents:
+                    audit(correlated_incident_id, "REVIEWED_EMAIL_EVIDENCE_ADDED", "Reviewed email evidence was linked to the alert. Existing plans were not automatically revised; operator review is required.")
 
                 return finish(conn, {
                     "status": "ingested_and_correlated",
@@ -1281,7 +1345,8 @@ class IncidentOrchestrator:
                     INSERT INTO incident_alert (incident_id, alert_id, correlation_score, correlation_reasons_json, added_at)
                     VALUES (%s, %s, %s, %s, %s)
                 """, (incident.incident_id, alert_id, 1.0, json.dumps(["Direct webhook correlation"]), now))
-                
+                link_reviewed_evidence(incident.incident_id)
+
                 # Auto-start triage (Now handled in api/main.py by kicking off Temporal workflow)
                 
                 return finish(conn, {

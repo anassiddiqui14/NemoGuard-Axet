@@ -225,6 +225,19 @@ async def startup_event():
             )
         """)
 
+    with db.get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS reviewed_alert_document (
+                document_id VARCHAR(64) PRIMARY KEY,
+                alert_id VARCHAR(128) NOT NULL REFERENCES alert(alert_id),
+                document_kind VARCHAR(32) NOT NULL,
+                title VARCHAR(200) NOT NULL,
+                content TEXT NOT NULL,
+                submitted_by VARCHAR(200) NOT NULL,
+                created_at VARCHAR(64) NOT NULL
+            )
+        """)
+
     _bootstrap_admin_if_configured(db)
     print(f"[startup-timing] bootstrap admin complete at +{__import__('time').perf_counter() - _startup_t0:.2f}s")
 
@@ -371,8 +384,9 @@ def get_hypotheses(incident_id: str):
         return rows
 
 @app.get("/api/v2/incidents/{incident_id}/evidence")
-def get_evidence(incident_id: str):
+def get_evidence(incident_id: str, current_user: User = Depends(get_current_user)):
     db = get_database()
+    _require_incident_in_tenant(db, incident_id, current_user.tenant_id)
     with db.get_connection() as conn:
         cursor = conn.execute("SELECT * FROM evidence WHERE incident_id = %s ORDER BY collected_at ASC", (incident_id,))
         cols = [col[0] for col in cursor.description]
@@ -508,11 +522,33 @@ async def preview_email_export(
         with extract_msg.Message(bytes(data), delayAttachments=True) as message:
             subject = message.subject or ""
             body = message.body or ""
+            attachments = []
+            all_attachments = message.attachments
+            attachments_truncated = len(all_attachments) > 20
+            for attachment in all_attachments[:20]:
+                name = attachment.longFilename or attachment.shortFilename or "unnamed"
+                name = str(name).replace("\\", "/").split("/")[-1][:200]
+                item = {"name": name, "text": None, "reason": None}
+                if not name.lower().endswith((".log", ".txt", ".csv")):
+                    item["reason"] = "Unsupported attachment type"
+                else:
+                    raw = attachment.data
+                    if not isinstance(raw, bytes) or len(raw) > 65536:
+                        item["reason"] = "Attachment exceeds 64 KB or is not a file"
+                    else:
+                        try:
+                            text = raw.decode("utf-8-sig")
+                            if "\x00" in text:
+                                raise ValueError("Binary content")
+                            item["text"] = text
+                        except (UnicodeError, ValueError):
+                            item["reason"] = "Not supported UTF-8 text"
+                attachments.append(item)
         if not isinstance(subject, str) or not isinstance(body, str):
             raise ValueError("Invalid message text")
         if len(subject) > 1000 or len(body) > 100000:
             raise HTTPException(status_code=413, detail="Message text is too large to preview")
-        return JSONResponse({"subject": subject, "body": body}, headers={"Cache-Control": "no-store"})
+        return JSONResponse({"subject": subject, "body": body, "attachments": attachments, "attachments_truncated": attachments_truncated}, headers={"Cache-Control": "no-store"})
     except HTTPException:
         raise
     except Exception:
@@ -538,7 +574,15 @@ async def ingest_webhook(payload: dict, request: Request):
 
     from app.domain.orchestrator import IncidentOrchestrator
     orchestrator = IncidentOrchestrator()
-    result = await orchestrator.process_webhook(payload, delivery_key, payload_hash)
+    reviewed = getattr(request.state, "reviewed_documents", None)
+    if reviewed is None:
+        result = await orchestrator.process_webhook(payload, delivery_key, payload_hash)
+    else:
+        classification_payload = {k: v for k, v in payload.items() if k != "attachments"}
+        result = await orchestrator.process_webhook(
+            classification_payload, delivery_key, payload_hash,
+            reviewed_documents=reviewed, submitted_by=request.state.reviewed_by,
+        )
 
     if result.get("status") == "idempotency_conflict":
         raise HTTPException(status_code=409, detail="Idempotency-Key was already used with a different payload")
@@ -589,6 +633,33 @@ async def replay_reviewed_email(
     current_user: User = Depends(require_role("operator")),
 ):
     """Replay reviewed text with operator authorization and webhook authentication."""
+    secret = os.environ.get("NEMOGUARD_WEBHOOK_SECRET", "")
+    if not secret:
+        raise HTTPException(status_code=503, detail="Webhook ingestion is not configured")
+    if not hmac.compare_digest(request.headers.get("X-NemoGuard-Webhook-Secret", "").encode("utf-8"), secret.encode("utf-8")):
+        raise HTTPException(status_code=401, detail="Invalid webhook credentials")
+    subject, body = payload.get("monitor_name"), payload.get("message")
+    attachments = payload.get("attachments", [])
+    if not isinstance(subject, str) or len(subject) > 1000 or not isinstance(body, str) or not body.strip() or len(body.encode("utf-8")) > 65536:
+        raise HTTPException(status_code=400, detail="Invalid reviewed email subject or body")
+    if not isinstance(attachments, list) or len(attachments) > 3:
+        raise HTTPException(status_code=400, detail="Select at most three text attachments")
+    documents = [{"kind": "EMAIL_BODY", "title": subject[:200] or "Reviewed email", "content": body}]
+    total = len(body.encode("utf-8"))
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            raise HTTPException(status_code=400, detail="Invalid attachment")
+        name, text = attachment.get("name"), attachment.get("text")
+        if not isinstance(name, str) or not name or len(name) > 200 or "/" in name or "\\" in name or not name.lower().endswith((".log", ".txt", ".csv")):
+            raise HTTPException(status_code=400, detail="Invalid attachment name")
+        if not isinstance(text, str) or not text.strip() or "\x00" in text or len(text.encode("utf-8")) > 65536:
+            raise HTTPException(status_code=400, detail="Invalid attachment text")
+        total += len(text.encode("utf-8"))
+        documents.append({"kind": "EMAIL_ATTACHMENT", "title": name, "content": text})
+    if total > 131072:
+        raise HTTPException(status_code=413, detail="Reviewed email and attachments exceed 128 KB")
+    request.state.reviewed_documents = documents
+    request.state.reviewed_by = current_user.user_id
     return await ingest_webhook(payload, request)
 
 @app.post("/api/v2/incidents/{incident_id}/triage")
@@ -720,6 +791,12 @@ async def approve_plan(incident_id: str, plan_id: str, req: ApprovalRequest, cur
         plan_row = cursor.fetchone()
         if not plan_row:
             raise HTTPException(status_code=404, detail="Plan not found for this incident")
+        reviewed_source = conn.execute(
+            "SELECT 1 FROM reviewed_alert_document d JOIN incident_alert ia ON ia.alert_id = d.alert_id "
+            "WHERE ia.incident_id = %s LIMIT 1", (incident_id,),
+        ).fetchone()
+        if reviewed_source:
+            raise HTTPException(status_code=409, detail="Email-supplied evidence requires independent review; no approval workflow is available yet.")
         plan_cols = [c[0] for c in cursor.description]
         plan_dict = dict(zip(plan_cols, plan_row))
         cursor = conn.execute("SELECT * FROM action_step WHERE action_plan_id = %s ORDER BY sequence_no ASC", (plan_id,))
