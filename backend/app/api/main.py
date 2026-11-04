@@ -479,6 +479,45 @@ def get_runbooks_context():
 
 # --- 12.4 Workflow endpoints ---
 
+@app.post("/api/v2/ingest/email-preview")
+async def preview_email_export(
+    request: Request,
+    current_user: User = Depends(require_role("operator")),
+):
+    """Preview an Outlook MSG export without creating an alert or calling the LLM."""
+    secret = os.environ.get("NEMOGUARD_WEBHOOK_SECRET", "")
+    if not secret:
+        raise HTTPException(status_code=503, detail="Webhook ingestion is not configured")
+    supplied = request.headers.get("X-NemoGuard-Webhook-Secret", "")
+    if not hmac.compare_digest(supplied.encode("utf-8"), secret.encode("utf-8")):
+        raise HTTPException(status_code=401, detail="Invalid webhook credentials")
+
+    limit = 5 * 1024 * 1024
+    data = bytearray()
+    async for chunk in request.stream():
+        if len(data) + len(chunk) > limit:
+            raise HTTPException(status_code=413, detail="Email export exceeds the 5 MB limit")
+        data.extend(chunk)
+    if not data.startswith(bytes.fromhex("D0CF11E0A1B11AE1")):
+        raise HTTPException(status_code=400, detail="Expected an Outlook .msg file")
+    try:
+        import extract_msg
+    except ImportError:
+        raise HTTPException(status_code=503, detail="Outlook .msg parser is not installed")
+    try:
+        with extract_msg.Message(bytes(data), delayAttachments=True) as message:
+            subject = message.subject or ""
+            body = message.body or ""
+        if not isinstance(subject, str) or not isinstance(body, str):
+            raise ValueError("Invalid message text")
+        if len(subject) > 1000 or len(body) > 100000:
+            raise HTTPException(status_code=413, detail="Message text is too large to preview")
+        return JSONResponse({"subject": subject, "body": body}, headers={"Cache-Control": "no-store"})
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="Unable to parse this Outlook .msg file")
+
 @app.post("/api/v2/ingest/webhook")
 async def ingest_webhook(payload: dict, request: Request):
     """
@@ -542,6 +581,15 @@ async def ingest_webhook(payload: dict, request: Request):
             result = {**result, "triage_scheduling_status": schedule_result.get("status")}
 
     return result
+
+@app.post("/api/v2/ingest/email-replay")
+async def replay_reviewed_email(
+    payload: dict,
+    request: Request,
+    current_user: User = Depends(require_role("operator")),
+):
+    """Replay reviewed text with operator authorization and webhook authentication."""
+    return await ingest_webhook(payload, request)
 
 @app.post("/api/v2/incidents/{incident_id}/triage")
 async def triage_incident(incident_id: str, current_user: User = Depends(get_current_user)):

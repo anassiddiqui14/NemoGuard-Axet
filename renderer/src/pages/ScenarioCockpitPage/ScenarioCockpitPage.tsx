@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import { ngToast } from '../../design-system/toast';
 import { clearDashboardCache } from '../../lib/dashboardCache';
+import { EmailReplay } from './EmailReplay';
 import {
     Rocket, Cloud, Sparkles, RotateCcw, Database, Mail, GitBranch,
     AlertTriangle, CheckCircle2, XCircle, Loader2, PlayCircle, BellRing, Network,
@@ -333,6 +334,8 @@ export function ScenarioCockpitPage() {
                     Reset All Incidents
                 </motion.button>
             </div>
+
+            <EmailReplay />
 
             {/* Scripted webhook scenarios — instant, no real infra required */}
             <Section

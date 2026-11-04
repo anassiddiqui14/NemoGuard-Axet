@@ -17,3 +17,4 @@ temporalio
 psycopg2-binary
 python-dotenv
 fastmcp
+extract-msg==0.58.1

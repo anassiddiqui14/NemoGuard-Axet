@@ -4,7 +4,28 @@ Use only authorized data in a non-production test. The watcher sends alert
 content and active incident context to the configured model and may print
 model output in logs. Masking is best-effort, not a privacy guarantee.
 
-## Prepare and review
+## Portal
+
+In NemoGuard, open **Scenario Cockpit → Email Alert Replay**. Enter the
+webhook secret, select one Outlook `.msg` file (maximum 5 MB), and choose
+**Preview email**. Review and redact the subject and body, then confirm
+authorization and select **Send reviewed alert**.
+
+Preview uploads the complete file, including attachments, to NemoGuard for
+parsing; attachments are not included in the replay payload. No automatic
+redaction is performed. The preview does not call the LLM or create an alert.
+Sending does both when the watcher accepts the message; inspect the displayed
+result because it may instead be ignored or correlated.
+
+To retry an uncertain delivery, select the same file and use exactly the
+same reviewed text. Editing either changes the idempotency key and may create
+a second alert. Identical files with identical reviewed text share a key.
+Keep the secret out of screenshots and flow exports. The current Axet
+Python-agent requirements must include `extract-msg` and the agent must
+be restarted after installing it. Access requires an operator or admin
+account and the webhook secret.
+
+## Command-line alternative: prepare and review
 
 Export Outlook messages as `.msg` files into a local folder. In PowerShell,
 from the project root, install the importer dependencies if needed:
