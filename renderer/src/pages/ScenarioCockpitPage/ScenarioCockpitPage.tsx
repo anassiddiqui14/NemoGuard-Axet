@@ -170,8 +170,23 @@ export function ScenarioCockpitPage() {
         }
     };
 
-    const runScripted = (scenarioType: string, label: string) =>
-        run(scenarioType, '/trigger', { scenario_type: scenarioType }, `Fired ${label} webhook into NemoGuard.`);
+    const runScripted = async (scenarioType: string, label: string) => {
+        setLoadingKey(scenarioType);
+        try {
+            const result = await postJson('/trigger', { scenario_type: scenarioType });
+            const outcomes: { status: string }[] = result?.outcomes ?? [];
+            const ingested = outcomes.filter(o => o.status.startsWith('ingested')).length;
+            if (outcomes.length > 0 && ingested === outcomes.length) {
+                ngToast.success(`${label}: ${ingested} alert(s) ingested; check incidents for correlation.`);
+            } else {
+                ngToast.error(`${label}: ${ingested}/${outcomes.length} alerts confirmed ingested. Other deliveries were ignored, failed, or unconfirmed.`);
+            }
+        } catch (e) {
+            ngToast.error(e instanceof Error ? e.message : 'Scenario failed');
+        } finally {
+            setLoadingKey(null);
+        }
+    };
 
     const runLab = (key: string, endpoint: string, scenario: string, label: string) =>
         run(key, `/lab/trigger/${endpoint}`, { scenario }, `${label} — real AWS lab invocation completed. Alarm forwarding may take up to ~15s.`);
@@ -254,7 +269,7 @@ export function ScenarioCockpitPage() {
                 setAiStreamStatus(message);
                 if (message.startsWith('ERROR')) {
                     streamError = message;
-                } else if (message.startsWith('Successfully injected AI incident into NemoGuard')) {
+                } else if (message.startsWith('Successfully injected AI alerts into NemoGuard') || message.startsWith('Successfully injected AI incident into NemoGuard')) {
                     sawSuccess = true;
                 }
             };
@@ -283,7 +298,7 @@ export function ScenarioCockpitPage() {
                 // Preserve the prompt -- the run did not confirm success.
             } else {
                 setPrompt('');
-                ngToast.success('Custom scenario injected into NemoGuard.');
+                ngToast.success('Custom alerts ingested. Check incidents for correlation.');
             }
         } catch (e) {
             ngToast.error(

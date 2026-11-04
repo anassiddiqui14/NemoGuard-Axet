@@ -18,10 +18,17 @@ sys.stdout.reconfigure(line_buffering=True)
 from datetime import datetime, timezone
 from typing import Any
 import psycopg2
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+# The standalone simulator starts at the repository root, whereas the
+# mounted Axet app has already added backend/ to sys.path.
+_backend_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend")
+if _backend_path not in sys.path:
+    sys.path.insert(0, _backend_path)
+from app.store.database_factory import get_database
 
 app = FastAPI(title="NemoGuard Application Simulator")
 
@@ -69,6 +76,30 @@ def _webhook_headers(delivery_key: str) -> dict:
     if not secret:
         raise RuntimeError("NEMOGUARD_WEBHOOK_SECRET must be configured for webhook delivery")
     return {"X-NemoGuard-Webhook-Secret": secret, "Idempotency-Key": delivery_key}
+
+
+def _scenario_api_base(request: Request) -> str:
+    # Do not use the caller-controlled Host header for credentialed requests.
+    # A mounted simulator shares the backend's ASGI server and actual port.
+    if request.scope.get("root_path", "").endswith("/api/v2/sim"):
+        server = request.scope.get("server")
+        if server and server[1]:
+            return f"http://127.0.0.1:{server[1]}"
+    return NEMOGUARD_API_BASE.rstrip("/")
+
+
+def _delivery_status(response) -> str:
+    if not response.is_success:
+        # A server/proxy error may occur after an alert has committed.
+        return "unknown" if response.status_code >= 500 else "failed"
+    try:
+        body = response.json()
+        status = body.get("status") if isinstance(body, dict) else None
+    except ValueError:
+        return "unknown"
+    if status in ("ingested", "ingested_and_correlated", "ingested_and_incident_created", "ingested_and_incident_auto_resolved"):
+        return status
+    return "ignored" if status == "ignored" else "unknown"
 
 FUNCTION_NAME_TO_JOB_ID = {
     "nemoguard-ingest-job": "LOCALSTACK_INGEST_JOB",
@@ -913,7 +944,7 @@ def _validate_generated_scenario(result: Any) -> str | None:
     return None
 
 
-async def generate_and_inject_ai(prompt: str):
+async def generate_and_inject_ai(prompt: str, api_base: str = NEMOGUARD_API_BASE):
     """
     Generates a synthetic incident scenario via the NTT aXet-managed LLM
     (through the same proven BaseAgent integration every real NemoGuard
@@ -932,7 +963,7 @@ async def generate_and_inject_ai(prompt: str):
         yield "status: ERROR - A scenario prompt is required.\n"
         return
 
-    run_id = f"RUN-SIM-{uuid.uuid4().hex[:6].upper()}"
+    run_id = f"RUN-SIM-{uuid.uuid4().hex.upper()}"
     now = datetime.now(timezone.utc).isoformat()
 
     yield "status: Generating incident using the aXet-managed model...\n"
@@ -970,26 +1001,30 @@ async def generate_and_inject_ai(prompt: str):
 
     # Only now -- after the generated output has been confirmed valid --
     # do we create any database residue for this run.
-    generate_noise_logs(run_id, 150)
+    try:
+        generate_noise_logs(run_id, 150)
+    except Exception:
+        yield "status: ERROR - Failed to prepare scenario data in the configured database.\n"
+        return
 
     for payload in webhook_payloads:
         payload["run_id"] = run_id
 
     logs_to_insert = []
     for log in failure_logs:
-        logs_to_insert.append((f"LOG-{uuid.uuid4().hex[:6]}", run_id, now, log.get("level", "ERROR"), log.get("component", "unknown"), None, log.get("message", "error")))
+        logs_to_insert.append((f"LOG-{uuid.uuid4().hex}", run_id, now, log.get("level", "ERROR"), log.get("component", "unknown"), None, log.get("message", "error")))
 
     assets_to_insert = []
     asset_dependencies_to_insert = []
     for idx, asset in enumerate(business_assets):
-        asset_id = f"AST-{uuid.uuid4().hex[:6]}"
+        asset_id = f"AST-{uuid.uuid4().hex}"
         job_id = f"JOB_{asset.get('depends_on_service', 'SIMULATOR_JOB').upper()}"
         assets_to_insert.append((asset_id, asset.get("asset_name"), asset.get("asset_type"), asset.get("owner"), asset.get("sla_minutes", 60), asset.get("criticality", 1), ""))
         asset_dependencies_to_insert.append((asset_id, job_id))
 
     runbooks_to_insert = []
     for idx, rb in enumerate(runbooks):
-        rb_id = f"RBK-{uuid.uuid4().hex[:6]}"
+        rb_id = f"RBK-{uuid.uuid4().hex}"
         job_name = f"JOB_{rb.get('service_name', 'SIMULATOR_JOB').upper()}"
         title = rb.get("title", f"Runbook for {job_name}")
         runbooks_to_insert.append((
@@ -1000,7 +1035,7 @@ async def generate_and_inject_ai(prompt: str):
 
     yield "status: Injecting generated alerts into NemoGuard...\n"
 
-    with psycopg2.connect(DATABASE_URL) as conn:
+    with get_database().get_connection() as conn:
         with conn.cursor() as cursor:
             # We must create jobs for all the dependencies generated so foreign keys work
             unique_jobs = set([j for _, j in asset_dependencies_to_insert])
@@ -1054,22 +1089,31 @@ async def generate_and_inject_ai(prompt: str):
     # success is therefore the acceptance signal used here.
     accepted_count = 0
     failed_count = 0
+    unknown_count = 0
     async with httpx.AsyncClient() as client:
-        for payload in webhook_payloads:
+        for index, payload in enumerate(webhook_payloads):
             try:
-                response = await client.post(f"{NEMOGUARD_API_BASE}/api/v2/ingest/webhook", json=payload, headers=_webhook_headers("sim:" + uuid.uuid4().hex), timeout=60.0)
-                if response.is_success:
+                response = await client.post(f"{api_base}/api/v2/ingest/webhook", json=payload, headers=_webhook_headers(f"sim:{run_id}:{index}"), timeout=180.0)
+                status = _delivery_status(response)
+                if status.startswith("ingested"):
                     accepted_count += 1
-                    yield f"status: Injected alert successfully: HTTP {response.status_code}\n"
+                    yield f"status: Alert delivered: {status}.\n"
                 else:
                     failed_count += 1
-                    yield f"status: ERROR - NemoGuard rejected generated alert with HTTP {response.status_code}\n"
+                    if status == "unknown":
+                        unknown_count += 1
+                    yield f"status: ERROR - Alert not confirmed ingested ({status}, HTTP {response.status_code}).\n"
             except Exception:
                 failed_count += 1
-                yield "status: ERROR - Failed to deliver generated alert to NemoGuard.\n"
+                unknown_count += 1
+                yield "status: ERROR - Delivery outcome unknown; supporting records retained for review.\n"
             await asyncio.sleep(1)
 
     total = len(webhook_payloads)
+
+    if unknown_count:
+        yield f"status: ERROR - {unknown_count} delivery outcome(s) unknown; supporting records retained for run {run_id}.\n"
+        return
 
     if accepted_count == 0:
         # Zero alerts were ever accepted -- nothing from this run can
@@ -1084,7 +1128,7 @@ async def generate_and_inject_ai(prompt: str):
         # that may be referenced by other runs/executions, and
         # ON CONFLICT DO NOTHING means this run may not even "own" it.
         try:
-            with psycopg2.connect(DATABASE_URL) as conn:
+            with get_database().get_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute("DELETE FROM log_event WHERE run_id = %s", (run_id,))
                     cursor.execute("DELETE FROM execution WHERE run_id = %s", (run_id,))
@@ -1136,8 +1180,8 @@ async def generate_and_inject_ai(prompt: str):
 
 
 @app.post("/trigger/ai")
-async def trigger_scenario_ai(req: PromptRequest):
-    return StreamingResponse(generate_and_inject_ai(req.prompt), media_type="text/event-stream")
+async def trigger_scenario_ai(req: PromptRequest, request: Request):
+    return StreamingResponse(generate_and_inject_ai(req.prompt, _scenario_api_base(request)), media_type="text/event-stream")
 
 class ScenarioRequest(BaseModel):
     scenario_type: str = "SCHEMA_REGRESSION"
@@ -1159,9 +1203,9 @@ def generate_noise_logs(run_id: str, count: int = 150):
     for _ in range(count):
         comp = random.choice(noise_components)
         msg = random.choice(noise_messages).replace("{uid}", str(random.randint(1000, 9999))).replace("{ms}", str(random.randint(10, 300)))
-        logs.append((f"LOG-{uuid.uuid4().hex[:6]}", run_id, now, "INFO", comp, None, msg))
+        logs.append((f"LOG-{uuid.uuid4().hex}", run_id, now, "INFO", comp, None, msg))
     
-    with psycopg2.connect(DATABASE_URL) as conn:
+    with get_database().get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute("""
                 INSERT INTO job (job_id, job_name, platform, domain, stage, schedule, criticality, default_duration_sec, owner_team, retry_policy, active)
@@ -1180,8 +1224,8 @@ def generate_noise_logs(run_id: str, count: int = 150):
             """, logs)
         conn.commit()
 
-def simulate_failure(scenario_type: str):
-    run_id = f"RUN-SIM-{uuid.uuid4().hex[:6].upper()}"
+def simulate_failure(scenario_type: str, api_base: str = NEMOGUARD_API_BASE):
+    run_id = f"RUN-SIM-{uuid.uuid4().hex.upper()}"
     now = datetime.now(timezone.utc).isoformat()
     
     # 1. Generate normal operations noise
@@ -1314,9 +1358,9 @@ def simulate_failure(scenario_type: str):
         
     logs_to_insert = []
     for level, component, msg in failure_logs:
-        logs_to_insert.append((f"LOG-{uuid.uuid4().hex[:6]}", run_id, now, level, component, None, msg))
+        logs_to_insert.append((f"LOG-{uuid.uuid4().hex}", run_id, now, level, component, None, msg))
         
-    with psycopg2.connect(DATABASE_URL) as conn:
+    with get_database().get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute("""
                 INSERT INTO job (job_id, job_name, platform, domain, stage, schedule, criticality, default_duration_sec, owner_team, retry_policy, active)
@@ -1375,19 +1419,31 @@ def simulate_failure(scenario_type: str):
             """, logs_to_insert)
         conn.commit()
         
-    # 3. Fire the webhooks to NemoGuard
-    for payload in webhook_payloads:
+    # Report actual ingestion outcomes; a timeout does not prove failure.
+    outcomes = []
+    for index, payload in enumerate(webhook_payloads):
         try:
-            response = httpx.post(f"{NEMOGUARD_API_BASE}/api/v2/ingest/webhook", json=payload, headers=_webhook_headers("sim:" + uuid.uuid4().hex), timeout=60.0)
-            print(f"Sent webhook to NemoGuard: {response.status_code}")
-            time.sleep(1) # small delay between alerts
-        except Exception as e:
-            print(f"Failed to send webhook to NemoGuard: {e}")
+            response = httpx.post(f"{api_base}/api/v2/ingest/webhook", json=payload, headers=_webhook_headers(f"sim:{run_id}:{index}"), timeout=180.0)
+            status = _delivery_status(response)
+            outcomes.append({"status": status, "http_status": response.status_code})
+        except Exception:
+            outcomes.append({"status": "unknown"})
+    return {"run_id": run_id, "outcomes": outcomes}
 
 @app.post("/trigger")
-def trigger_scenario(req: ScenarioRequest, bg: BackgroundTasks):
-    bg.add_task(simulate_failure, req.scenario_type)
-    return {"status": "accepted", "scenario": req.scenario_type}
+async def trigger_scenario(req: ScenarioRequest, request: Request):
+    try:
+        result = await asyncio.to_thread(simulate_failure, req.scenario_type, _scenario_api_base(request))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to prepare the scenario in the configured database.")
+    outcomes = result["outcomes"]
+    ingested = sum(o["status"].startswith("ingested") for o in outcomes)
+    if not outcomes or ingested != len(outcomes):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Scenario {result['run_id']}: {ingested}/{len(outcomes)} alerts confirmed ingested; other deliveries were ignored, rejected, or unconfirmed. Check the run before retrying.",
+        )
+    return result
 
 @app.post("/reset")
 def reset_database():
