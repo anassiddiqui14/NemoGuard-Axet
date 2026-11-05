@@ -1447,11 +1447,28 @@ async def trigger_scenario(req: ScenarioRequest, request: Request):
 
 @app.post("/reset")
 def reset_database():
-    with psycopg2.connect(DATABASE_URL) as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("TRUNCATE TABLE incident CASCADE;")
-            cursor.execute("TRUNCATE TABLE alert CASCADE;")
-        conn.commit()
+    db = get_database()
+    # Child tables precede their parents. Some are absent in older schemas.
+    incident_tables = (
+        "action_execution", "approval", "verification_result", "action_step",
+        "action_plan", "incident_impact", "hypothesis", "evidence",
+        "tool_call", "agent_step", "agent_run", "feedback",
+        "incident_alert", "incident_evidence", "reviewed_alert_document",
+        "commander_status_update", "incident_message", "commander_guidance",
+        "incident_guidance_revision", "plan_feedback",
+    )
+    existing_tables = [name for name in incident_tables if db.table_exists(name)]
+    has_audit = db.table_exists("audit_event")
+    has_execution = db.table_exists("execution")
+    with db.get_connection() as conn:
+        for table in existing_tables:
+            conn.execute(f"DELETE FROM {table}")
+        if has_audit:
+            conn.execute("DELETE FROM audit_event WHERE incident_id IS NOT NULL")
+        if has_execution:
+            conn.execute("UPDATE execution SET incident_id = NULL WHERE incident_id IS NOT NULL")
+        conn.execute("DELETE FROM incident")
+        conn.execute("DELETE FROM alert")
     return {"status": "success", "message": "All incidents and alerts cleared"}
 
 if __name__ == "__main__":

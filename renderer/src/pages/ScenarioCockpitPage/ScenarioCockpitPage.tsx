@@ -192,16 +192,22 @@ export function ScenarioCockpitPage() {
     const runLab = (key: string, endpoint: string, scenario: string, label: string) =>
         run(key, `/lab/trigger/${endpoint}`, { scenario }, `${label} — real AWS lab invocation completed. Alarm forwarding may take up to ~15s.`);
 
-    const runReset = () =>
-        run('reset', '/reset', undefined, 'Cleared all incidents and alerts.').then(() => {
-            // Explicitly invalidate the Dashboard's stale-while-revalidate
-            // cache so a returning Command Center mount cannot show
-            // stale pre-reset incidents even for one frame -- the next
-            // authoritative refresh (which always runs on mount) would
-            // clear them anyway, but this avoids that one extra stale
-            // render.
+    const runReset = async () => {
+        if (!window.confirm('Permanently delete all incidents, alerts, and their related records? This cannot be undone.')) return;
+        setLoadingKey('reset');
+        try {
+            const result = await postJson('/reset');
+            if (result?.status !== 'success') {
+                throw new Error('Reset was not confirmed by the server.');
+            }
             clearDashboardCache();
-        });
+            ngToast.success('Cleared all incidents and alerts.');
+        } catch (e) {
+            ngToast.error(e instanceof Error ? e.message : 'Reset failed');
+        } finally {
+            setLoadingKey(null);
+        }
+    };
 
     const runCorrelationCheck = async (check: 'same_alarm' | 'different_alarm') => {
         try {
