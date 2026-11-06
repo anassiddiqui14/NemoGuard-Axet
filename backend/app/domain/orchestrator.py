@@ -176,7 +176,7 @@ class IncidentOrchestrator:
                 rca_hypotheses = [{
                     "statement": rca_res.get("finding", "Unknown root cause"),
                     "cause_type": rca_res.get("cause_type", "OTHER"),
-                    "confidence": rca_res.get("confidence", 0.9)
+                    "confidence": rca_res.get("confidence", 0.0)
                 }]
 
             llm_response = {
@@ -200,11 +200,11 @@ class IncidentOrchestrator:
             # the critic "rejected" a plan it never actually evaluated.
             critic_status = final_state.get("critic_status", "INCONCLUSIVE")
             critic_feedback = final_state.get("critic_feedback", "")
-            self.save_agent_findings(
+            result = self.save_agent_findings(
                 incident_id, llm_response,
                 critic_status=critic_status, critic_feedback=critic_feedback,
             )
-            saved_plan = True
+            saved_plan = bool(result and result.get("status") == "success" and result.get("plan_id"))
         except Exception as e:
             print(f"LangGraph execution failed: {e}")
             saved_plan = False
@@ -368,7 +368,7 @@ class IncidentOrchestrator:
                     {
                         "statement": llm_response.get("finding"),
                         "cause_type": "SYSTEM_FAILURE",
-                        "confidence": 0.90
+                        "confidence": llm_response.get("confidence", 0.0)
                     }
                 ],
                 "action_plan": {
@@ -413,7 +413,7 @@ class IncidentOrchestrator:
                 conn.execute("""
                     INSERT INTO hypothesis (hypothesis_id, incident_id, agent_run_id, rank_no, statement, cause_type, confidence, status, supporting_evidence_json, contradicting_evidence_json, missing_evidence_json, created_at)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (hyp_id, incident_id, "SYSTEM", idx+1, hyp.get("statement", ""), hyp.get("cause_type", "OTHER"), hyp.get("confidence", 0.5), "PROBABLE_CAUSE", json.dumps(evidence_ids), "[]", "[]", now))
+                """, (hyp_id, incident_id, "SYSTEM", idx+1, hyp.get("statement", ""), hyp.get("cause_type", "OTHER"), hyp.get("confidence", 0.0), "UNVERIFIED" if reviewed_source else "PROBABLE_CAUSE", json.dumps(evidence_ids), "[]", "[]", now))
                 
             # 3. Insert/refresh Impacts. Revision-safe: a re-investigation
             # (Commander guidance, plan feedback, new correlated evidence)
@@ -461,8 +461,8 @@ class IncidentOrchestrator:
             rationale = plan_data.get("rationale", "")
             if reviewed_source:
                 rationale = (
-                    "[UNVERIFIED EMAIL EVIDENCE] This plan includes operator-reviewed "
-                    "email-supplied material that is not independently verified. "
+                    "[UNVERIFIED EMAIL EVIDENCE] This plan includes "
+                    "email-supplied material that may be unreviewed and is not independently verified. "
                     "It remains in NEEDS_REVIEW; independently verify the evidence "
                     "and use an authorized review workflow before taking action.\n\n"
                     + rationale
@@ -514,8 +514,8 @@ class IncidentOrchestrator:
                 """, (self._generate_id("STP"), plan_id, i, step.get("action", ""), step.get("tool", "manual"), risk, 1 if risk in ["MEDIUM", "HIGH"] else 0, "{}", "{}", "{}", "PENDING"))
                 
             # Update Incident
-            rca_statement = primary_hypothesis.get("statement", "") if primary_hypothesis else "AI Triage Completed"
-            rca_confidence = primary_hypothesis.get("confidence", 0.0) if primary_hypothesis else 0.0
+            rca_statement = None if reviewed_source else (primary_hypothesis.get("statement", "") if primary_hypothesis else None)
+            rca_confidence = None if reviewed_source else (primary_hypothesis.get("confidence", 0.0) if primary_hypothesis else None)
             conn.execute(
                 "UPDATE incident SET actual_root_cause = %s, rca_confidence = %s, status = %s WHERE incident_id = %s",
                 (rca_statement, rca_confidence, IncidentState.PLAN_READY.value, incident_id)
@@ -542,7 +542,8 @@ class IncidentOrchestrator:
         return {"status": "success", "plan_id": plan_id, "critic_status": critic_status}
 
     def triage_fallback(self, incident_id: str) -> Dict[str, Any]:
-        """Generates high-quality triage data by invoking the native Python Tool-Calling Agents. Used when TS-nemoclaw agent is unavailable."""
+        """Fail closed: the legacy fallback contains ungrounded demo actions."""
+        return {"error": "Investigation incomplete; no verified fallback plan is available."}
         now = datetime.now(timezone.utc).isoformat()
         
         import asyncio
@@ -725,7 +726,7 @@ class IncidentOrchestrator:
             ).fetchone()
             if reviewed_source:
                 raise ValueError(
-                    "execute_plan: reviewed email evidence requires independent review; "
+                    "execute_plan: email evidence requires independent review; "
                     "no approval workflow is available yet"
                 )
             if current_plan_status != "APPROVED":
@@ -998,6 +999,20 @@ class IncidentOrchestrator:
                     "source_system": row[3], "message": row[4],
                 })
 
+        # Include prior operator context as well as the latest request. A
+        # message such as "start re investigation" is not itself the
+        # evidence supplied in an earlier guidance revision.
+        with self.db.get_connection() as conn:
+            guidance_rows = conn.execute(
+                "SELECT guidance_revision, authority, text FROM commander_guidance "
+                "WHERE incident_id = %s ORDER BY guidance_revision DESC LIMIT 20",
+                (incident_id,),
+            ).fetchall()
+        guidance_history = [
+            {"revision": row[0], "authority": row[1], "text": row[2]}
+            for row in reversed(guidance_rows)
+        ]
+
         authority_label = "a CONFIRMED FACT (authoritative)" if is_fact else "operator guidance"
         self._log_audit(
             incident_id, "Commander", "REINVESTIGATION_TRIGGERED",
@@ -1021,11 +1036,12 @@ class IncidentOrchestrator:
         from app.domain.agents.langgraph_investigator import LangGraphInvestigator
         investigator = LangGraphInvestigator()
         feedback_context = (
-            f"OPERATOR-PROVIDED {'CONFIRMED FACT' if is_fact else 'GUIDANCE'} (via Commander Live chat): "
-            f"\"{guidance_text}\"\n\n"
-            f"{'This is an authoritative, confirmed fact from the operator -- treat it as ground truth.' if is_fact else 'This is an operator observation -- weigh it as strong but not necessarily authoritative evidence.'} "
-            "Re-evaluate whether the current root cause and recovery plan still apply given this input, "
-            "or whether it points to a different/additional root cause the plan must address."
+            "RECENT OPERATOR GUIDANCE (JSON; observations are not independently verified):\n"
+            f"{json.dumps(guidance_history, ensure_ascii=False)}\n\n"
+            f"LATEST REQUEST: {guidance_text}\n"
+            "Distinguish human-confirmed facts from observations, and explicitly "
+            "identify claims requiring independent verification. Re-evaluate the "
+            "current hypotheses and plan against all relevant guidance."
         )
         try:
             final_state = await investigator.investigate(
@@ -1053,7 +1069,7 @@ class IncidentOrchestrator:
         rca_hypotheses = rca_res.get("hypotheses") or [{
             "statement": rca_res.get("finding", "Unknown root cause"),
             "cause_type": rca_res.get("cause_type", "OTHER"),
-            "confidence": rca_res.get("confidence", 0.9),
+            "confidence": rca_res.get("confidence", 0.0),
         }]
         llm_response = {
             "evidence": rca_res.get("evidence", []),
@@ -1210,6 +1226,7 @@ class IncidentOrchestrator:
             def link_reviewed_evidence(incident_id):
                 if not reviewed_documents:
                     return
+                automatic = submitted_by == "automatic-outlook-bridge"
                 cursor = conn.execute(
                     "SELECT document_id, document_kind, title, content FROM reviewed_alert_document WHERE alert_id = %s",
                     (alert_id,),
@@ -1219,9 +1236,11 @@ class IncidentOrchestrator:
                         INSERT INTO evidence (evidence_id, incident_id, evidence_type, source_system, source_record_id, title, excerpt, collected_at, reliability, metadata_json, authority)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """, (
-                        f"EVD-{uuid.uuid4().hex}", incident_id, kind, "Reviewed email export",
+                        f"EVD-{uuid.uuid4().hex}", incident_id, kind,
+                        "Automatic Outlook email (unreviewed)" if automatic else "Reviewed email export",
                         document_id, title, content, now, 0.2,
-                        json.dumps({"submitted_by": submitted_by, "verification": "unverified_external"}),
+                        json.dumps({"submitted_by": submitted_by, "verification": "unverified_external",
+                                    "operator_reviewed": not automatic}),
                         "LOW",
                     ))
 
@@ -1230,8 +1249,8 @@ class IncidentOrchestrator:
                 VALUES (%s, %s, %s, %s, %s, %s, %s, 'open')
             """, (alert_id, run_id, now, severity, alert_type, source_system, message))
 
-            # These are operator-reviewed but remain untrusted external claims.
-            # Store against the alert even when no incident is created yet.
+            # Email documents may be automatically captured or operator-reviewed.
+            # Both remain untrusted external claims.
             for document in reviewed_documents or []:
                 conn.execute("""
                     INSERT INTO reviewed_alert_document
@@ -1273,7 +1292,8 @@ class IncidentOrchestrator:
                 # incident, with an explicit audit trail noting it was resolved
                 # externally (not via an executed NemoGuard plan) so operators
                 # can tell the two cases apart.
-                if analysis.get("is_recovery_signal") and os.getenv("NEMOGUARD_WEBHOOK_AUTO_RESOLVE", "").lower() in ("1", "true", "yes", "on"):
+                if (not reviewed_documents and analysis.get("is_recovery_signal")
+                        and os.getenv("NEMOGUARD_WEBHOOK_AUTO_RESOLVE", "").lower() in ("1", "true", "yes", "on")):
                     conn.execute(
                         "UPDATE incident SET status = %s, resolved_at = %s, updated_at = %s WHERE incident_id = %s",
                         (IncidentState.RESOLVED.value, now, now, correlated_incident_id)
@@ -1294,7 +1314,7 @@ class IncidentOrchestrator:
 
                 audit(correlated_incident_id, "ALERT_CORRELATED", f"Alert {alert_id} dynamically correlated to this incident by AI. Reasoning: {analysis.get('reasoning')}")
                 if reviewed_documents:
-                    audit(correlated_incident_id, "REVIEWED_EMAIL_EVIDENCE_ADDED", "Reviewed email evidence was linked to the alert. Existing plans were not automatically revised; operator review is required.")
+                    audit(correlated_incident_id, "EMAIL_EVIDENCE_ADDED", "Unverified email evidence was linked to the alert. Existing plans were not automatically revised; operator review is required.")
 
                 return finish(conn, {
                     "status": "ingested_and_correlated",

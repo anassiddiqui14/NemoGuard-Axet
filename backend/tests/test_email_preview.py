@@ -1,6 +1,8 @@
 """Email preview authorization and input tests; no real messages or network."""
 import os
 import sys
+import tempfile
+from pathlib import Path
 import types
 import unittest
 from unittest.mock import patch, AsyncMock
@@ -81,6 +83,69 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "ingested")
         ingest.assert_awaited_once()
+
+    def test_outlook_bridge_auth_validation_and_provenance(self):
+        import app.api.main as api
+        url = "/api/v2/ingest/outlook-bridge"
+        payload = {"source": "Outlook email", "monitor_name": "Test", "message": "Synthetic failure"}
+        headers = {"X-NemoGuard-Webhook-Secret": "test-webhook-secret", "Idempotency-Key": "outlook:test"}
+        self.assertEqual(self.client.post(url, json=payload).status_code, 401)
+        self.assertEqual(self.client.post(url, json={**payload, "message": ""}, headers=headers).status_code, 400)
+        self.assertEqual(self.client.post(url, json={**payload, "source": "other"}, headers=headers).status_code, 400)
+
+        async def fake_ingest(payload, request):
+            self.assertEqual(request.state.reviewed_by, "automatic-outlook-bridge")
+            self.assertEqual(request.state.reviewed_documents[0]["content"], "Synthetic failure")
+            return {"status": "ingested"}
+
+        with patch.object(api, "ingest_webhook", side_effect=fake_ingest) as ingest:
+            response = self.client.post(url, json=payload, headers=headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "ingested")
+        ingest.assert_awaited_once()
+
+    def test_outlook_bridge_persists_evidence_and_deduplicates(self):
+        from app.domain import orchestrator as domain
+        from app.domain import triage_scheduler
+        from app.store.sqlite_database import SqliteDatabase
+
+        class Watcher:
+            async def analyze(self, payload, active_incidents):
+                return {
+                    "is_valid": True,
+                    "normalized_alert": {
+                        "severity": "high", "alert_type": "TEST",
+                        "source_system": "Outlook", "message": "Reported failure",
+                    },
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            db = SqliteDatabase(str(Path(directory) / "test.db"))
+            db.init_schema()
+            with db.get_connection() as conn:
+                conn.execute("CREATE TABLE webhook_delivery (delivery_key TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, result_json TEXT NOT NULL)")
+                conn.execute("CREATE TABLE reviewed_alert_document (document_id TEXT PRIMARY KEY, alert_id TEXT NOT NULL REFERENCES alert(alert_id), document_kind TEXT NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL, submitted_by TEXT NOT NULL, created_at TEXT NOT NULL)")
+            payload = {"source": "Outlook email", "monitor_name": "Synthetic job", "message": "Synthetic failure"}
+            headers = {"X-NemoGuard-Webhook-Secret": "test-webhook-secret", "Idempotency-Key": "outlook:integration"}
+            with patch.object(domain, "get_database", return_value=db), \
+                 patch.object(domain, "WatcherAgent", Watcher), \
+                 patch.object(triage_scheduler, "schedule_triage_for_new_incident", new_callable=AsyncMock, return_value={"status": "QUEUED_DIRECT"}) as schedule:
+                first = self.client.post("/api/v2/ingest/outlook-bridge", json=payload, headers=headers)
+                second = self.client.post("/api/v2/ingest/outlook-bridge", json=payload, headers=headers)
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(first.json()["status"], "ingested_and_incident_created")
+            self.assertTrue(second.json()["duplicate"])
+            self.assertEqual(second.json()["incident_id"], first.json()["incident_id"])
+            schedule.assert_awaited_once()
+            with db.get_connection() as conn:
+                row = conn.execute(
+                    "SELECT source_system, authority, metadata_json FROM evidence WHERE incident_id=%s",
+                    (first.json()["incident_id"],),
+                ).fetchone()
+                self.assertEqual(row[0], "Automatic Outlook email (unreviewed)")
+                self.assertEqual(row[1], "LOW")
+                self.assertIn('"operator_reviewed": false', row[2])
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM reviewed_alert_document").fetchone()[0], 1)
 
     def test_replay_rejects_unsupported_and_oversized_attachments(self):
         url = "/api/v2/ingest/email-replay"

@@ -28,7 +28,7 @@ is the single authoritative model for every call this agent makes.
 from typing import Any, Dict, List, Optional
 
 from app.domain.agents.base_agent import BaseAgent
-from app.domain.agents.agent_tools import _get_read_only_tools_schema, execute_tool_call
+from app.domain.agents.agent_tools import _get_read_only_tools_schema, execute_read_only_tool_call
 
 
 ASK_SYSTEM_PROMPT = """You are Commander, the AI incident collaborator inside NemoGuard.
@@ -191,7 +191,7 @@ class CommanderLiveAgent(BaseAgent):
                     ]
                     messages.append({"role": "assistant", "content": message.content, "tool_calls": tool_calls_dict})
                     for tool_call in message.tool_calls:
-                        result = await execute_tool_call(tool_call.function.name, tool_call.function.arguments)
+                        result = await execute_read_only_tool_call(tool_call.function.name, tool_call.function.arguments)
                         messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": str(result)})
                     continue
                 return (message.content or "").strip()

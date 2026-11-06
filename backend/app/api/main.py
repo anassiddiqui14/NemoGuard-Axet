@@ -302,6 +302,7 @@ def get_status():
         "policy_engine": "active",
         "temporal": temporal_status,
         "inference_provider": "axet",
+        "outlook_bridge_contract": 1,
         "last_checked_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -625,6 +626,25 @@ async def ingest_webhook(payload: dict, request: Request):
             result = {**result, "triage_scheduling_status": schedule_result.get("status")}
 
     return result
+
+@app.post("/api/v2/ingest/outlook-bridge")
+async def ingest_outlook_bridge(payload: dict, request: Request):
+    """Ingest automatically captured Outlook text as unreviewed external evidence."""
+    secret = os.environ.get("NEMOGUARD_WEBHOOK_SECRET", "")
+    supplied = request.headers.get("X-NemoGuard-Webhook-Secret", "")
+    if not secret:
+        raise HTTPException(status_code=503, detail="Webhook ingestion is not configured")
+    if not hmac.compare_digest(supplied.encode("utf-8"), secret.encode("utf-8")):
+        raise HTTPException(status_code=401, detail="Invalid webhook credentials")
+    subject, body = payload.get("monitor_name"), payload.get("message")
+    if (payload.get("source") != "Outlook email" or not isinstance(subject, str)
+            or len(subject) > 2000 or not isinstance(body, str) or not body.strip()
+            or "\x00" in subject or "\x00" in body or len(body.encode("utf-8")) > 400000):
+        raise HTTPException(status_code=400, detail="Invalid Outlook email subject or body")
+    request.state.reviewed_documents = [{"kind": "EMAIL_BODY", "title": subject[:200] or "Outlook email", "content": body}]
+    request.state.reviewed_by = "automatic-outlook-bridge"
+    return await ingest_webhook(payload, request)
+
 
 @app.post("/api/v2/ingest/email-replay")
 async def replay_reviewed_email(

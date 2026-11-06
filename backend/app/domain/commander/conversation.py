@@ -44,7 +44,7 @@ _MATERIAL_KEYWORDS = (
     "not correct", "incorrect", "wrong", "actually", "instead",
     "already", "partial", "stale", "duplicate", "do not", "don't",
     "confirmed", "rule out", "ruled out", "contradicts", "unsafe",
-    "reinvestigate", "re-investigate", "investigate again", "look again",
+    "reinvestigate", "re-investigate", "re investigation", "re-investigation", "investigate again", "look again",
     "check again", "re-run", "rerun the investigation",
 )
 

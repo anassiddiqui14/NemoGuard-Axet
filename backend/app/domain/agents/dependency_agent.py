@@ -1,6 +1,6 @@
 from typing import Dict, Any, List
 from .base_agent import BaseAgent
-from .agent_tools import AGENT_TOOLS_SCHEMA, execute_tool_call
+from .agent_tools import AGENT_TOOLS_SCHEMA, execute_read_only_tool_call
 import json
 
 class DependencyAgent(BaseAgent):
@@ -33,5 +33,5 @@ If no downstream dependencies can be confidently identified, return "impacts": [
         Then, return the JSON containing the impacts.
         """
         
-        response = await self.call_llm_with_tools(prompt, AGENT_TOOLS_SCHEMA, execute_tool_call)
+        response = await self.call_llm_with_tools(prompt, AGENT_TOOLS_SCHEMA, execute_read_only_tool_call)
         return response

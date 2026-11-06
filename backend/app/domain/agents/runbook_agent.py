@@ -1,6 +1,6 @@
 from typing import Dict, Any, List
 from .base_agent import BaseAgent
-from .agent_tools import _get_full_tools_schema, execute_tool_call, LOCALSTACK_LAB_ENABLED
+from .agent_tools import _get_read_only_tools_schema, execute_read_only_tool_call, LOCALSTACK_LAB_ENABLED
 import json
 
 class RunbookAgent(BaseAgent):
@@ -71,5 +71,5 @@ If no specific runbook is found, still return at least one generic step (e.g. "E
         {rca_finding}
         """
         
-        response = await self.call_llm_with_tools(prompt, _get_full_tools_schema(), execute_tool_call)
+        response = await self.call_llm_with_tools(prompt, _get_read_only_tools_schema(), execute_read_only_tool_call)
         return response
