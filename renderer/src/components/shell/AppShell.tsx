@@ -114,7 +114,7 @@ function NotificationBell({ onSelectIncident }: { onSelectIncident: (id: string)
 
 function TopBar({ onSelectIncident, onToggleNav, navCollapsed, onOpenMobileNav, onOpenCommandPalette }: { onSelectIncident: (id: string) => void; onToggleNav: () => void; navCollapsed: boolean; onOpenMobileNav: () => void; onOpenCommandPalette: () => void }) {
     return (
-        <div className="h-16 border-b border-white/[0.06] flex items-center justify-between px-6 flex-shrink-0 glass-panel z-20 relative">
+        <div className="h-[68px] flex items-center justify-between px-4 sm:px-6 flex-shrink-0 border-b border-[#0F3F32]/10 bg-[#FCFDFB] z-20 relative">
             <div className="flex items-center gap-2.5 min-w-0">
                 {/*
                  * UI MODERNIZATION (Phase 4): mobile/tablet hamburger --
@@ -144,10 +144,10 @@ function TopBar({ onSelectIncident, onToggleNav, navCollapsed, onOpenMobileNav, 
                     <Logomark className="w-5 h-5" />
                 </motion.div>
                 <div className="min-w-0 flex flex-col justify-center">
-                    <h1 className="font-semibold text-text-primary text-[15px] leading-tight tracking-tight">
-                        Nemo<span className="text-primary">Guard</span> <span className="text-text-secondary font-medium">Production Operations</span>
+                    <h1 className="font-semibold text-[#13231E] text-[15px] leading-tight tracking-tight">
+                        Nemo<span className="text-[#0C6F58]">Guard</span>
                     </h1>
-                    <p className="text-[11px] text-text-muted leading-tight">Agentic incident response</p>
+                    <p className="text-[11px] text-[#62716B] leading-tight">Production operations</p>
                 </div>
             </div>
 
@@ -162,12 +162,14 @@ function TopBar({ onSelectIncident, onToggleNav, navCollapsed, onOpenMobileNav, 
                  */}
                 <button
                     onClick={onOpenCommandPalette}
-                    className="relative hidden sm:flex items-center gap-2 pl-8 pr-3 py-1.5 bg-white/[0.03] border border-white/[0.06] rounded-lg text-[13px] text-text-muted hover:text-text-secondary hover:bg-white/[0.05] w-56 transition-all text-left"
+                    className="relative hidden lg:flex items-center gap-2 pl-8 pr-3 py-2 bg-[#EDF3EE] border border-[#0F3F32]/10 rounded-xl text-[13px] text-[#62716B] hover:text-[#13231E] hover:bg-[#E1F3EC] w-56 transition-all text-left"
                 >
-                    <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-text-muted" />
-                    <span className="flex-1">Search incidents…</span>
-                    <kbd className="text-[9.5px] font-mono px-1 py-0.5 rounded ring-1 ring-white/[0.08] flex-shrink-0">⌘K</kbd>
+                    <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-[#62716B]" />
+                    <span className="flex-1">Search operations…</span>
+                    <kbd className="text-[9.5px] font-mono px-1 py-0.5 rounded ring-1 ring-[#0F3F32]/10 flex-shrink-0">⌘K</kbd>
                 </button>
+                <span className="hidden md:inline-flex items-center rounded-xl bg-[#E1F3EC] px-3 py-2 text-[12px] font-semibold text-[#0C6F58]">Production</span>
+                <span className="hidden xl:inline-flex items-center rounded-xl border border-[#0F3F32]/10 bg-[#FCFDFB] px-3 py-2 text-[12px] font-medium text-[#62716B]">Last 30 days</span>
 
                 <ThemeToggle />
                 <NotificationBell onSelectIncident={onSelectIncident} />
@@ -200,7 +202,7 @@ export function AppShell() {
     };
 
     return (
-        <div className="flex flex-col h-screen w-full bg-app-bg overflow-hidden font-sans">
+        <div className="flex flex-col h-screen w-full bg-[#F3F6F2] overflow-hidden font-sans">
             <MobileNavDrawer open={mobileNavOpen} onClose={() => setMobileNavOpen(false)} />
             {/*
              * PHASE 1 FIX (NemoGuard UI Modernization Spec, Section 46/13):

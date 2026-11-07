@@ -434,6 +434,89 @@
   }
 }
 
+/* NemoGuard V22: calm, operational light-surface primitives. These are
+   deliberately scoped utilities so the V22 rollout can proceed screen by
+   screen without destabilizing existing dark-first product surfaces. */
+:root {
+  --v22-canvas: #F3F6F2;
+  --v22-surface: #FCFDFB;
+  --v22-surface-muted: #EDF3EE;
+  --v22-surface-mint: #E1F3EC;
+  --v22-brand-deep: #073F32;
+  --v22-brand: #0C6F58;
+  --v22-brand-medium: #15876D;
+  --v22-brand-mint: #8FE4C9;
+  --v22-text-primary: #13231E;
+  --v22-text-secondary: #62716B;
+  --v22-text-muted: #8C9994;
+  --v22-border: rgba(15, 63, 50, 0.10);
+  --v22-success: #18A566;
+  --v22-warning: #E5A52B;
+  --v22-critical: #DE565E;
+  --v22-info: #3777D6;
+  --v22-warm-accent: #FF9C55;
+  --v22-radius: 24px;
+  --v22-shadow: 0 18px 45px -34px rgba(7, 63, 50, 0.26);
+  --v22-shadow-raised: 0 24px 48px -30px rgba(7, 63, 50, 0.32);
+}
+
+@layer utilities {
+  .v22-canvas {
+    background: var(--v22-canvas);
+    color: var(--v22-text-primary);
+  }
+
+  .v22-card {
+    background: var(--v22-surface);
+    border: 1px solid var(--v22-border);
+    border-radius: var(--v22-radius);
+    box-shadow: var(--v22-shadow);
+  }
+
+  .v22-card-muted {
+    background: var(--v22-surface-muted);
+    border: 1px solid var(--v22-border);
+    border-radius: var(--v22-radius);
+  }
+
+  .v22-interactive {
+    transition: transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease;
+  }
+
+  .v22-interactive:hover {
+    transform: translateY(-2px);
+    border-color: rgba(12, 111, 88, 0.24);
+    box-shadow: var(--v22-shadow-raised);
+  }
+
+  .v22-interactive:active {
+    transform: scale(0.985);
+  }
+
+  .v22-status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 9999px;
+    flex: none;
+  }
+
+  .v22-content-enter {
+    animation: v22ContentEnter 220ms ease-out both;
+  }
+
+  @keyframes v22ContentEnter {
+    from {
+      opacity: 0;
+      transform: translateY(6px) scale(0.992);
+    }
+
+    to {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
 
   *,

@@ -25,9 +25,9 @@ export function GlobalNavRail({ collapsed }: Props) {
     return (
         <motion.aside
             initial={false}
-            animate={{ width: collapsed ? 68 : 230 }}
+            animate={{ width: collapsed ? 74 : 236 }}
             transition={{ type: 'spring', stiffness: 300, damping: 32 }}
-            className="hidden md:flex flex-col flex-shrink-0 h-full border-r border-white/[0.06] bg-black/20 overflow-hidden"
+            className="hidden md:flex flex-col flex-shrink-0 h-full overflow-hidden border-r border-white/10 bg-[#073F32]"
         >
             <nav className={`flex-1 py-3 space-y-1 overflow-y-auto ${collapsed ? 'px-2' : 'px-2.5'}`}>
                 {items.map((item) => {
@@ -37,9 +37,9 @@ export function GlobalNavRail({ collapsed }: Props) {
                             to={item.to}
                             end={item.end}
                             className={({ isActive }) =>
-                                `relative flex items-center gap-3 px-3 py-2.5 rounded-xl transition-colors w-full ${collapsed ? 'justify-center' : ''} ${isActive
-                                    ? 'bg-primary/[0.12] text-primary ring-1 ring-primary/25'
-                                    : 'text-text-secondary hover:bg-white/[0.04] hover:text-text-primary'
+                                `relative isolate flex items-center gap-3 px-3 py-2.5 rounded-2xl transition-colors w-full ${collapsed ? 'justify-center' : ''} ${isActive
+                                    ? 'text-[#073F32]'
+                                    : 'text-white/65 hover:bg-white/10 hover:text-white'
                                 }`
                             }
                         >
@@ -48,7 +48,8 @@ export function GlobalNavRail({ collapsed }: Props) {
                                     {isActive && (
                                         <motion.div
                                             layoutId="nav-active-rail"
-                                            className="absolute left-0 top-1.5 bottom-1.5 w-[3px] rounded-full bg-gradient-to-b from-primary to-agent-active"
+                                            transition={{ type: 'spring', stiffness: 430, damping: 34 }}
+                                            className="absolute inset-0 -z-10 rounded-2xl bg-[#E1F3EC] shadow-[0_10px_22px_-16px_rgba(0,0,0,0.65)]"
                                         />
                                     )}
                                     <span className="flex-shrink-0">{item.icon}</span>
