@@ -6,7 +6,6 @@ class CommanderAgent(BaseAgent):
     def __init__(self):
         super().__init__(
             agent_name="Commander_Agent",
-            model="nvidia/nemotron-3-ultra-550b-a55b",
             system_prompt="""You are the Incident Commander.
 Your job is to synthesize findings from specialized sub-agents (RCA, Dependency, Runbook) into a final unified recovery plan.
 You MUST return ONLY valid JSON in this exact format expected by the downstream API:

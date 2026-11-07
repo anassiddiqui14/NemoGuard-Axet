@@ -2,6 +2,6 @@
   "baseUrl": "http://localhost:43076",
   "backendBaseUrl": "http://localhost:8000",
   "notes": {
-    "deviation_from_default_template": "NemoGuard's React frontend calls '/api/v2/...' endpoints directly (not the Axet template's generic '/backend/api/' method+action endpoint). The .flows middleware/nginx layer in front of this app must proxy '/api/*' requests through to backendBaseUrl (FastAPI on port 8000) for the frontend to work unmodified. See HOW-TO-START.md and DEPLOY-TO-AXET.md."
+    "v22": "Legacy standalone/local template settings only. aXet Flows cloud routing is injected by axet-spa-app via AXET_CONFIG.flowsBaseUrl and uses python-gateway /backend/api -> FastAPI /api/v2. Do not hard-code the cloud deployment prefix here. See DEPLOY-TO-AXET.md."
   }
 }

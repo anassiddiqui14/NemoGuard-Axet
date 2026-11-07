@@ -1,199 +1,206 @@
-# Deploying NemoGuard to Axet `.flows`
+# Deploying NemoGuard V22 to aXet Flows
 
-This document gives the exact, NemoGuard-specific values and gotchas for
-importing this repository into an Axet `.flows` workspace, following the
-standard React + FastAPI `.flows` template pattern. Read `HOW-TO-START.md`
-first for local dev instructions; this file is deployment-only.
+This document reflects the current `axet-migration` architecture. Older guidance that used generic `settings.json` middleware or direct NVIDIA/Nemotron configuration is obsolete for this branch.
 
-## 0. Prerequisites checklist
+## Current Flows architecture
 
-- [ ] This repo pushed to a Git server reachable from the `.flows` environment
-      (branch: `axet-migration`, or whichever branch you push).
-- [ ] A Git access token with read access to that repo.
-- [ ] An Axet `.flows` workspace where you can import the template `.deptapp`.
-- [ ] `NVIDIA_API_KEY` and `JWT_SECRET` values ready (never commit these).
-- [ ] A reachable PostgreSQL instance and Temporal server for this deployment
-      (NemoGuard does **not** use the template's default SQLAlchemy/DuckDB
-      storage — see "Important divergence" below).
+```text
+Browser
+  |
+  v
+axet-spa-app  (App ID: seed-app)
+  |
+  |  public UI: /flows/cloud/<FLOW_ID>/ui/seed-app/
+  |
+  v
+python-gateway
+  public prefix:  /backend/api
+  backend prefix: /api/v2
+  ASGI app:       backend.app.main:app
+  |
+  v
+python-agent / Uvicorn
+  internal port: 8200
+  |
+  v
+FastAPI
+```
 
-## 1. Push this repo
+The renderer's aXet runtime resolver uses `AXET_CONFIG.flowsBaseUrl` to construct cloud-safe API URLs. Do not hard-code the cloud deployment prefix in React code.
+
+## 1. Repository/branch
+
+Use the repository branch containing this V22 code (`axet-migration` unless you intentionally rename it).
+
+The Python Agent source root must contain:
+
+```text
+backend/
+renderer/
+config/
+...
+```
+
+## 2. SPA node
+
+Configure the aXet SPA node for the Vite renderer:
+
+```text
+App ID:     seed-app
+Entry file: index.html
+Repository: this repository / axet-migration
+```
+
+The public cloud URL is expected to look like:
+
+```text
+https://axet.nttdata.com/flows/cloud/<FLOW_ID>/ui/seed-app/
+```
+
+The deployment root `/flows/cloud/<FLOW_ID>/` itself is not the SPA route and may legitimately return `Cannot GET /`.
+
+## 3. Python Agent
+
+Configure the Python Agent with HTTP API exposure enabled and attach it to the NemoGuard Python Gateway.
+
+Expected reverse-proxy behavior:
+
+```text
+Gateway mode: reverse-proxy
+Uvicorn port: 8200
+ASGI app: backend.app.main:app
+```
+
+The Python Agent's **Uvicorn Startup Timeout** can be set higher (for example 200 seconds) to tolerate slow FastAPI startup. This setting is separate from the Python Gateway's agent-discovery wait; see the known platform issue below.
+
+## 4. Python Gateway
+
+Use:
+
+```text
+Mode:           Reverse proxy (FastAPI)
+Public Prefix:  /backend/api
+Backend Prefix: /api/v2
+ASGI App:       backend.app.main:app
+```
+
+Healthy registration produces logs similar to:
+
+```text
+using agent ... uvicorn port=8200
+registerProxy called with: prefix=/backend/api, backendPrefix=/api/v2, target=http://127.0.0.1:8200
+reverse proxy active: /backend/api -> http://127.0.0.1:8200
+```
+
+Verification from the Designer/container:
 
 ```bash
-cd NemoGuard-Axet
-git add .
-git commit -m "Port NemoGuard to Axet flows structure"
-git remote add origin <your-repo-url>
-git push -u origin axet-migration
+curl -i http://127.0.0.1:8200/api/v2/status
 ```
 
-## 2. Import the base template `.deptapp` into `.flows`
+should return HTTP 200 once FastAPI is running.
 
-Do **not** try to convert this Git repo into a `.deptapp` yourself. Import the
-React + FastAPI `.flows` template's `.deptapp` export
-(`template-react-fastapi-flows_v1.3.1_export.deptapp`, from the Axet cookbook
-download) into your `.flows` workspace first — it already contains the
-generic repo-clone, frontend-build, and backend-start workflow nodes. You
-then point those nodes at this NemoGuard repo instead of the template repo.
-
-## 3. Configure the repository-clone node
-
-Set it to run (values come from step 0/1):
+The Node-RED/Designer-facing route:
 
 ```bash
-./setup_app.sh <repo-url> app <git-token> axet-migration
+curl -i http://localhost:<designer-port>/backend/api/status
 ```
 
-This clones the repo so the `.flows` runtime sees:
+should also return 200 once the Gateway has registered.
 
-```
-app/
-├── renderer/
-├── backend/
-│   ├── requirements.txt   <- Python node needs this
-│   └── app/
-│       ├── main.py        <- re-exports the real FastAPI `app` object
-│       └── api/main.py    <- NemoGuard's actual FastAPI app + all routes
-├── settings.json
-└── ...
-```
+## 5. aXet LLM configuration
 
-## 4. Configure the frontend-build node
+Active NemoGuard agents use the shared `BaseAgent` OpenAI-compatible aXet integration.
 
-Run:
+The aXet Python Agent runtime is expected to inject:
 
-```bash
-./setup_frontend_app.sh
+```text
+AXET_LLM_BASE_URL
+OPENAI_API_KEY
+AXET_MODEL
+AXET_PROJECT_ID
+AXET_USER_ID
+DEPTAPPS_WEB_BACKEND_JWT_TOKEN
 ```
 
-This builds `renderer/` (Vite + React) using the `FRONTEND_DIR=renderer`
-convention already matched by this repo's folder name, and copies the
-production build to `renderer/dist`.
+No NVIDIA API key is required by the active V22 agent path.
 
-## 5. Configure the Python backend node
+`GET /api/v2/status` reports whether the required inference configuration is present. It deliberately does not call that state "healthy" without a live probe.
 
-Point the backend application folder at:
+## 6. Authentication
 
-```
-app/backend
-```
+Use the aXet/Okta-provided application session in cloud deployment. NemoGuard's backend APIs still enforce role and tenant/workspace boundaries.
 
-Install step uses `backend/requirements.txt` (already added at the repo
-root of `backend/`). Start command should resolve to:
+The application can bootstrap a first SQLite-cloud admin only when the explicit bootstrap configuration is used; do not rely on arbitrary first-user auto-admin behavior.
 
-```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
+## 7. Database
 
-This works because `backend/app/main.py` is a thin shim that imports and
-re-exports NemoGuard's real FastAPI `app` object from `backend/app/api/main.py`,
-so Axet's generic `app.main:app` convention keeps working without having to
-rewrite NemoGuard's internal module layout further.
+### Current repository support
 
-## 6. Configure `settings.json`
+The repository currently implements:
 
-For the deployed environment:
-
-```json
-{
-  "baseUrl": "https://<flows-host>/<workspace-or-cloud-path>",
-  "backendBaseUrl": "http://localhost:8000"
-}
+```text
+NEMOGUARD_DB_BACKEND=postgres
+NEMOGUARD_DB_BACKEND=sqlite
 ```
 
-`baseUrl` is what the browser talks to (through `.flows`). `backendBaseUrl`
-stays `http://localhost:8000` because FastAPI runs as an internal sidecar
-process inside the same `.flows` runtime, not directly exposed to the
-internet.
+### Important cloud storage guidance
 
-## 7. ⚠️ Important divergence: NemoGuard's API routes are NOT `/backend/api/`
+The aXet team has advised that SQLite on `/internal-storage-files/files` is not recommended for application persistence because SQLite locking/journaling semantics are not reliable on that mounted storage.
 
-The base Axet template's `flows_middleware.json` proxies a single generic
-endpoint, `POST /backend/api/` (method+action JSON body), to the FastAPI
-backend. **NemoGuard does not use that contract.** Its React frontend calls
-many separate REST/SSE routes directly under `/api/v2/...`
-(e.g. `/api/v2/incidents`, `/api/v2/incidents/{id}/events/stream`,
-`/api/v2/auth/login`), as defined in `backend/app/api/main.py`.
+SQLite at `/tmp/...` is suitable only for diagnostics/demos and is **not durable**.
 
-You must therefore either:
+The aXet team recommends the Flow MySQL-compatible service for durable cloud application data:
 
-- **Option A (recommended, matches existing nginx setup):** configure the
-  `.flows` middleware/reverse-proxy layer to forward `/api/*` requests
-  (not just `/backend/api/`) straight through to `backendBaseUrl`, mirroring
-  `renderer/nginx.conf`'s existing rule:
+- external tools (for example DBeaver): port `3307`
+- application inside Flow: port `3306`
 
-  ```
-  location /api/ {
-      proxy_pass http://<backendBaseUrl>/api/;
-      proxy_buffering off;         # required for the SSE events/stream route
-      proxy_set_header Connection '';
-      proxy_http_version 1.1;
-      chunked_transfer_encoding off;
-  }
-  ```
+A MySQL database backend is intentionally **not** implemented in this V22 package yet because the final internal hostname/credential/database contract should be confirmed before credentials or assumptions are added to code. Track this as the next persistence hardening item.
 
-  A minimal Node-RED `flows_middleware.json` function node doing a transparent
-  passthrough proxy (instead of the template's method/action JSON wrapper) is
-  the Node-RED-native way to express this; see the template's existing SSE
-  proxy function node for a working reference you can adapt (it already
-  streams `text/event-stream` correctly for `/backend/api/stream/` — change
-  the upstream path construction to pass through `msg.req.url` verbatim
-  instead of hardcoding `/backend/api/stream/`).
+## 8. Temporal
 
-- **Option B (more invasive, not done in this port):** rewrite NemoGuard's
-  frontend `fetch()` calls and backend route prefixes to adopt the generic
-  `method`/`action` JSON contract and register each capability as a
-  `BaseHandler` in a `registry.py`, matching the base template exactly. This
-  was explicitly out of scope for this port (see `HOW-TO-START.md`'s
-  "Notes On Divergence" section) — it would mean re-implementing ~30 REST
-  endpoints and the SSE stream as handler classes.
+For the current aXet leadership/demo deployment, Temporal can be disabled:
 
-The `/backend/api/health` alias added in `backend/app/main.py` already works
-out of the box with the template's default health-check convention; it is
-the one route that matches Axet's generic expectation without extra proxy
-configuration.
+```text
+NEMOGUARD_TEMPORAL_ENABLED=false
+```
 
-## 8. Environment variables / secrets
+The application uses its implemented direct fallback path and V22 surfaces the workflow mode to the operator.
 
-Set these in `.flows`'s environment configuration or `ENV_JSON` — never in
-`settings.json` or committed files:
+For future durable production orchestration, provide a supported Temporal service and worker and set the corresponding environment variables.
 
-| Variable | Required | Notes |
-|---|---|---|
-| `NVIDIA_API_KEY` | Yes | Agent LLM calls will fail without it. |
-| `JWT_SECRET` | Yes | App raises `RuntimeError` on startup if unset. |
-| `POSTGRES_URL` | Yes | Must point at a real Postgres instance reachable from the `.flows` runtime. |
-| `TEMPORAL_URL` | Yes | Must point at a real Temporal server (`host:port`). Without one, `/triage` and `/approve` fall back to direct synchronous execution (see `backend/app/api/main.py`), which works but loses durability. |
-| `ENV` | No | Set to `development`/`dev`/`local` only in non-production deployments to enable the mock-login endpoint. |
-| `NEMOGUARD_LOCALSTACK_LAB` | No | Leave `0`/unset in a real Axet deployment. |
+## 9. Outlook/forwarded-alert bridge
 
-## 9. Deploy and verify
+The approved real-world ingestion path for the current prototype is forwarded alert email through the dedicated Outlook bridge. Keep that distinction explicit:
 
-Run the `.flows` deployment, then verify in order:
+- Production Overview = persisted production-side observations only
+- Outlook forward = untrusted/source-reported evidence
+- Scenario Lab = synthetic/lab data
 
-1. `GET https://<flows-url>/backend/api/health` → `{"statusCode": 200, "status": "ok"}`
-2. `GET https://<flows-url>/api/v2/status` → NemoGuard's own status payload
-   (confirms the `/api/*` proxy rule from step 7 is working).
-3. Open the main app URL → Landing page → Login → Dashboard → Incidents.
+Do not represent Scenario Lab data as production telemetry.
 
-If step 2 fails with a 404, the `.flows` middleware is only proxying
-`/backend/api/` and not the broader `/api/*` prefix NemoGuard needs — revisit
-step 7.
+## 10. Known aXet Python Gateway cold-start issue
 
-## 10. Postgres schema + Temporal worker
+The installed aXet `python-gateway` implementation currently waits exactly 60 seconds for one connected Python Agent to expose `uvicornPort`.
 
-This repo's `docker-compose.yml` still shows the full intended topology
-(Postgres, Temporal, API, Temporal worker, frontend, simulator). If your
-`.flows` workspace does not run a Temporal worker process alongside the API
-node, you'll need either:
+If the Agent becomes ready after that window, the Gateway returns from startup and does not retry, so `/backend/api/*` remains 404 even though Uvicorn is healthy on port 8200.
 
-- A second `.flows` Python node running
-  `python -m backend.app.temporal_worker` against the same `TEMPORAL_URL`, or
-- Accept the degraded mode where `/triage` and `/approve` execute directly
-  without Temporal's durability guarantees (already implemented as a
-  fallback in `backend/app/api/main.py`).
+This has been reproduced and isolated from NemoGuard application routing. Restarting/redeploying the Gateway while the Agent is ready registers the proxy successfully.
 
-The Postgres schema bootstraps itself automatically on API startup
-(`backend/app/api/main.py::startup_event` calls `db.init_schema()` if the
-`incident` table doesn't exist yet), so no manual migration step is required
-on first deploy — just make sure `POSTGRES_URL` points at an empty, reachable
-database.
+The aXet team is investigating whether the discovery timeout is configurable or requires a platform fix. Increasing the Python Agent's **Uvicorn Startup Timeout** does not change this separate 60-second Gateway discovery window.
+
+## 11. Cloud verification order
+
+After deployment:
+
+1. confirm Python Agent/Uvicorn started on 8200;
+2. confirm direct `GET 127.0.0.1:8200/api/v2/status` returns 200;
+3. confirm Gateway logs `reverse proxy active`;
+4. confirm `/backend/api/status` through the Flows runtime returns 200;
+5. open `/flows/cloud/<FLOW_ID>/ui/seed-app/`;
+6. confirm Production Overview loads without a lost-connection banner;
+7. confirm Alert Inbox/Outlook heartbeat as appropriate.
+
+## 12. Production readiness
+
+This V22 package is optimized for a leadership prototype and read/understand/prioritize workflows. Before broader production adoption, close the items in `V22_KNOWN_LIMITATIONS.md`, especially durable MySQL persistence, Gateway cold-start behavior, and approved read-only integrations.

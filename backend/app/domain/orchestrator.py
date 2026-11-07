@@ -1,9 +1,5 @@
 import os
 import json
-import urllib.request
-import urllib.parse
-import urllib.error
-import ssl
 import asyncio
 import uuid
 import re
@@ -40,11 +36,6 @@ class IncidentOrchestrator:
         else:
             self.db = get_database()
             self.db_path = self.db.db_path
-        # NVIDIA_API_KEY MUST be provided via environment (.env / secrets manager).
-        # No hardcoded fallback key is used — see docs/IMPROVEMENT_PLAN.md (Security §1).
-        if not os.environ.get("NVIDIA_API_KEY"):
-            print("WARNING: NVIDIA_API_KEY is not set. LLM-backed agent calls will fail until it is configured.")
-
     def _generate_id(self, prefix: str) -> str:
         return f"{prefix}-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:4].upper()}"
 
@@ -54,73 +45,6 @@ class IncidentOrchestrator:
                 INSERT INTO audit_event (audit_event_id, incident_id, actor_type, actor_id, event_type, event_summary, created_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
             """, (self._generate_id("AUD"), incident_id, "SYSTEM", actor, event_type, summary, datetime.now(timezone.utc).isoformat()))
-
-    def call_llm_json(self, prompt: str) -> Dict[str, Any]:
-        """Calls NVIDIA Nemotron and strictly extracts JSON response."""
-        url = "https://integrate.api.nvidia.com/v1/chat/completions"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {os.environ['NVIDIA_API_KEY']}"
-        }
-        
-        system_prompt = "You are an expert Data Engineering Incident Commander. You MUST output ONLY valid JSON. Do not include any markdown formatting outside the JSON block."
-        
-        data = {
-            "model": "nvidia/nemotron-3-super-120b-a12b",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.1,
-            "max_tokens": 16384,
-            "chat_template_kwargs": {"enable_thinking": True},
-            "reasoning_budget": 8192
-        }
-        
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        
-        try:
-            req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers, method='POST')
-            with urllib.request.urlopen(req, context=ctx, timeout=300) as response:
-                result = json.loads(response.read().decode('utf-8'))
-                content = result['choices'][0]['message']['content'].strip()
-                
-                # Cleanup if the model still outputs markdown blocks
-                if content.startswith("```json"):
-                    content = content[7:]
-                if content.startswith("```"):
-                    content = content[3:]
-                if content.endswith("```"):
-                    content = content[:-3]
-                    
-                # Fix unescaped newlines in JSON strings (common LLM failure for bash scripts)
-                content = content.replace("\n", "\\n")
-                # But we actually want real newlines between keys to be valid JSON, 
-                # so fixing it perfectly with regex is complex. Let's rely on the LLM, 
-                # but handle trailing commas and basic fixes.
-                content = content.replace("\\n", "\n") # Revert, as python json handles newlines in some cases or LLM handles it.
-                
-                try:
-                    import re
-                    # very basic fix for common unescaped newlines inside string values:
-                    # we will just try json.loads directly first
-                    return json.loads(content)
-                except Exception as parse_e:
-                    # Attempt a naive fix for newlines inside strings
-                    try:
-                        # Sometimes LLMs don't escape newlines in string literals
-                        fixed_content = re.sub(r'(%s<!\\)\n', r'\\n', content)
-                        # The above breaks real JSON structure. So we don't do it.
-                        pass
-                    except:
-                        pass
-                    print("JSON PARSE ERROR. Raw Content:", content[-200:])
-                    return {"error": f"{str(parse_e)}. Content might be truncated or invalid."}
-        except Exception as e:
-            print(f"LLM Error: {e}")
-            return {"error": str(e)}
 
     def triage_incident(self, incident_id: str, has_runbook: bool = True):
         import asyncio
@@ -824,7 +748,7 @@ class IncidentOrchestrator:
             self._log_audit(incident_id, "Verifier", "VERIFICATION_FAILED", "One or more actions failed independent verification; incident NOT marked resolved.")
             self._log_audit(incident_id, "Commander", "INCIDENT_ESCALATED", "Plan execution did not verify successfully. Human intervention required.")
 
-    def triage_feedback(self, incident_id: str, feedback_text: str) -> Dict[str, Any]:
+    async def triage_feedback(self, incident_id: str, feedback_text: str) -> Dict[str, Any]:
         """Handles user feedback on an existing action plan and generates a revised plan."""
         with self.db.get_connection() as conn:
             # 1. Fetch existing plan
@@ -873,13 +797,26 @@ class IncidentOrchestrator:
         }}
         """
 
-        llm_response = self.call_llm_json(prompt)
-        
+        # The legacy implementation called NVIDIA directly from this
+        # otherwise aXet-managed application.  Keep feedback/re-planning on
+        # the same provider path as every other NemoGuard agent.
+        from app.domain.agents.base_agent import BaseAgent
+        feedback_agent = BaseAgent(
+            agent_name="Feedback Planner",
+            system_prompt=(
+                "You are NemoGuard's recovery-plan revision assistant. "
+                "Return only valid JSON matching the requested schema. "
+                "Treat operator feedback as guidance, never as permission to "
+                "bypass safety, approval, policy, precondition, or verification controls."
+            ),
+        )
+        llm_response = await feedback_agent.call_llm_json(prompt)
+
         if "error" in llm_response:
             return llm_response
 
-        # Update the database. This legacy path (NVIDIA Nemotron direct
-        # call via call_llm_json(), not the LangGraph/aXet investigation)
+        # Update the database. This remains a feedback-driven revision
+        # path rather than a full re-investigation, so it stays fail-closed
         # revises a rejected plan WITHOUT running the Grounding Critic.
         # It must therefore be fail-closed: NEEDS_REVIEW (never
         # PENDING_APPROVAL) until this flow is migrated to the full

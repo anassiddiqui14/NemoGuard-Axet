@@ -10,12 +10,9 @@ import { authFetch } from '../../contexts/AuthGateContext';
 import { SkeletonBlock } from '../../design-system/components/Skeleton';
 import { AlertTriangle } from 'lucide-react';
 
-// Operational readiness row — inspired by a UI exploration on the
-// `darshan-dev` branch (an "Operations" page summarizing service
-// readiness at a glance). Reimplemented here as a header strip on the
-// existing Agent Operations page rather than a separate page, since this
-// page is already the natural home for "is the agentic system itself
-// healthy" questions (as opposed to per-incident status).
+// V22: this strip is an observed-workload projection, not a health check.
+// Earlier wording claimed agents were "healthy/working" based only on open
+// incident counts. That was visually useful but operationally misleading.
 function ReadinessRow({ incidents }: { incidents: IncidentSummary[] }) {
     // Previously only excluded RESOLVED, so a queue containing nothing but
     // CANCELLED/FAILED incidents still showed "Monitoring"/"Working" here as
@@ -28,20 +25,20 @@ function ReadinessRow({ incidents }: { incidents: IncidentSummary[] }) {
     const items = [
         {
             icon: <Radio className="w-4 h-4" />,
-            label: 'Incident event stream',
-            status: activeCount > 0 ? 'Monitoring' : 'Idle',
-            tone: 'healthy' as const,
+            label: 'Active incident workload',
+            status: `${activeCount} active`,
+            tone: activeCount > 0 ? ('active' as const) : ('healthy' as const),
         },
         {
             icon: <Brain className="w-4 h-4" />,
-            label: 'NemoGuard investigation agents',
-            status: activeCount > 0 ? 'Working' : 'Standing by',
+            label: 'Investigation activity',
+            status: activeCount > 0 ? 'Inspect audit trail' : 'No active incidents',
             tone: activeCount > 0 ? ('active' as const) : ('healthy' as const),
         },
         {
             icon: <ShieldCheckIcon className="w-4 h-4" />,
-            label: 'Safety & approval controls',
-            status: reviewCount > 0 ? `${reviewCount} need review` : 'All clear',
+            label: 'Human review queue',
+            status: reviewCount > 0 ? `${reviewCount} need review` : 'No review items',
             tone: reviewCount > 0 ? ('warning' as const) : ('healthy' as const),
         },
     ];
@@ -54,7 +51,7 @@ function ReadinessRow({ incidents }: { incidents: IncidentSummary[] }) {
 
     return (
         <div className="glass-panel rounded-2xl ring-1 ring-white/[0.06] p-4 mb-4">
-            <div className="text-[12px] font-semibold text-text-secondary mb-3">Operational readiness</div>
+            <div className="text-[12px] font-semibold text-text-secondary mb-3">Observed operational state</div>
             <div className="space-y-2">
                 {items.map((item, idx) => (
                     <motion.div

@@ -118,7 +118,6 @@ class GroundingCritic(BaseAgent):
             # Final safety/grounding gate before a plan reaches a human approver — route to the
             # stronger model since this is the last automated check standing between the AI's
             # output and a real recovery action.
-            model="nvidia/nemotron-3-ultra-550b-a55b",
             system_prompt=f"""You are the Grounding Critic -- the final independent safety/verification
 gate before a recovery plan reaches a human approver (spec: "Grounding and Safety Critic").
 

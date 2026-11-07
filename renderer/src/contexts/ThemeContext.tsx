@@ -13,7 +13,9 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     const [theme, setTheme] = useState<Theme>(() => {
         const stored = localStorage.getItem('nemoguard_theme');
         if (stored === 'light' || stored === 'dark') return stored;
-        return window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+        // V22 is intentionally light-first for the calm operations cockpit.
+        // A stored preference still wins and operators can switch at any time.
+        return 'light';
     });
 
     useEffect(() => {

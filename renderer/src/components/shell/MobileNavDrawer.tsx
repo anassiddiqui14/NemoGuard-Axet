@@ -84,22 +84,22 @@ export function MobileNavDrawer({ open, onClose }: { open: boolean; onClose: () 
                         animate={{ x: 0 }}
                         exit={{ x: '-100%' }}
                         transition={{ type: 'spring', stiffness: 360, damping: 36 }}
-                        className="fixed inset-y-0 left-0 z-[61] w-[280px] max-w-[85vw] bg-surface border-r border-white/[0.08] flex flex-col md:hidden outline-none"
+                        className="fixed inset-y-0 left-0 z-[61] w-[280px] max-w-[85vw] bg-[#073F32] border-r border-white/10 text-white flex flex-col md:hidden outline-none"
                     >
-                        <div className="h-16 flex items-center justify-between px-4 border-b border-white/[0.06] flex-shrink-0">
+                        <div className="h-16 flex items-center justify-between px-4 border-b border-white/10 flex-shrink-0">
                             <div className="flex items-center gap-2">
-                                <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-primary/10 ring-1 ring-primary/25 text-primary">
+                                <div className="flex items-center justify-center w-8 h-8 rounded-xl bg-[#E1F3EC] text-[#073F32]">
                                     <Logomark className="w-4.5 h-4.5" />
                                 </div>
-                                <span className="font-semibold text-text-primary text-[14px]">
-                                    Nemo<span className="text-primary">Guard</span>
+                                <span className="font-semibold text-white text-[14px]">
+                                    Nemo<span className="text-[#8FE4C9]">Guard</span>
                                 </span>
                             </div>
                             <button
                                 onClick={onClose}
                                 aria-label="Close navigation"
                                 title="Close navigation"
-                                className="press-scale focus-ring p-2 rounded-lg text-text-muted hover:text-text-primary hover:bg-white/[0.05]"
+                                className="press-scale focus-ring p-2 rounded-lg text-white/60 hover:text-white hover:bg-white/10"
                             >
                                 <X className="w-4.5 h-4.5" />
                             </button>
@@ -113,9 +113,9 @@ export function MobileNavDrawer({ open, onClose }: { open: boolean; onClose: () 
                                     end={item.end}
                                     onClick={onClose}
                                     className={({ isActive }) =>
-                                        `relative flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${isActive
-                                            ? 'bg-primary/[0.12] text-primary ring-1 ring-primary/25'
-                                            : 'text-text-secondary hover:bg-white/[0.04] hover:text-text-primary'
+                                        `relative flex items-center gap-3 px-3 py-3 rounded-2xl transition-colors ${isActive
+                                            ? 'bg-[#E1F3EC] text-[#073F32] shadow-[0_10px_22px_-16px_rgba(0,0,0,0.65)]'
+                                            : 'text-white/65 hover:bg-white/10 hover:text-white'
                                         }`
                                     }
                                 >

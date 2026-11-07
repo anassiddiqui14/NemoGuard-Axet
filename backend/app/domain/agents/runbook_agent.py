@@ -31,7 +31,6 @@ rows that already committed.""" if LOCALSTACK_LAB_ENABLED else ""
 
         super().__init__(
             agent_name="Runbook_Agent",
-            model="nvidia/nemotron-3-super-120b-a12b",
             system_prompt=f"""You are the Runbook Agent.
 Your job is to search the runbook library and propose actionable recovery steps based on the incident context.
 Use the `get_runbook` tool to fetch standard operating procedures for the services identified in the alerts or RCA finding.

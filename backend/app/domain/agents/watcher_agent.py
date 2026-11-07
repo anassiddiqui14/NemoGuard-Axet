@@ -6,7 +6,6 @@ class WatcherAgent(BaseAgent):
     def __init__(self):
         super().__init__(
             agent_name="Watcher_Agent",
-            model="nvidia/nemotron-3-super-120b-a12b",
             system_prompt="""You are the Watcher Agent (First-Line Intelligence).
 Your job is to analyze incoming webhook payloads (from Datadog, PagerDuty, Emails, etc.) and determine if they represent a real anomaly or are just noise.
 If it is a valid alert, normalize it into a standard schema.

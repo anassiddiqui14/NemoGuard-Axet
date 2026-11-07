@@ -60,7 +60,6 @@ missing evidence rather than inventing competing causes or confidence."""
             # Root-cause diagnosis is the single most consequential decision in the pipeline
             # (everything downstream — impact, runbook selection, the recovery plan — depends
             # on getting this right), so we route it to the larger/stronger reasoning model.
-            model="nvidia/nemotron-3-ultra-550b-a55b",
             system_prompt=f"""You are the Root Cause Analysis (RCA) Agent. 
 Your job is to investigate an incident by querying logs.
 Use the `query_logs` tool to fetch independently recorded logs for the incident ONCE.

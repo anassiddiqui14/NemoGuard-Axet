@@ -43,7 +43,12 @@ services:
     environment:
       - POSTGRES_URL=postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db
       - TEMPORAL_URL=temporal:7233
-      - NVIDIA_API_KEY=${NVIDIA_API_KEY:?NVIDIA_API_KEY must be set in .env}
+      - AXET_LLM_BASE_URL=${AXET_LLM_BASE_URL:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - AXET_MODEL=${AXET_MODEL:-}
+      - AXET_PROJECT_ID=${AXET_PROJECT_ID:-}
+      - AXET_USER_ID=${AXET_USER_ID:-}
+      - DEPTAPPS_WEB_BACKEND_JWT_TOKEN=${DEPTAPPS_WEB_BACKEND_JWT_TOKEN:-}
       - JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set in .env}
       - ENV=${ENV:-production}
       - NEMOGUARD_WEBHOOK_SECRET=${NEMOGUARD_WEBHOOK_SECRET:-}
@@ -67,7 +72,12 @@ services:
     environment:
       - POSTGRES_URL=postgresql://nemoguard:nemoguard_password@postgres:5432/nemoguard_db
       - TEMPORAL_URL=temporal:7233
-      - NVIDIA_API_KEY=${NVIDIA_API_KEY:?NVIDIA_API_KEY must be set in .env}
+      - AXET_LLM_BASE_URL=${AXET_LLM_BASE_URL:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - AXET_MODEL=${AXET_MODEL:-}
+      - AXET_PROJECT_ID=${AXET_PROJECT_ID:-}
+      - AXET_USER_ID=${AXET_USER_ID:-}
+      - DEPTAPPS_WEB_BACKEND_JWT_TOKEN=${DEPTAPPS_WEB_BACKEND_JWT_TOKEN:-}
       - JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set in .env}
 
   frontend:

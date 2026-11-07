@@ -33,7 +33,7 @@ class MockWatcher:
         return self.result
 
 namespace = {
-    "Dict": dict, "Any": object, "json": json, "os": os, "uuid": uuid,
+    "Dict": dict, "Any": object, "List": list, "json": json, "os": os, "uuid": uuid,
     "datetime": datetime, "timedelta": timedelta, "timezone": timezone,
     "WatcherAgent": MockWatcher, "IncidentState": State,
 }

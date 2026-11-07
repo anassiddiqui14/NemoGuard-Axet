@@ -1,166 +1,144 @@
-# How To Start
+# How to Start NemoGuard V22
 
-This repository is NemoGuard Pipeline Copilot, restructured to follow the
-Axet `react-fastapi-flows` template's folder conventions (`renderer/` for the
-frontend, `backend/app/` for the Python backend). Unlike the base Axet
-template, this application still depends on external **PostgreSQL** and
-**Temporal** services for durable incident workflow orchestration — these are
-NOT replaced by the template's default SQLAlchemy/JSON/DuckDB storage.
+NemoGuard uses a React/Vite renderer (`renderer/`) and FastAPI backend (`backend/app/`). The current `axet-migration` branch supports two practical execution modes:
+
+1. **Standalone/local** — PostgreSQL + optional Temporal + approved aXet-compatible LLM configuration.
+2. **aXet Flows cloud** — `axet-spa-app` + `python-agent` + `python-gateway`, with aXet-managed identity/LLM injection. See `DEPLOY-TO-AXET.md`.
 
 ## Prerequisites
 
-- Node.js 18 or newer.
-- Python 3.10 or newer.
-- Docker + Docker Compose (recommended, provides Postgres + Temporal + all
-  services in one command).
-- Git.
-- An NVIDIA NIM API key (`NVIDIA_API_KEY`) for the agent LLM calls.
+- Python 3.10+
+- Node.js 18+ (Node 20+ recommended)
+- Git
+- For Docker mode: Docker + Docker Compose
+- For AI-agent calls outside aXet cloud: approved values for the aXet/OpenAI-compatible environment variables in `.env.example`
 
-## Local Development (Docker Compose — recommended)
+## Local development with Docker Compose
 
-1. Copy the example environment file and fill in secrets:
+1. Copy the example environment:
 
 ```bash
 cp .env.example .env
 ```
 
-Required variables: `NVIDIA_API_KEY`, `JWT_SECRET` (generate with
-`python -c "import secrets; print(secrets.token_urlsafe(48))"`).
+2. Set a strong `JWT_SECRET`.
 
-2. Start the full stack (Postgres, Temporal, API, Temporal worker, frontend,
-   simulator):
+3. If you want real LLM-backed agents locally, populate the approved aXet-compatible values:
 
-```bash
-docker-compose up -d --build
+```text
+AXET_LLM_BASE_URL
+OPENAI_API_KEY
+AXET_MODEL
+AXET_PROJECT_ID
+AXET_USER_ID
+DEPTAPPS_WEB_BACKEND_JWT_TOKEN
 ```
 
-3. Open the services:
+The application can still start without those values, but LLM-backed agent calls will report configuration errors.
 
-- NemoGuard API docs: `http://localhost:8000/docs`
-- NemoGuard UI: `http://localhost:80`
+4. Start the stack:
+
+```bash
+docker compose up -d --build
+```
+
+Services:
+
+- UI: `http://localhost/`
+- API docs: `http://localhost:8000/docs`
 - Simulator API: `http://localhost:8001/docs`
-- Temporal Web UI: `http://localhost:8233`
+- Temporal UI: `http://localhost:8233`
 
-To additionally run the optional LocalStack AWS-emulation lab:
+Optional LocalStack action lab:
 
 ```bash
-docker-compose --profile lab up -d
+docker compose --profile lab up -d
 ```
 
-## Local Development (without Docker)
+## Local development without Docker
 
-You must have Postgres and a Temporal server reachable (e.g. `temporal
-server start-dev`) before starting the app components below.
-
-1. Install backend dependencies:
+### Backend
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate   # or .\.venv\Scripts\Activate.ps1 on Windows
-pip install -e .
-pip install opentelemetry-api opentelemetry-sdk temporalio psycopg2-binary
+source .venv/bin/activate       # Windows PowerShell: .\.venv\Scripts\Activate.ps1
+pip install -r backend/requirements.txt
 ```
 
-2. Start the FastAPI backend:
+Set at minimum:
+
+```text
+JWT_SECRET=<strong-random-secret>
+NEMOGUARD_DB_BACKEND=postgres
+POSTGRES_URL=<your-postgres-url>
+```
+
+For LLM-backed agents also set the aXet-compatible variables listed above.
+
+Run:
 
 ```bash
 python -m uvicorn backend.app.api.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-3. Start the Temporal worker (separate terminal):
+### Temporal
+
+Temporal is optional at runtime. To use durable workflow orchestration:
+
+```text
+NEMOGUARD_TEMPORAL_ENABLED=true
+TEMPORAL_URL=localhost:7233
+```
+
+and run the worker in a separate terminal:
 
 ```bash
 python -m backend.app.temporal_worker
 ```
 
-4. Install and start the frontend:
+If Temporal is disabled, NemoGuard uses the implemented deterministic/direct fallback path. The V22 UI reports that workflow mode explicitly.
+
+### Frontend
+
+Always install dependencies for the platform on which you are building. Do not reuse a `node_modules` directory copied from another OS.
 
 ```bash
 cd renderer
-npm install
+npm ci
 npm run dev
 ```
 
-Vite proxies `/api` requests to `http://127.0.0.1:8000` automatically (see
-`renderer/vite.config.ts`).
-
-## Configuration
-
-Unlike the default Axet template, this app does not read `settings.json` for
-backend/frontend wiring — configuration is environment-variable driven via
-`.env` (see `.env.example`) and `config/*.yaml`:
-
-- `config/capability_policy.yaml` — risk/autonomy overrides for the Governed
-  Capability Gateway (`backend/app/capabilities/`).
-- `config/action_policy.yaml` — legacy action policy rules.
-- `config/scoring.yaml`, `config/demo.yaml` — scenario/demo scoring config.
-
-Key environment variables (see `.env.example` for the full list):
-
-- `POSTGRES_URL` — Postgres connection string.
-- `TEMPORAL_URL` — Temporal server address (`host:port`).
-- `NVIDIA_API_KEY` — required for all agent LLM calls.
-- `JWT_SECRET` — required; signs/verifies auth JWTs.
-- `ENV` — set to `development`/`dev`/`local` to enable the mock-login dev
-  endpoint (`/api/v2/auth/mock-login`); any other value disables it.
-- `NEMOGUARD_LOCALSTACK_LAB` — set to `1` to route capability execution/
-  verification through the LocalStack lab instead of safe no-ops.
-
-## Project Structure Mapping (original -> Axet-style)
-
-| Original (NemoGuard-V2) | Axet-structured (this repo) |
-|---|---|
-| `frontend/` | `renderer/` |
-| `src/` | `backend/app/` |
-| `src/api/main.py` | `backend/app/api/main.py` |
-| `src/domain/` | `backend/app/domain/` |
-| `src/capabilities/` | `backend/app/capabilities/` |
-| `src/temporal_worker.py` | `backend/app/temporal_worker.py` |
-
-All Python imports (`from src.xxx import ...`) were rewritten to
-`from app.xxx import ...` inside `backend/app/`, and to
-`from backend.app.xxx import ...` in top-level `scripts/` and
-`localstack_lab/` files that reach into the backend package.
-
-## Validation
-
-Run the backend tests:
+Production validation:
 
 ```bash
-python -m pytest
-```
-
-Build the frontend:
-
-```bash
-cd renderer
-npm install
 npm run build
 ```
 
-Check backend health:
+## SQLite
 
-```bash
-curl http://localhost:8000/docs
+SQLite remains useful for tests/diagnostics:
+
+```text
+NEMOGUARD_DB_BACKEND=sqlite
+NEMOGUARD_SQLITE_PATH=/tmp/nemoguard.db
 ```
 
-## Notes On Divergence From The Base Axet Template
+Do **not** treat `/tmp` as durable storage. The aXet team has also advised against using SQLite on `/internal-storage-files/files` for application database persistence because of locking/journaling behavior. See `V22_KNOWN_LIMITATIONS.md`.
 
-This project intentionally keeps the following NemoGuard-specific
-infrastructure instead of adopting the Axet template's lighter-weight
-defaults, because the incident-commander domain requires them:
+## Authentication modes
 
-- **PostgreSQL** instead of SQLAlchemy/JSON/DuckDB local storage — incident,
-  evidence, hypothesis, action-plan, and audit tables need relational
-  integrity and concurrent multi-service access.
-- **Temporal** for durable, resumable incident lifecycle workflows — the
-  Axet template has no equivalent long-running-workflow primitive.
-- **Docker Compose multi-service stack** (`postgres`, `temporal`, `api`,
-  `temporal-worker`, `frontend`, `simulator`, optional `localstack`) instead
-  of a single FastAPI process — this app genuinely needs an async
-  worker and durable orchestration tier separate from the request/response
-  API tier.
+Standalone/local:
 
-If you need a fully `.flows`-native, single-process variant, see the task
-notes for the "simplified port" option instead of this one, which focuses on
-folder/import conventions only.
+```text
+AXET_FLOWS_AUTH=false
+```
+
+uses NemoGuard JWT authentication.
+
+In aXet Flows, identity is supplied by the platform and backend authorization remains enforced by NemoGuard role/tenant/workspace checks.
+
+## V22 starting point
+
+After sign-in, start at **Production Overview**. It is backed by `GET /api/v2/operations/snapshot` and intentionally uses only real persisted state.
+
+For the intended leadership/demo flow see `V22_DEMO_GUIDE.md`.

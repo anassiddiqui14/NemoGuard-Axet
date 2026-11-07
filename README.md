@@ -1,84 +1,130 @@
-# NemoGuard Pipeline Copilot (Axet-structured)
+# NemoGuard V22
 
-NemoGuard Pipeline Copilot is an AI-driven, real-time Incident Commander platform powered by NemoClaw agents. It monitors complex data pipelines, triages anomalies across schemas, data quality, and compute layers, and automatically generates actionable recovery plans using autonomous AI agents.
+NemoGuard is an AI-assisted production-operations and incident-response platform. The current V22 direction is deliberately simple:
 
-This repository has been restructured to follow the **Axet `react-fastapi-flows` template conventions** (`renderer/` for the frontend, `backend/app/` for the Python backend) while keeping its original external service dependencies: **PostgreSQL** and **Temporal**. See `HOW-TO-START.md` for the full Axet-style setup guide.
+> **Help a production-support team understand what is happening, what needs attention, what NemoGuard knows, what it does not know, and what should happen next — before expanding production autonomy.**
 
-## Project Structure
+The repository follows the aXet React + FastAPI layout (`renderer/` + `backend/app/`) and supports local/standalone execution as well as an aXet Flows deployment.
 
-- `renderer/` - React frontend built with Vite, TailwindCSS, and Lucide Icons (renamed from `frontend/` to match the Axet template's `renderer/` convention). Features real-time SSE event streaming for agent activity and a fully responsive enterprise-grade dashboard.
-- `backend/app/` - Backend Python application (FastAPI), relocated from the original `src/` to match the Axet template's `backend/app/` convention.
-  - `backend/app/api/` - REST API endpoints and SSE endpoints.
-  - `backend/app/domain/` - Orchestrator and agent definitions using LLM APIs to drive the NemoClaw agents.
-  - `backend/app/capabilities/` - Governed Capability Gateway (typed action execution + policy + verification).
-- `data/` - SQLite/legacy artifacts plus demo seed data.
-- `scripts/` - Assorted helper scripts for scenario injection and configuration.
-- `migrations/` - PostgreSQL schema migrations (still required — this app depends on an external Postgres instance, unlike the Axet template's default SQLAlchemy/DuckDB storage).
-- `localstack_lab/` - Optional LocalStack-based AWS emulation lab for real remediation testing.
+## V22 product focus
 
-> **Note on external services:** Unlike the default Axet `.flows` template (which uses a single FastAPI backend + SQLAlchemy/JSON/DuckDB storage with no external services), NemoGuard requires **PostgreSQL** and a **Temporal** server for durable workflow orchestration. These remain as external dependencies — see `docker-compose.yml` and `HOW-TO-START.md`.
+- **Production Overview** — deterministic Needs Attention, Shift Brief, real KPIs, activity, health, recent investigations, and live persisted events.
+- **What NemoGuard Needs** — investigation-coverage gaps such as missing independent evidence, runbook grounding, dependency context, execution IDs, or ownership.
+- **Alert Inbox / Outlook bridge** — the current approved real-world intake path for forwarded production alerts.
+- **Incident Command Center** — correlated alerts, evidence, RCA hypotheses, impact, runbook/plan state, agent progression, Commander, approvals, execution and verification.
+- **Commander Live / Pulse** — persistent incident conversation and deterministic operational-status projection.
+- **Governed capabilities** — policy, approval, precondition, execution and independent verification controls.
+- **Scenario Lab** — explicitly synthetic/lab-only demonstrations of the future action lifecycle.
 
-## Setup & Installation
+V22 does not fabricate production metrics and does not add unauthorized direct integrations or autonomous production writes.
 
-### 1. Backend (FastAPI + Python)
+## Architecture
 
-Ensure you have Python 3.10+ installed.
-
-```bash
-# Create and activate a virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies
-pip install -e .
+```text
+Browser / React Vite SPA
+          |
+          v
+FastAPI REST + authenticated streaming
+          |
+   +------+--------------------+
+   |      |                    |
+Database  Agent layer          Optional Temporal
+   |      |                    |
+   |      +--> aXet-managed LLM|
+   |                           |
+   +--> incidents/alerts/evidence/plans/audit/Commander
 ```
 
-### 2. Frontend (React + Vite)
+Local/Docker deployments can use PostgreSQL and Temporal. The current repository also contains a SQLite backend used for tests/diagnostics and constrained deployments; see the cloud persistence limitation below.
 
-Ensure you have Node.js 18+ installed.
+## Project structure
+
+```text
+backend/app/
+  api/                 FastAPI composition, auth, REST/SSE endpoints
+  domain/              incident lifecycle, agents, correlation, Commander
+  capabilities/        governed action/capability policy + verification
+  store/               PostgreSQL/SQLite database abstraction
+  tools/               read/write tool contracts
+
+renderer/src/
+  components/          shell + incident command-center components
+  design-system/       reusable UI primitives and motion
+  hooks/               data/auth/event/navigation hooks
+  pages/               route-level product surfaces
+
+config/                 capability/action/scoring configuration
+localstack_lab/         optional isolated action/remediation lab
+```
+
+## Quick start
+
+See [HOW-TO-START.md](HOW-TO-START.md).
+
+For a local frontend install:
 
 ```bash
 cd renderer
-npm install
-```
-
-## Running the Application
-
-The simplest way to run everything (Postgres, Temporal, API, worker, frontend) is via Docker Compose:
-
-```bash
-docker-compose up -d --build
-```
-
-For local development without Docker, you need Postgres and Temporal running externally, then:
-
-**Start the Backend Server (Terminal 1):**
-```bash
-# From the project root, with your venv activated:
-python3 -m uvicorn backend.app.api.main:app --reload --port 8000
-```
-*Note: The backend runs on `http://localhost:8000`.*
-
-**Start the Temporal Worker (Terminal 2):**
-```bash
-python3 -m backend.app.temporal_worker
-```
-
-**Start the Frontend Server (Terminal 3):**
-```bash
-cd renderer
+npm ci
 npm run dev
 ```
-*Note: The frontend typically runs on `http://localhost:5173`. The Vite config is set up to proxy `/api` requests automatically to `http://localhost:8000`.*
 
-## Features
+For the backend:
 
-- **Live Agent Operations Console**: View real-time autonomous reasoning and execution traces via SSE.
-- **Dynamic Causal Chain**: Visualizes the downstream impact of an alert leading to a root cause hypothesis.
-- **Scenario Lab**: Generate fully synthetic, highly realistic pipeline incidents (Schema Regressions, Compute Crashes, DQ Anomalies) to test the agent platform.
-- **Business Impact Dashboards**: See real-time blast radius analysis (Data Products affected, SLAs at risk).
-- **Interactive Action Plans**: Review, edit, approve, or provide textual feedback on LLM-generated incident recovery runbooks.
-- **Governed Capability Gateway**: Typed, policy-enforced action execution with independent verification (`backend/app/capabilities/`).
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r backend/requirements.txt
+python -m uvicorn backend.app.api.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Configuration is documented in `.env.example`.
+
+## aXet deployment
+
+See [DEPLOY-TO-AXET.md](DEPLOY-TO-AXET.md).
+
+The current cloud architecture uses:
+
+```text
+axet-spa-app -> python-gateway (/backend/api -> /api/v2) -> python-agent/Uvicorn -> FastAPI
+```
+
+Active agents use the aXet-managed OpenAI-compatible runtime (`AXET_LLM_BASE_URL`, `AXET_MODEL`, etc.). The active V22 path no longer requires `NVIDIA_API_KEY`.
+
+## Persistence note
+
+The aXet team has advised against SQLite on `/internal-storage-files/files` for durable application persistence because of locking/journaling behavior. SQLite in `/tmp` is diagnostic/ephemeral only.
+
+For durable aXet cloud persistence, the platform team recommends the Flow MySQL-compatible service (internal port 3306). A MySQL backend is intentionally not included in this V22 package until the remaining internal hostname/credential/database contract is confirmed.
+
+## Validation
+
+The V22 change set includes tests for:
+
+- operations intelligence / attention + coverage projection
+- guarded incident cancellation
+- alert re-correlation
+- webhook idempotency and isolation
+- existing Outlook/email and SQLite behaviors where dependencies are available
+
+See [V22_IMPLEMENTATION_SUMMARY.md](V22_IMPLEMENTATION_SUMMARY.md) for the exact validation performed in the review environment.
+
+## Leadership/demo docs
+
+- [V22_DEMO_GUIDE.md](V22_DEMO_GUIDE.md)
+- [V22_IMPLEMENTATION_SUMMARY.md](V22_IMPLEMENTATION_SUMMARY.md)
+- [V22_KNOWN_LIMITATIONS.md](V22_KNOWN_LIMITATIONS.md)
+
+## Safety posture
+
+NemoGuard separates observation, recommendation, approval, execution, and verification. Forwarded email is intentionally treated as unverified/source-reported evidence. A plausible AI recommendation is not sufficient authority to change production.
+
+The intended maturity path is:
+
+```text
+Observe -> Understand -> Prioritize -> Learn -> Recommend -> Governed Action -> Controlled Autonomy
+```
 
 ## License
 

@@ -5,7 +5,7 @@ import { AgentConstellation, InvestigationChecklist } from '../AgentConstellatio
 import { LiveOperationsConsole } from '../LiveOperationsConsole';
 import { EmptyState, severityPill } from './shared';
 import { InvestigationGlyphIcon } from '../../pages/LandingPage/NemoIcons';
-import { Search, Activity, TrendingUp, ChevronDown, Lightbulb, ArrowRightLeft } from 'lucide-react';
+import { Search, Activity, TrendingUp, ChevronDown, Lightbulb, ArrowRightLeft, CheckCircle2, CircleDashed, Wrench } from 'lucide-react';
 import type { AgentEvent } from '../../hooks/useIncidentEvents';
 import { authFetch } from '../../contexts/AuthGateContext';
 
@@ -182,17 +182,43 @@ function describeInvestigationProgress(events: AgentEvent[]): { title: string; s
 }
 
 export function AgentAndHypothesisRow({
-    activeIncidentId, incidentStatus, liveEvents, hypothesis, evidence, dataLoading, onViewEvidence,
+    activeIncidentId, incidentStatus, liveEvents, hypothesis, evidence, impact, plan, incident, dataLoading, onViewEvidence,
 }: {
     activeIncidentId: string | null;
     incidentStatus: string;
     liveEvents: AgentEvent[];
     hypothesis: any;
     evidence: any[];
+    impact: any[];
+    plan: any;
+    incident: any;
     dataLoading: boolean;
     onViewEvidence: () => void;
 }) {
     const progress = dataLoading ? describeInvestigationProgress(liveEvents) : null;
+    const independentEvidence = evidence.filter((ev: any) => {
+        const authority = String(ev.authority || 'MEDIUM').toUpperCase();
+        const reliability = Number(ev.reliability ?? 0);
+        return (authority === 'HIGH' || authority === 'MEDIUM') && reliability >= 0.5;
+    });
+    const checks = [
+        { label: 'Evidence persisted', ready: evidence.length > 0, detail: evidence.length ? `${evidence.length} evidence item${evidence.length === 1 ? '' : 's'}` : 'No evidence persisted yet' },
+        { label: 'Independent evidence', ready: independentEvidence.length > 0, detail: independentEvidence.length ? `${independentEvidence.length} independently trusted item${independentEvidence.length === 1 ? '' : 's'}` : 'Source-reported evidence is not independently validated' },
+        { label: 'Dependency context', ready: impact.length > 0, detail: impact.length ? `${impact.length} affected asset${impact.length === 1 ? '' : 's'} mapped` : 'Blast radius is currently unknown' },
+        { label: 'Runbook grounding', ready: Boolean(plan?.runbook_id), detail: plan?.runbook_id ? `Matched ${plan.runbook_id}` : 'No approved runbook matched' },
+        { label: 'Execution context', ready: Boolean(incident?.primary_run_id || incident?.primary_job_id), detail: incident?.primary_run_id || incident?.primary_job_id || 'No job/run identifier available' },
+        { label: 'Support ownership', ready: Boolean(incident?.owner_team), detail: incident?.owner_team || 'No owner team recorded' },
+    ];
+    const coverageScore = Math.round((checks.filter((check) => check.ready).length / checks.length) * 100);
+    let requestedEvidence: string[] = [];
+    try {
+        const raw = hypothesis?.missing_evidence_json;
+        requestedEvidence = Array.isArray(raw) ? raw : raw ? JSON.parse(raw) : [];
+        if (!Array.isArray(requestedEvidence)) requestedEvidence = [];
+    } catch {
+        requestedEvidence = [];
+    }
+
     return (
         <div className="grid grid-cols-1 lg:grid-cols-[1fr_1fr] gap-4 items-start">
             <Card title="Agent Constellation" subtitle="Coordinated multi-agent investigation" className="h-[400px]">
@@ -276,6 +302,36 @@ export function AgentAndHypothesisRow({
                                         <span className="text-text-muted">No evidence linked yet.</span>
                                     )}
                                 </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            </Card>
+
+            <Card
+                title="Investigation Coverage"
+                subtitle="What NemoGuard knows, what it is missing, and what would improve confidence"
+                titleIcon={<Wrench className="w-3.5 h-3.5 text-primary" />}
+                right={<span className={`text-[11px] font-bold px-2.5 py-1 rounded-full ${coverageScore >= 80 ? 'bg-healthy/15 text-healthy' : coverageScore >= 50 ? 'bg-warning/15 text-warning' : 'bg-critical/15 text-critical'}`}>{coverageScore}% covered</span>}
+                className="lg:col-span-2"
+            >
+                <div className="p-4 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2.5">
+                    {checks.map((check) => (
+                        <div key={check.label} className={`rounded-xl p-3 ring-1 ${check.ready ? 'bg-healthy/[0.05] ring-healthy/15' : 'bg-warning/[0.05] ring-warning/15'}`}>
+                            <div className="flex items-start gap-2.5">
+                                {check.ready ? <CheckCircle2 className="w-4 h-4 text-healthy flex-shrink-0 mt-0.5" /> : <CircleDashed className="w-4 h-4 text-warning flex-shrink-0 mt-0.5" />}
+                                <div className="min-w-0">
+                                    <div className="text-[11.5px] font-semibold text-text-primary">{check.label}</div>
+                                    <div className="text-[10.5px] text-text-muted mt-0.5 leading-relaxed">{check.detail}</div>
+                                </div>
+                            </div>
+                        </div>
+                    ))}
+                    {requestedEvidence.length > 0 && (
+                        <div className="md:col-span-2 xl:col-span-3 rounded-xl p-3.5 bg-primary/[0.05] ring-1 ring-primary/15">
+                            <div className="text-[10.5px] font-semibold uppercase tracking-wider text-primary mb-1.5">What NemoGuard needs next</div>
+                            <div className="text-[11.5px] text-text-secondary leading-relaxed">
+                                {requestedEvidence.slice(0, 3).join(' · ')}
                             </div>
                         </div>
                     )}

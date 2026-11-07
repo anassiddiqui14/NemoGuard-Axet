@@ -94,29 +94,32 @@
    * like the same product, not a palette-swapped "default Tailwind
    * light theme" fallback.
    */
-  --color-app-bg: #F2F8F8;
-  --color-surface: #FFFFFF;
-  --color-surface-secondary: #ECF5F5;
+  /* V22 light-first operations palette: warm canvas, forest-green brand,
+     quiet violet agent accent. Existing components inherit this globally
+     so the overhaul reaches every page without screen-by-screen restyling. */
+  --color-app-bg: #F3F6F2;
+  --color-surface: #FCFDFB;
+  --color-surface-secondary: #EDF3EE;
   --color-surface-elevated: #FFFFFF;
-  --color-border-color: #D6E6E6;
-  --color-border-strong: #B8D2D2;
-  --color-text-primary: #0F2426;
-  --color-text-secondary: #3F5E61;
-  --color-text-muted: #6E8C8F;
+  --color-border-color: #D9E5DE;
+  --color-border-strong: #BED2C7;
+  --color-text-primary: #13231E;
+  --color-text-secondary: #62716B;
+  --color-text-muted: #8C9994;
 
-  --color-primary: #0A8D8F;
-  --color-primary-glow: rgba(10, 141, 143, 0.25);
+  --color-primary: #0C6F58;
+  --color-primary-glow: rgba(12, 111, 88, 0.22);
 
-  --color-agent-active: #B32E7E;
-  --color-healthy: #0D9C74;
-  --color-warning: #B45309;
-  --color-critical: #DC2650;
-  --color-info: #0284C7;
+  --color-agent-active: #6D67C7;
+  --color-healthy: #18A566;
+  --color-warning: #C88718;
+  --color-critical: #D94F59;
+  --color-info: #3777D6;
 
-  --panel-bg: rgba(255, 255, 255, 0.75);
-  --panel-border: rgba(15, 36, 38, 0.08);
-  --glow-primary: rgba(10, 141, 143, 0.08);
-  --glow-agent: rgba(179, 46, 126, 0.06);
+  --panel-bg: rgba(252, 253, 251, 0.88);
+  --panel-border: rgba(15, 63, 50, 0.10);
+  --glow-primary: rgba(12, 111, 88, 0.06);
+  --glow-agent: rgba(109, 103, 199, 0.045);
 
   /* Light-mode chart tokens -- same mapping, resolves to the already-
      light-adjusted semantic colors defined above in this same block. */

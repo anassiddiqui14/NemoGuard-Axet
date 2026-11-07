@@ -5,7 +5,6 @@ import {
     AgentOpsIcon,
     IntelligenceIcon,
     ScenarioIcon,
-    AdoptionIcon,
 } from '../pages/LandingPage/NemoIcons';
 import { useCurrentUser } from './useCurrentUser';
 
@@ -43,8 +42,7 @@ export function useNavItems(): NavItem[] {
         { to: '/app/incidents', label: 'Incidents', icon: <IncidentsIcon className="w-4.5 h-4.5" /> },
         { to: '/app/agent-operations', label: 'Agent Operations', icon: <AgentOpsIcon className="w-4.5 h-4.5" /> },
         { to: '/app/intelligence', label: 'Intelligence', icon: <IntelligenceIcon className="w-4.5 h-4.5" /> },
-        { to: '/app/scenario-cockpit', label: 'Scenario Cockpit', icon: <ScenarioIcon className="w-4.5 h-4.5" /> },
-        { to: '/app/adoption-readiness', label: 'Adoption Readiness', icon: <AdoptionIcon className="w-4.5 h-4.5" /> },
+        { to: '/app/scenario-cockpit', label: 'Scenario Lab', icon: <ScenarioIcon className="w-4.5 h-4.5" /> },
         ...(isAdmin ? [{ to: '/app/admin', label: 'Admin', icon: <ShieldCheck className="w-4.5 h-4.5" /> }] : []),
         { to: '/app/settings', label: 'Settings', icon: <Settings className="w-4.5 h-4.5" /> },
     ];

@@ -327,7 +327,7 @@ export function ScenarioCockpitPage() {
                         <Rocket className="w-5 h-5 text-primary" /> Scenario Cockpit
                     </h1>
                     <p className="text-[13px] text-text-muted mt-1">
-                        Control demo scenarios, trigger real AWS/Airflow-style jobs, and introduce error conditions for NemoGuard to detect and respond to.
+                        Explicitly isolated demo/lab scenarios for showing the future execute-and-verify lifecycle. Nothing on this page should be represented as production telemetry.
                     </p>
                 </div>
                 <motion.button

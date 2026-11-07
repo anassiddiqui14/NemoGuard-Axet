@@ -297,46 +297,69 @@ def get_status():
         else "disconnected"
     )
 
+    policy_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../config/capability_policy.yaml"))
+    policy_status = "configured" if os.path.exists(policy_path) else "not_configured"
+
+    inference_requirements = {
+        "base_url": os.environ.get("AXET_LLM_BASE_URL") or os.environ.get("OPENAI_API_BASE"),
+        "api_key": os.environ.get("OPENAI_API_KEY"),
+        "model": os.environ.get("AXET_MODEL"),
+        "project_id": os.environ.get("AXET_PROJECT_ID"),
+        "user_id": os.environ.get("AXET_USER_ID"),
+        "backend_jwt": os.environ.get("DEPTAPPS_WEB_BACKEND_JWT_TOKEN"),
+    }
+    inference_status = "configured" if all(inference_requirements.values()) else "not_configured"
+
     return {
         "environment": os.environ.get("ENV", "production"),
         "database_backend": database_backend,
         "database": database_status,
-        "orchestrator": "healthy",
-        "policy_engine": "active",
+        # These are intentionally not labelled "healthy" without an active
+        # dependency probe.  V22 distinguishes configured/available from
+        # genuinely health-checked runtime state.
+        "orchestrator": "available" if database_status == "healthy" else "degraded",
+        "policy_engine": policy_status,
         "temporal": temporal_status,
-        "inference_provider": "axet",
+        "inference_provider": "axet" if inference_status == "configured" else "not_configured",
+        "inference_status": inference_status,
         "outlook_bridge_contract": 1,
         "last_checked_at": datetime.now(timezone.utc).isoformat(),
     }
 
+
+def _operations_snapshot(current_user: User):
+    from app.domain.operations_intelligence import build_operations_snapshot
+    return build_operations_snapshot(
+        get_database(),
+        current_user.tenant_id,
+        current_user.workspace_id,
+        get_status(),
+    )
+
+
+@app.get("/api/v2/operations/snapshot")
+def get_operations_snapshot(current_user: User = Depends(get_current_user)):
+    """One deterministic, explainable snapshot for the V22 operations home."""
+    return JSONResponse(_operations_snapshot(current_user), headers={"Cache-Control": "no-store"})
+
+
 @app.get("/api/v2/overview")
-def get_overview():
-    db = get_database()
-    try:
-        with db.get_connection() as conn:
-            cur = conn.execute("SELECT COUNT(*) FROM incident WHERE status != 'RESOLVED'")
-            open_incidents = cur.fetchone()[0]
-            cur = conn.execute("SELECT COUNT(*) FROM incident WHERE status != 'RESOLVED' AND severity = 'SEV-1'")
-            critical = cur.fetchone()[0]
-            cur = conn.execute("SELECT COUNT(*) FROM incident WHERE status != 'RESOLVED' AND severity = 'SEV-2'")
-            high = cur.fetchone()[0]
-            cur = conn.execute("SELECT COUNT(*) FROM alert WHERE status = 'acknowledged'")
-            correlated = cur.fetchone()[0]
-            
-            return {
-                "open_incidents": open_incidents,
-                "critical_incidents": critical,
-                "high_incidents": high,
-                "alerts_correlated_today": correlated,
-                "alerts_suppressed_today": 0,
-                "jobs_currently_affected": 8 if open_incidents > 0 else 0,
-                "data_products_at_risk": 3 if open_incidents > 0 else 0
-            }
-    except Exception:
-        return {}
+def get_overview(current_user: User = Depends(get_current_user)):
+    """Compatibility overview backed only by real persisted measurements."""
+    snapshot = _operations_snapshot(current_user)
+    summary = snapshot["summary"]
+    return {
+        "open_incidents": summary["open_incidents"],
+        "critical_incidents": summary["high_priority_incidents"],
+        "high_incidents": summary["high_priority_incidents"],
+        "open_high_priority_alerts": summary["high_priority_alerts"],
+        "verified_recoveries_30d": summary["verified_recoveries_30d"],
+        "median_triage_seconds": summary["median_triage_seconds"],
+        "alerts_last_24h": summary["alerts_last_24h"],
+    }
 
 @app.get("/api/v2/incidents")
-def list_incidents(state: str = "open"):
+def list_incidents(state: str = "open", current_user: User = Depends(get_current_user)):
     db = get_database()
     with db.get_connection() as conn:
         # Include resolved_at so the frontend can show "time to resolve" for
@@ -349,10 +372,16 @@ def list_incidents(state: str = "open"):
             # unchanged active incident in the operator queue.
             cursor = conn.execute(
                 "SELECT incident_id, title, status, severity, detected_at, next_sla_breach_at, owner_team, primary_job_id, summary, resolved_at "
-                "FROM incident WHERE status NOT IN ('RESOLVED', 'FAILED', 'CLOSED', 'CANCELLED') ORDER BY detected_at DESC"
+                "FROM incident WHERE tenant_id = %s AND (workspace_id = %s OR workspace_id IS NULL) "
+                "AND status NOT IN ('RESOLVED', 'FAILED', 'CLOSED', 'CANCELLED') ORDER BY detected_at DESC",
+                (current_user.tenant_id, current_user.workspace_id),
             )
         else:
-            cursor = conn.execute("SELECT incident_id, title, status, severity, detected_at, next_sla_breach_at, owner_team, primary_job_id, summary, resolved_at FROM incident ORDER BY detected_at DESC")
+            cursor = conn.execute(
+                "SELECT incident_id, title, status, severity, detected_at, next_sla_breach_at, owner_team, primary_job_id, summary, resolved_at "
+                "FROM incident WHERE tenant_id = %s AND (workspace_id = %s OR workspace_id IS NULL) ORDER BY detected_at DESC",
+                (current_user.tenant_id, current_user.workspace_id),
+            )
             
         cols = [col[0] for col in cursor.description]
         return [dict(zip(cols, row)) for row in cursor.fetchall()]
@@ -360,8 +389,9 @@ def list_incidents(state: str = "open"):
 # --- 12.2 Incident detail endpoints ---
 
 @app.get("/api/v2/incidents/{incident_id}")
-def get_incident(incident_id: str):
+def get_incident(incident_id: str, current_user: User = Depends(get_current_user)):
     db = get_database()
+    _require_incident_in_tenant(db, incident_id, current_user.tenant_id, current_user.workspace_id)
     with db.get_connection() as conn:
         cursor = conn.execute("SELECT * FROM incident WHERE incident_id = %s", (incident_id,))
         row = cursor.fetchone()
@@ -371,13 +401,14 @@ def get_incident(incident_id: str):
         return dict(zip(cols, row))
 
 @app.get("/api/v2/incidents/{incident_id}/summary")
-def get_incident_summary(incident_id: str):
-    # For now, just return the incident details
-    return get_incident(incident_id)
+def get_incident_summary(incident_id: str, current_user: User = Depends(get_current_user)):
+    # For now, just return the incident details.
+    return get_incident(incident_id, current_user)
 
 @app.get("/api/v2/incidents/{incident_id}/hypotheses")
-def get_hypotheses(incident_id: str):
+def get_hypotheses(incident_id: str, current_user: User = Depends(get_current_user)):
     db = get_database()
+    _require_incident_in_tenant(db, incident_id, current_user.tenant_id, current_user.workspace_id)
     with db.get_connection() as conn:
         cursor = conn.execute("SELECT * FROM hypothesis WHERE incident_id = %s ORDER BY confidence DESC", (incident_id,))
         cols = [col[0] for col in cursor.description]
@@ -390,15 +421,16 @@ def get_hypotheses(incident_id: str):
 @app.get("/api/v2/incidents/{incident_id}/evidence")
 def get_evidence(incident_id: str, current_user: User = Depends(get_current_user)):
     db = get_database()
-    _require_incident_in_tenant(db, incident_id, current_user.tenant_id)
+    _require_incident_in_tenant(db, incident_id, current_user.tenant_id, current_user.workspace_id)
     with db.get_connection() as conn:
         cursor = conn.execute("SELECT * FROM evidence WHERE incident_id = %s ORDER BY collected_at ASC", (incident_id,))
         cols = [col[0] for col in cursor.description]
         return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
 @app.get("/api/v2/incidents/{incident_id}/impact")
-def get_impact(incident_id: str):
+def get_impact(incident_id: str, current_user: User = Depends(get_current_user)):
     db = get_database()
+    _require_incident_in_tenant(db, incident_id, current_user.tenant_id, current_user.workspace_id)
     with db.get_connection() as conn:
         cursor = conn.execute("""
             SELECT i.*, d.name as asset_name, d.freshness_sla_minutes 
@@ -413,9 +445,10 @@ def get_impact(incident_id: str):
         return rows
 
 @app.get("/api/v2/incidents/{incident_id}/plans")
-def get_plans(incident_id: str):
+def get_plans(incident_id: str, current_user: User = Depends(get_current_user)):
     from app.domain.plan_hash import compute_plan_hash
     db = get_database()
+    _require_incident_in_tenant(db, incident_id, current_user.tenant_id, current_user.workspace_id)
     with db.get_connection() as conn:
         cursor = conn.execute("SELECT * FROM action_plan WHERE incident_id = %s ORDER BY created_at DESC", (incident_id,))
         cols = [col[0] for col in cursor.description]
@@ -430,16 +463,18 @@ def get_plans(incident_id: str):
         return plans
 
 @app.get("/api/v2/incidents/{incident_id}/events")
-def get_events(incident_id: str):
+def get_events(incident_id: str, current_user: User = Depends(get_current_user)):
     db = get_database()
+    _require_incident_in_tenant(db, incident_id, current_user.tenant_id, current_user.workspace_id)
     with db.get_connection() as conn:
         cursor = conn.execute("SELECT * FROM audit_event WHERE incident_id = %s ORDER BY created_at ASC", (incident_id,))
         cols = [col[0] for col in cursor.description]
         return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
 @app.get("/api/v2/incidents/{incident_id}/alerts")
-def get_incident_alerts(incident_id: str):
+def get_incident_alerts(incident_id: str, current_user: User = Depends(get_current_user)):
     db = get_database()
+    _require_incident_in_tenant(db, incident_id, current_user.tenant_id, current_user.workspace_id)
     with db.get_connection() as conn:
         cursor = conn.execute("""
             SELECT a.* FROM alert a
@@ -479,8 +514,8 @@ def recorrelate_alert(
     db = get_database()
     now = datetime.now(timezone.utc).isoformat()
     with db.get_connection() as conn:
-        _require_incident_in_tenant(db, incident_id, current_user.tenant_id)
-        _require_incident_in_tenant(db, req.target_incident_id, current_user.tenant_id)
+        _require_incident_in_tenant(db, incident_id, current_user.tenant_id, current_user.workspace_id)
+        _require_incident_in_tenant(db, req.target_incident_id, current_user.tenant_id, current_user.workspace_id)
 
         link = conn.execute(
             "SELECT correlation_score, correlation_reasons_json FROM incident_alert "
@@ -524,10 +559,13 @@ def recorrelate_alert(
     return {"status": "recorrelated", "alert_id": alert_id, "from_incident_id": incident_id, "to_incident_id": req.target_incident_id}
 
 @app.get("/api/v2/alerts")
-def get_all_alerts():
+def get_all_alerts(current_user: User = Depends(get_current_user)):
     db = get_database()
     with db.get_connection() as conn:
-        cursor = conn.execute("SELECT * FROM alert ORDER BY opened_ts DESC")
+        cursor = conn.execute(
+            "SELECT * FROM alert WHERE tenant_id = %s AND (workspace_id = %s OR workspace_id IS NULL) ORDER BY opened_ts DESC",
+            (current_user.tenant_id, current_user.workspace_id),
+        )
         cols = [col[0] for col in cursor.description]
         return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
@@ -1038,6 +1076,8 @@ def agent_findings(incident_id: str, payload: dict, current_user: User = Depends
     which save_agent_findings() routes to NEEDS_REVIEW (never
     PENDING_APPROVAL) and logs as SAFETY_VALIDATION_INCONCLUSIVE.
     """
+    db = get_database()
+    _require_incident_in_tenant(db, incident_id, current_user.tenant_id, current_user.workspace_id)
     from app.domain.orchestrator import IncidentOrchestrator
     orchestrator = IncidentOrchestrator()
     res = orchestrator.save_agent_findings(
@@ -1051,7 +1091,9 @@ def agent_findings(incident_id: str, payload: dict, current_user: User = Depends
     return res
 
 @app.get("/api/v2/incidents/{incident_id}/agent-logs")
-def agent_logs(incident_id: str):
+def agent_logs(incident_id: str, current_user: User = Depends(get_current_user)):
+    db = get_database()
+    _require_incident_in_tenant(db, incident_id, current_user.tenant_id, current_user.workspace_id)
     import os
     log_file = f"logs/{incident_id}_nemoclaw.log"
     if os.path.exists(log_file):
@@ -1068,13 +1110,80 @@ class FeedbackRequest(BaseModel):
     feedback: str
 
 @app.post("/api/v2/incidents/{incident_id}/feedback")
-def submit_feedback(incident_id: str, req: FeedbackRequest, current_user: User = Depends(get_current_user)):
+async def submit_feedback(incident_id: str, req: FeedbackRequest, current_user: User = Depends(get_current_user)):
+    db = get_database()
+    _require_incident_in_tenant(db, incident_id, current_user.tenant_id, current_user.workspace_id)
     from app.domain.orchestrator import IncidentOrchestrator
     orchestrator = IncidentOrchestrator()
-    res = orchestrator.triage_feedback(incident_id, req.feedback)
+    res = await orchestrator.triage_feedback(incident_id, req.feedback)
     if "error" in res:
         raise HTTPException(status_code=500, detail=res["error"])
     return res
+
+
+class CancelIncidentRequest(BaseModel):
+    reason: Optional[str] = None
+
+
+@app.post("/api/v2/incidents/{incident_id}/cancel")
+async def cancel_incident(
+    incident_id: str,
+    req: CancelIncidentRequest,
+    current_user: User = Depends(require_role("commander")),
+):
+    """Cancel an incident only at the safe human-approval checkpoint."""
+    global temporal_client
+    from app.domain.state_machine import StateMachine, InvalidTransitionError
+
+    db = get_database()
+    _require_incident_in_tenant(db, incident_id, current_user.tenant_id, current_user.workspace_id)
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT status FROM incident WHERE incident_id = %s",
+            (incident_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Incident not found")
+        current_status = row[0]
+        try:
+            StateMachine.validate_transition(current_status, IncidentState.CANCELLED.value)
+        except InvalidTransitionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE incident SET status = %s, updated_at = %s WHERE incident_id = %s",
+            (IncidentState.CANCELLED.value, now, incident_id),
+        )
+        conn.execute(
+            "UPDATE action_plan SET status = 'CANCELLED' WHERE incident_id = %s "
+            "AND status IN ('PENDING_APPROVAL','NEEDS_REVIEW','APPROVED')",
+            (incident_id,),
+        )
+        reason = (req.reason or "No reason supplied").strip()[:1000]
+        conn.execute(
+            "INSERT INTO audit_event (audit_event_id, incident_id, actor_type, actor_id, event_type, event_summary, details_json, created_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+            (
+                f"AUD-{uuid.uuid4().hex[:8]}", incident_id, "HUMAN", current_user.user_id,
+                "INCIDENT_CANCELLED", f"Incident cancelled by operator: {reason}",
+                json.dumps({"reason": reason}), now,
+            ),
+        )
+
+    # If a durable workflow is waiting for approval, release it with a
+    # non-approve decision. The database transition above is authoritative;
+    # a stale/absent Temporal workflow must not make cancellation fail.
+    if temporal_client:
+        try:
+            from app.domain.workflows.incident_workflow import IncidentLifecycleWorkflow
+            handle = temporal_client.get_workflow_handle(f"incident-{incident_id}")
+            await handle.signal(IncidentLifecycleWorkflow.approve_plan, {"decision": "cancel", "plan_id": None})
+        except Exception as exc:
+            print(f"Temporal cancellation signal failed for {incident_id}: {exc}")
+
+    return {"status": "CANCELLED", "incident_id": incident_id}
+
 
 @app.post("/api/v2/incidents/{incident_id}/plans/{plan_id}/approve")
 async def approve_plan(incident_id: str, plan_id: str, req: ApprovalRequest, current_user: User = Depends(require_role("commander"))):
@@ -1097,6 +1206,7 @@ async def approve_plan(incident_id: str, plan_id: str, req: ApprovalRequest, cur
 
     # Validate the plan_hash actually matches the current plan content (defense against stale/tampered approvals).
     db = get_database()
+    _require_incident_in_tenant(db, incident_id, current_user.tenant_id, current_user.workspace_id)
     from app.domain.plan_hash import compute_plan_hash
     with db.get_connection() as conn:
         # Bound to BOTH action_plan_id AND incident_id (from the URL path):
@@ -1214,6 +1324,7 @@ async def execute_plan(incident_id: str, plan_id: str, current_user: User = Depe
     through this route.
     """
     db = get_database()
+    _require_incident_in_tenant(db, incident_id, current_user.tenant_id, current_user.workspace_id)
     with db.get_connection() as conn:
         # Bound to BOTH action_plan_id AND incident_id (from the URL path)
         # so a plan belonging to a DIFFERENT incident cannot satisfy this
@@ -1320,7 +1431,7 @@ def auth_me(current_user: User = Depends(get_current_user)):
 # CommanderConversation's own equivalent check.
 # ---------------------------------------------------------------------------
 
-def _require_incident_in_tenant(db, incident_id: str, tenant_id: str) -> None:
+def _require_incident_in_tenant(db, incident_id: str, tenant_id: str, workspace_id: str | None = None) -> None:
     """
     Verifies `incident_id` exists AND belongs to `tenant_id`, raising 404 if
     not (never 403 -- "doesn't exist" and "wrong tenant" are intentionally
@@ -1328,10 +1439,17 @@ def _require_incident_in_tenant(db, incident_id: str, tenant_id: str) -> None:
     leaked).
     """
     with db.get_connection() as conn:
-        cursor = conn.execute(
-            "SELECT 1 FROM incident WHERE incident_id = %s AND tenant_id = %s",
-            (incident_id, tenant_id),
-        )
+        if workspace_id:
+            cursor = conn.execute(
+                "SELECT 1 FROM incident WHERE incident_id = %s AND tenant_id = %s "
+                "AND (workspace_id = %s OR workspace_id IS NULL)",
+                (incident_id, tenant_id, workspace_id),
+            )
+        else:
+            cursor = conn.execute(
+                "SELECT 1 FROM incident WHERE incident_id = %s AND tenant_id = %s",
+                (incident_id, tenant_id),
+            )
         if not cursor.fetchone():
             raise HTTPException(status_code=404, detail="Incident not found")
 
@@ -1340,7 +1458,7 @@ def _require_incident_in_tenant(db, incident_id: str, tenant_id: str) -> None:
 def get_commander_pulse(incident_id: str, current_user: User = Depends(get_current_user)):
     from app.domain.commander.status_projector import StatusProjector
     db = get_database()
-    _require_incident_in_tenant(db, incident_id, current_user.tenant_id)
+    _require_incident_in_tenant(db, incident_id, current_user.tenant_id, current_user.workspace_id)
     return StatusProjector(db).get_pulse(incident_id)
 
 

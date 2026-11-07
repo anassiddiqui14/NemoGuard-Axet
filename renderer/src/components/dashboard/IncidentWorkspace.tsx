@@ -277,6 +277,9 @@ export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParen
                         liveEvents={liveEvents}
                         hypothesis={hypothesis}
                         evidence={evidence}
+                        impact={impact}
+                        plan={plan}
+                        incident={selectedIncident}
                         dataLoading={dataLoading}
                         onViewEvidence={() => setIsEvidenceModalOpen(true)}
                     />

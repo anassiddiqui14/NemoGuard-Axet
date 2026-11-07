@@ -30,7 +30,6 @@ import { SettingsPage } from '../pages/SettingsPage/SettingsPage';
  */
 const IntelligencePage = lazy(() => import('../pages/IntelligencePage/IntelligencePage').then((m) => ({ default: m.IntelligencePage })));
 const ScenarioCockpitPage = lazy(() => import('../pages/ScenarioCockpitPage/ScenarioCockpitPage').then((m) => ({ default: m.ScenarioCockpitPage })));
-const AdoptionReadinessPage = lazy(() => import('../pages/AdoptionReadinessPage/AdoptionReadinessPage').then((m) => ({ default: m.AdoptionReadinessPage })));
 const AdminPage = lazy(() => import('../pages/AdminPage/AdminPage').then((m) => ({ default: m.AdminPage })));
 
 function RouteFallback() {
@@ -86,14 +85,6 @@ export function AppRoutes() {
                     element={
                         <Suspense fallback={<RouteFallback />}>
                             <ScenarioCockpitPage />
-                        </Suspense>
-                    }
-                />
-                <Route
-                    path="adoption-readiness"
-                    element={
-                        <Suspense fallback={<RouteFallback />}>
-                            <AdoptionReadinessPage />
                         </Suspense>
                     }
                 />
