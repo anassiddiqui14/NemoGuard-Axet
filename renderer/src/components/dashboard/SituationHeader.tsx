@@ -200,7 +200,7 @@ export function SituationHeader({ selectedIncident, alerts, impact, hypothesis, 
                 <Metric icon={<Layers className="w-3.5 h-3.5" />} label="Alerts" value={alerts.length > 0 ? `${alerts.length}→1` : '—'} sub="consolidated" />
                 <Metric icon={<Briefcase className="w-3.5 h-3.5" />} label="Jobs" value={impact.filter((i) => i.impact_type?.includes('Job')).length || (impact.length > 0 ? 0 : '—')} sub="blocked jobs" accent="text-critical" />
                 <Metric icon={<Layers className="w-3.5 h-3.5" />} label="Products" value={impact.filter((i) => !i.impact_type?.includes('Job')).length || (impact.length > 0 ? 0 : '—')} sub="at risk" accent="text-warning" />
-                <Metric icon={<ShieldAlert className="w-3.5 h-3.5" />} label="Confidence" value={hypothesis ? `${Math.round(hypothesis.confidence_score * 100)}%` : '—'} sub="root cause" accent="text-agent-active" />
+                <Metric icon={<ShieldAlert className="w-3.5 h-3.5" />} label="Confidence" value={hypothesis && hypothesis.status !== 'UNVERIFIED' ? `${Math.round(hypothesis.confidence_score * 100)}%` : '—'} sub={hypothesis?.status === 'UNVERIFIED' ? 'unverified' : 'model estimate'} accent="text-agent-active" />
                 <Metric
                     icon={<Clock className="w-3.5 h-3.5" />}
                     label={selectedIncident?.resolved_at ? 'Resolved In' : 'Elapsed'}

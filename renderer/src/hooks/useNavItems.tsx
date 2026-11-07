@@ -1,4 +1,4 @@
-import { Settings, ShieldCheck } from 'lucide-react';
+import { Home, Inbox, Settings, ShieldCheck } from 'lucide-react';
 import {
     CommandCenterIcon,
     IncidentsIcon,
@@ -37,7 +37,9 @@ export function useNavItems(): NavItem[] {
     const isAdmin = roles.includes('admin');
 
     return [
-        { to: '/app', label: 'Command Center', icon: <CommandCenterIcon className="w-4.5 h-4.5" />, end: true },
+        { to: '/app', label: 'Production Overview', icon: <Home className="w-4.5 h-4.5" />, end: true },
+        { to: '/app/command-center', label: 'Command Center', icon: <CommandCenterIcon className="w-4.5 h-4.5" /> },
+        ...(isAdmin || roles.includes('operator') ? [{ to: '/app/alert-inbox', label: 'Alert Inbox', icon: <Inbox className="w-4.5 h-4.5" /> }] : []),
         { to: '/app/incidents', label: 'Incidents', icon: <IncidentsIcon className="w-4.5 h-4.5" /> },
         { to: '/app/agent-operations', label: 'Agent Operations', icon: <AgentOpsIcon className="w-4.5 h-4.5" /> },
         { to: '/app/intelligence', label: 'Intelligence', icon: <IntelligenceIcon className="w-4.5 h-4.5" /> },

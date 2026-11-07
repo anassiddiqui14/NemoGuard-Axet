@@ -145,7 +145,7 @@ function TopBar({ onSelectIncident, onToggleNav, navCollapsed, onOpenMobileNav, 
                 </motion.div>
                 <div className="min-w-0 flex flex-col justify-center">
                     <h1 className="font-semibold text-text-primary text-[15px] leading-tight tracking-tight">
-                        Nemo<span className="text-primary">Guard</span> <span className="text-text-secondary font-medium">Command Center</span>
+                        Nemo<span className="text-primary">Guard</span> <span className="text-text-secondary font-medium">Production Operations</span>
                     </h1>
                     <p className="text-[11px] text-text-muted leading-tight">Agentic incident response</p>
                 </div>

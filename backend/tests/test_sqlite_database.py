@@ -450,6 +450,7 @@ class TestBootstrapAdmin(unittest.TestCase):
     """
 
     def setUp(self):
+        os.environ.setdefault("JWT_SECRET", "isolated-test-secret-for-sqlite-suite")
         self.tmpdir = tempfile.mkdtemp()
         self.db_path = os.path.join(self.tmpdir, "bootstrap_test.db")
         self.db = SqliteDatabase(self.db_path)

@@ -1,11 +1,13 @@
+import { useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { ResponsiveContainer, Radar, RadarChart, PolarGrid, PolarAngleAxis, Tooltip } from 'recharts';
 import { AgentConstellation, InvestigationChecklist } from '../AgentConstellation';
 import { LiveOperationsConsole } from '../LiveOperationsConsole';
 import { EmptyState, severityPill } from './shared';
 import { InvestigationGlyphIcon } from '../../pages/LandingPage/NemoIcons';
-import { Search, Activity, TrendingUp, ChevronDown, Lightbulb } from 'lucide-react';
+import { Search, Activity, TrendingUp, ChevronDown, Lightbulb, ArrowRightLeft } from 'lucide-react';
 import type { AgentEvent } from '../../hooks/useIncidentEvents';
+import { authFetch } from '../../contexts/AuthGateContext';
 
 function Card({ title, subtitle, right, children, className = '', titleIcon }: { title: string; subtitle?: string; right?: React.ReactNode; children: React.ReactNode; className?: string; titleIcon?: React.ReactNode }) {
     return (
@@ -30,7 +32,75 @@ function Card({ title, subtitle, right, children, className = '', titleIcon }: {
     );
 }
 
-export function AlertsPanel({ alerts, expandedAlert, setExpandedAlert }: { alerts: any[]; expandedAlert: string | null; setExpandedAlert: (id: string | null) => void }) {
+function RecorrelateAlertForm({ incidentId, alertId, onDone }: { incidentId: string; alertId: string; onDone: () => void }) {
+    const [targetIncidentId, setTargetIncidentId] = useState('');
+    const [reason, setReason] = useState('');
+    const [submitting, setSubmitting] = useState(false);
+    const [message, setMessage] = useState('');
+
+    async function submit(event: React.FormEvent) {
+        event.preventDefault();
+        const target = targetIncidentId.trim();
+        const trimmedReason = reason.trim();
+        if (!target || !trimmedReason || submitting) return;
+        setSubmitting(true);
+        setMessage('');
+        try {
+            const response = await authFetch(`/api/v2/incidents/${incidentId}/alerts/${alertId}/recorrelate`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ target_incident_id: target, reason: trimmedReason }),
+            });
+            if (!response.ok) {
+                const body = await response.json().catch(() => ({}));
+                throw new Error(body.detail || 'Re-correlation failed.');
+            }
+            setMessage(`Moved to incident ${target}. This incident keeps its existing evidence and plans unchanged.`);
+            setTargetIncidentId('');
+            setReason('');
+            onDone();
+        } catch (error) {
+            setMessage(error instanceof Error ? error.message : 'Re-correlation failed.');
+        } finally {
+            setSubmitting(false);
+        }
+    }
+
+    return (
+        <form onSubmit={submit} className="mt-3 space-y-2 rounded-lg border border-white/[0.08] bg-black/10 p-3">
+            <div className="flex items-center gap-1.5 text-[10.5px] font-semibold uppercase tracking-wider text-text-muted">
+                <ArrowRightLeft className="h-3 w-3" /> Move to a different incident
+            </div>
+            <p className="text-[11px] text-text-muted">
+                Links this alert to another incident. It does not move or revise this incident's existing evidence, hypotheses, or plans.
+            </p>
+            <input
+                value={targetIncidentId}
+                onChange={(e) => setTargetIncidentId(e.target.value)}
+                placeholder="Target incident ID (e.g. INC-abc123)"
+                className="w-full rounded-md bg-white/[0.04] px-2.5 py-1.5 text-[12px] text-text-primary ring-1 ring-white/[0.08] placeholder:text-text-muted focus:outline-none focus:ring-primary/50"
+            />
+            <textarea
+                value={reason}
+                onChange={(e) => setReason(e.target.value)}
+                maxLength={2000}
+                rows={2}
+                placeholder="Reason for moving this alert (required)"
+                className="w-full rounded-md bg-white/[0.04] px-2.5 py-1.5 text-[12px] text-text-primary ring-1 ring-white/[0.08] placeholder:text-text-muted focus:outline-none focus:ring-primary/50"
+            />
+            <button
+                type="submit"
+                disabled={submitting || !targetIncidentId.trim() || !reason.trim()}
+                className="rounded-md bg-primary px-3 py-1.5 text-[11.5px] font-semibold text-white disabled:opacity-50"
+            >
+                {submitting ? 'Moving…' : 'Move alert'}
+            </button>
+            {message && <p role="status" className="text-[11.5px] text-text-secondary">{message}</p>}
+        </form>
+    );
+}
+
+export function AlertsPanel({ alerts, expandedAlert, setExpandedAlert, incidentId, onRecorrelated }: { alerts: any[]; expandedAlert: string | null; setExpandedAlert: (id: string | null) => void; incidentId?: string | null; onRecorrelated?: () => void }) {
     if (!alerts || alerts.length === 0) return null;
     return (
         <Card title="Consolidated Alerts" subtitle="Downstream alerts dynamically grouped into this incident" right={
@@ -75,6 +145,13 @@ export function AlertsPanel({ alerts, expandedAlert, setExpandedAlert }: { alert
                                     <p className="text-[12px] font-mono text-text-secondary leading-5 whitespace-pre-wrap break-words">
                                         {alt.message}
                                     </p>
+                                    {incidentId && (
+                                        <RecorrelateAlertForm
+                                            incidentId={incidentId}
+                                            alertId={alt.alert_id}
+                                            onDone={() => onRecorrelated?.()}
+                                        />
+                                    )}
                                 </div>
                             )}
                         </div>
@@ -130,7 +207,7 @@ export function AgentAndHypothesisRow({
 
             <Card
                 title="Root-Cause Hypothesis"
-                subtitle="Ranked and evidence-grounded"
+                subtitle={hypothesis?.status === 'UNVERIFIED' ? 'Unverified hypothesis — independent evidence required' : 'Review supporting evidence before taking action'}
                 titleIcon={<InvestigationGlyphIcon className="w-3.5 h-3.5 text-agent-active" />}
                 right={
                     <button onClick={onViewEvidence} className="focus-ring press-scale text-[11px] font-medium px-3 py-1.5 rounded-lg bg-white/[0.03] hover:bg-white/[0.06] ring-1 ring-white/[0.06] transition flex items-center gap-1.5 text-text-secondary">
@@ -177,8 +254,8 @@ export function AgentAndHypothesisRow({
                                         </div>
                                     </div>
                                     <div className="flex-shrink-0 text-right">
-                                        <div className="text-agent-active font-bold text-2xl leading-none tabular-nums">{Math.round((hypothesis.confidence_score || 0) * 100)}%</div>
-                                        <div className="text-[9.5px] text-text-muted mt-0.5 uppercase tracking-wide">confidence</div>
+                                        <div className="text-agent-active font-bold text-2xl leading-none tabular-nums">{hypothesis.status === 'UNVERIFIED' ? '—' : `${Math.round((hypothesis.confidence_score || 0) * 100)}%`}</div>
+                                        <div className="text-[9.5px] text-text-muted mt-0.5 uppercase tracking-wide">{hypothesis.status === 'UNVERIFIED' ? 'unverified' : 'model confidence'}</div>
                                     </div>
                                 </div>
                             </div>
@@ -300,7 +377,7 @@ export function ActivityAndImpactRow({ activeIncidentId, liveEvents, sseStatus, 
                                 ))}
                             </AnimatePresence>
                         ) : (
-                            <div className="text-[12px] text-text-muted py-2">No assets currently affected.</div>
+                            <div className="text-[12px] text-text-muted py-2">No impact data available; affected assets are unknown.</div>
                         )}
                     </div>
                 </div>

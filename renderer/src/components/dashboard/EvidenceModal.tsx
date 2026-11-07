@@ -68,7 +68,7 @@ function HypothesisLedger({ hypotheses }: { hypotheses: any[] }) {
                                 <span className="text-[12.5px] text-text-primary font-medium">{h.statement}</span>
                             </div>
                             <div className="flex items-center gap-3 mt-1 text-[10.5px] text-text-muted">
-                                <span>Confidence: <span className="font-mono text-text-secondary">{confidencePct}%</span></span>
+                                <span>{h.status === 'UNVERIFIED' ? 'Unverified hypothesis' : <>Model confidence: <span className="font-mono text-text-secondary">{confidencePct}%</span></>}</span>
                                 {supporting > 0 && <span className="text-healthy">+{supporting} supporting</span>}
                                 {contradicting > 0 && <span className="text-critical">-{contradicting} contradicting</span>}
                             </div>
@@ -97,7 +97,7 @@ export function EvidenceModal({ hypothesis, hypotheses, evidence, onClose }: { h
             <div className="p-6 overflow-y-auto max-h-[calc(85vh-80px)] space-y-4">
                 <div>
                     <h3 className="font-semibold text-text-primary text-[14px]">Hypothesis: {hypothesis?.title}</h3>
-                    <p className="text-[13px] text-text-secondary mb-4 mt-1 leading-relaxed">{hypothesis?.statement || 'Root cause identified based on logs and metrics.'}</p>
+                    <p className="text-[13px] text-text-secondary mb-4 mt-1 leading-relaxed">{hypothesis?.statement || 'No hypothesis statement available.'}</p>
                 </div>
 
                 {hypotheses && <HypothesisLedger hypotheses={hypotheses} />}

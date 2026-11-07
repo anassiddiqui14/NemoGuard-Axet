@@ -67,7 +67,10 @@ export function useIncidentData(incidentId: string | null) {
           // API already orders by confidence DESC (see /hypotheses endpoint),
           // so hypData[0] is the primary hypothesis and the rest are the
           // ranked alternatives the RCA agent considered and ruled down.
-          const normalized = hypData.map((h: any) => ({
+          const latest = hypData.reduce((value: string, h: any) =>
+            typeof h.created_at === 'string' && h.created_at > value ? h.created_at : value, '');
+          const current = latest ? hypData.filter((h: any) => h.created_at === latest) : hypData;
+          const normalized = [...current].sort((a: any, b: any) => (a.rank_no ?? 0) - (b.rank_no ?? 0)).map((h: any) => ({
             ...h,
             title: h.title || h.statement || 'Identified Root Cause',
             confidence_score: h.confidence_score ?? h.confidence ?? 0,

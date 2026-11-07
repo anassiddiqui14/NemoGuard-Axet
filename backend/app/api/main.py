@@ -238,6 +238,9 @@ async def startup_event():
             )
         """)
 
+    from app.store import alert_inbox
+    alert_inbox.initialize(db)
+
     _bootstrap_admin_if_configured(db)
     print(f"[startup-timing] bootstrap admin complete at +{__import__('time').perf_counter() - _startup_t0:.2f}s")
 
@@ -446,6 +449,80 @@ def get_incident_alerts(incident_id: str):
         cols = [col[0] for col in cursor.description]
         return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
+
+class AlertRecorrelationRequest(BaseModel):
+    target_incident_id: str
+    reason: str
+
+
+@app.post("/api/v2/incidents/{incident_id}/alerts/{alert_id}/recorrelate")
+def recorrelate_alert(
+    incident_id: str, alert_id: str, req: AlertRecorrelationRequest,
+    current_user: User = Depends(require_role("operator")),
+):
+    """
+    Move an alert's correlation link to a different incident, recording the
+    operator's reason on both incidents. This does NOT copy, move, or
+    revise any evidence, hypotheses, or plans already generated against
+    the source incident -- those remain as a historical record of what was
+    investigated under the original (incorrect) correlation. The target
+    incident does not automatically get new evidence derived from this
+    alert; a fresh investigation/triage against the target incident is a
+    separate, deliberate operator action.
+    """
+    reason = req.reason.strip()
+    if not reason or len(reason) > 2000:
+        raise HTTPException(status_code=400, detail="A reason of at most 2000 characters is required")
+    if req.target_incident_id == incident_id:
+        raise HTTPException(status_code=400, detail="Target incident must differ from the current incident")
+
+    db = get_database()
+    now = datetime.now(timezone.utc).isoformat()
+    with db.get_connection() as conn:
+        _require_incident_in_tenant(db, incident_id, current_user.tenant_id)
+        _require_incident_in_tenant(db, req.target_incident_id, current_user.tenant_id)
+
+        link = conn.execute(
+            "SELECT correlation_score, correlation_reasons_json FROM incident_alert "
+            "WHERE incident_id=%s AND alert_id=%s",
+            (incident_id, alert_id),
+        ).fetchone()
+        if not link:
+            raise HTTPException(status_code=404, detail="Alert is not correlated to this incident")
+        if conn.execute(
+            "SELECT 1 FROM incident_alert WHERE incident_id=%s AND alert_id=%s",
+            (req.target_incident_id, alert_id),
+        ).fetchone():
+            raise HTTPException(status_code=409, detail="Alert is already correlated to the target incident")
+
+        # Remove the old link and create the new one atomically, so an
+        # alert is never simultaneously correlated to two incidents nor
+        # orphaned if this request fails partway through.
+        conn.execute(
+            "DELETE FROM incident_alert WHERE incident_id=%s AND alert_id=%s",
+            (incident_id, alert_id),
+        )
+        conn.execute(
+            "INSERT INTO incident_alert (incident_id, alert_id, correlation_score, correlation_reasons_json, added_at) "
+            "VALUES (%s,%s,%s,%s,%s)",
+            (req.target_incident_id, alert_id, link[0],
+             json.dumps([f"Operator re-correlation: {reason}"]), now),
+        )
+
+        for target, other, direction in (
+            (incident_id, req.target_incident_id, "moved to"),
+            (req.target_incident_id, incident_id, "moved from"),
+        ):
+            conn.execute(
+                "INSERT INTO audit_event (audit_event_id, incident_id, actor_type, actor_id, event_type, event_summary, created_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (f"AUD-{uuid.uuid4().hex[:8]}", target, "HUMAN", current_user.user_id,
+                 "ALERT_RECORRELATED",
+                 f"Alert {alert_id} {direction} incident {other} by operator. Reason: {reason}",
+                 now),
+            )
+    return {"status": "recorrelated", "alert_id": alert_id, "from_incident_id": incident_id, "to_incident_id": req.target_incident_id}
+
 @app.get("/api/v2/alerts")
 def get_all_alerts():
     db = get_database()
@@ -641,9 +718,234 @@ async def ingest_outlook_bridge(payload: dict, request: Request):
             or len(subject) > 2000 or not isinstance(body, str) or not body.strip()
             or "\x00" in subject or "\x00" in body or len(body.encode("utf-8")) > 400000):
         raise HTTPException(status_code=400, detail="Invalid Outlook email subject or body")
+    delivery_key = request.headers.get("Idempotency-Key", "").strip()
+    if not delivery_key or len(delivery_key) > 200 or not delivery_key.isascii():
+        raise HTTPException(status_code=400, detail="A stable ASCII Idempotency-Key of at most 200 characters is required")
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    from app.store import alert_inbox
+    db = get_database()
+    if not alert_inbox.receive(db, delivery_key, digest, subject, body, canonical):
+        raise HTTPException(status_code=409, detail="Idempotency-Key was already used with a different payload")
     request.state.reviewed_documents = [{"kind": "EMAIL_BODY", "title": subject[:200] or "Outlook email", "content": body}]
     request.state.reviewed_by = "automatic-outlook-bridge"
-    return await ingest_webhook(payload, request)
+    try:
+        result = await ingest_webhook(payload, request)
+    except Exception:
+        alert_inbox.record_result(db, delivery_key, {"status": "error", "message": "Processing failed; delivery can be retried."})
+        raise
+    alert_inbox.record_result(db, delivery_key, result)
+    return result
+
+
+@app.post("/api/v2/ingest/outlook-bridge-heartbeat")
+def outlook_bridge_heartbeat(payload: dict, request: Request):
+    """Record a completed Outlook folder scan without email content."""
+    secret = os.environ.get("NEMOGUARD_WEBHOOK_SECRET", "")
+    supplied = request.headers.get("X-NemoGuard-Webhook-Secret", "")
+    if not secret:
+        raise HTTPException(status_code=503, detail="Webhook ingestion is not configured")
+    if not hmac.compare_digest(supplied.encode("utf-8"), secret.encode("utf-8")):
+        raise HTTPException(status_code=401, detail="Invalid webhook credentials")
+    counts = [payload.get(key) for key in ("pending", "blocked", "baseline")]
+    if any(type(value) is not int or value < 0 or value > 1000000000 for value in counts):
+        raise HTTPException(status_code=400, detail="Invalid bridge counts")
+    from app.store import alert_inbox
+    tenant, workspace = alert_inbox.scope()
+    with get_database().get_connection() as conn:
+        conn.execute(
+            "INSERT INTO outlook_bridge_heartbeat "
+            "(tenant_id, workspace_id, observed_at, pending_count, blocked_count, baseline_count) "
+            "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (tenant_id, workspace_id) DO UPDATE SET "
+            "observed_at=excluded.observed_at, pending_count=excluded.pending_count, "
+            "blocked_count=excluded.blocked_count, baseline_count=excluded.baseline_count",
+            (tenant, workspace, datetime.now(timezone.utc).isoformat(), *counts),
+        )
+    return {"status": "recorded"}
+
+
+@app.get("/api/v2/outlook-bridge-health")
+def outlook_bridge_health(current_user: User = Depends(require_role("operator"))):
+    with get_database().get_connection() as conn:
+        row = conn.execute(
+            "SELECT observed_at, pending_count, blocked_count, baseline_count "
+            "FROM outlook_bridge_heartbeat WHERE tenant_id=%s AND workspace_id=%s",
+            (current_user.tenant_id, current_user.workspace_id),
+        ).fetchone()
+    data = None if not row else {
+        "last_scan_at": row[0], "pending": row[1], "blocked": row[2], "baseline": row[3],
+    }
+    return JSONResponse({"last_report": data}, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/v2/outlook-inbox")
+def list_outlook_inbox(current_user: User = Depends(require_role("operator"))):
+    from app.store import alert_inbox
+    items = alert_inbox.list_items(get_database(), current_user.tenant_id, current_user.workspace_id)
+    return JSONResponse({"items": items, "limit": 200}, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/v2/outlook-inbox/{delivery_key}")
+def get_outlook_inbox_item(delivery_key: str, current_user: User = Depends(require_role("operator"))):
+    db = get_database()
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT subject, body, state, received_at, updated_at, result_json FROM outlook_inbox "
+            "WHERE delivery_key=%s AND tenant_id=%s AND workspace_id=%s",
+            (delivery_key, current_user.tenant_id, current_user.workspace_id),
+        ).fetchone()
+        reviews = conn.execute(
+            "SELECT assessment, reason, actor_id, created_at FROM outlook_inbox_review "
+            "WHERE delivery_key=%s AND tenant_id=%s AND workspace_id=%s ORDER BY created_at DESC",
+            (delivery_key, current_user.tenant_id, current_user.workspace_id),
+        ).fetchall() if row else []
+        promotion = conn.execute(
+            "SELECT alert_id, actor_id, reason, created_at FROM outlook_inbox_promotion WHERE delivery_key=%s",
+            (delivery_key,),
+        ).fetchone() if row else None
+    if not row:
+        raise HTTPException(status_code=404, detail="Inbox item not found")
+    return JSONResponse({
+        "delivery_key": delivery_key, "subject": row[0], "body": row[1], "state": row[2],
+        "received_at": row[3], "updated_at": row[4], "result": json.loads(row[5]),
+        "reviews": [{"assessment": r[0], "reason": r[1], "actor_id": r[2], "created_at": r[3]} for r in reviews],
+        "promotion": None if not promotion else {
+            "alert_id": promotion[0], "actor_id": promotion[1], "reason": promotion[2], "created_at": promotion[3],
+        },
+    }, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/v2/outlook-inbox/{delivery_key}/retry")
+async def retry_outlook_inbox_item(
+    delivery_key: str,
+    current_user: User = Depends(require_role("operator")),
+):
+    """Retry a retained delivery using its original payload and idempotency key."""
+    from app.store import alert_inbox
+    if (current_user.tenant_id, current_user.workspace_id) != alert_inbox.scope():
+        raise HTTPException(status_code=404, detail="Inbox item not found")
+    db = get_database()
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT i.state, i.payload_hash, p.payload_json FROM outlook_inbox i "
+            "LEFT JOIN outlook_inbox_payload p ON p.delivery_key=i.delivery_key "
+            "WHERE i.delivery_key=%s AND i.tenant_id=%s AND i.workspace_id=%s",
+            (delivery_key, current_user.tenant_id, current_user.workspace_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Inbox item not found")
+        if row[0] not in ("received", "failed"):
+            raise HTTPException(status_code=409, detail="Only failed or unfinished deliveries can be retried")
+        if not row[2] or hashlib.sha256(row[2].encode("utf-8")).hexdigest() != row[1]:
+            raise HTTPException(status_code=409, detail="Original delivery payload is unavailable or invalid")
+        secret = os.environ.get("NEMOGUARD_WEBHOOK_SECRET", "")
+        if not secret:
+            raise HTTPException(status_code=503, detail="Webhook ingestion is not configured")
+        conn.execute(
+            "INSERT INTO outlook_inbox_retry "
+            "(retry_id, delivery_key, tenant_id, workspace_id, actor_id, created_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s)",
+            (f"RETRY-{uuid.uuid4().hex}", delivery_key, current_user.tenant_id,
+             current_user.workspace_id, current_user.user_id, datetime.now(timezone.utc).isoformat()),
+        )
+        payload = json.loads(row[2])
+    internal_request = Request({
+        "type": "http", "method": "POST", "path": "/api/v2/ingest/outlook-bridge",
+        "headers": [
+            (b"x-nemoguard-webhook-secret", secret.encode("utf-8")),
+            (b"idempotency-key", delivery_key.encode("ascii")),
+        ],
+    })
+    return await ingest_outlook_bridge(payload, internal_request)
+
+
+class OutlookInboxReview(BaseModel):
+    assessment: str
+    reason: str
+
+
+@app.post("/api/v2/outlook-inbox/{delivery_key}/reviews")
+def review_outlook_inbox_item(
+    delivery_key: str, review: OutlookInboxReview,
+    current_user: User = Depends(require_role("operator")),
+):
+    if review.assessment not in ("alert", "noise", "uncertain"):
+        raise HTTPException(status_code=400, detail="Invalid assessment")
+    reason = review.reason.strip()
+    if not reason or len(reason) > 2000:
+        raise HTTPException(status_code=400, detail="A reason of at most 2000 characters is required")
+    db = get_database()
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM outlook_inbox WHERE delivery_key=%s AND tenant_id=%s AND workspace_id=%s",
+            (delivery_key, current_user.tenant_id, current_user.workspace_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Inbox item not found")
+        conn.execute(
+            "INSERT INTO outlook_inbox_review "
+            "(review_id, delivery_key, tenant_id, workspace_id, assessment, reason, actor_id, created_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+            (f"REV-{uuid.uuid4().hex}", delivery_key, current_user.tenant_id,
+             current_user.workspace_id, review.assessment, reason, current_user.user_id,
+             datetime.now(timezone.utc).isoformat()),
+        )
+    return {"status": "assessment_recorded"}
+
+
+class OutlookInboxPromotion(BaseModel):
+    severity: str
+    reason: str
+
+
+@app.post("/api/v2/outlook-inbox/{delivery_key}/promote")
+def promote_outlook_inbox_item(
+    delivery_key: str, promotion: OutlookInboxPromotion,
+    current_user: User = Depends(require_role("operator")),
+):
+    if promotion.severity not in ("info", "warning", "high", "critical"):
+        raise HTTPException(status_code=400, detail="Invalid severity")
+    reason = promotion.reason.strip()
+    if not reason or len(reason) > 2000:
+        raise HTTPException(status_code=400, detail="A reason of at most 2000 characters is required")
+    timestamp = datetime.now(timezone.utc).isoformat()
+    alert_id = f"WEB-ALT-{uuid.uuid4().hex}"
+    with get_database().get_connection() as conn:
+        claimed = conn.execute(
+            "UPDATE outlook_inbox SET state=%s, updated_at=%s "
+            "WHERE delivery_key=%s AND tenant_id=%s AND workspace_id=%s AND state=%s",
+            ("promoted", timestamp, delivery_key, current_user.tenant_id,
+             current_user.workspace_id, "needs_review"),
+        )
+        item = conn.execute(
+            "SELECT subject, body, state, result_json FROM outlook_inbox "
+            "WHERE delivery_key=%s AND tenant_id=%s AND workspace_id=%s",
+            (delivery_key, current_user.tenant_id, current_user.workspace_id),
+        ).fetchone()
+        if not item:
+            raise HTTPException(status_code=404, detail="Inbox item not found")
+        if claimed.rowcount != 1 or json.loads(item[3]).get("status") != "ignored":
+            raise HTTPException(status_code=409, detail="Only ignored emails can be promoted")
+        conn.execute(
+            "INSERT INTO alert (alert_id, tenant_id, workspace_id, opened_ts, severity, alert_type, source_system, message, status) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (alert_id, current_user.tenant_id, current_user.workspace_id, timestamp,
+             promotion.severity, "OPERATOR_REVIEWED_EMAIL", "Outlook email",
+             item[0][:2000] or "Operator-promoted email alert", "open"),
+        )
+        conn.execute(
+            "INSERT INTO reviewed_alert_document "
+            "(document_id, alert_id, document_kind, title, content, submitted_by, created_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            (f"DOC-{uuid.uuid4().hex}", alert_id, "EMAIL_BODY",
+             item[0][:200] or "Outlook email", item[1], "automatic-outlook-bridge", timestamp),
+        )
+        conn.execute(
+            "INSERT INTO outlook_inbox_promotion (delivery_key, alert_id, actor_id, reason, created_at) "
+            "VALUES (%s,%s,%s,%s,%s)",
+            (delivery_key, alert_id, current_user.user_id, reason, timestamp),
+        )
+    return {"status": "promoted", "alert_id": alert_id}
 
 
 @app.post("/api/v2/ingest/email-replay")

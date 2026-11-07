@@ -282,7 +282,13 @@ export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParen
                     />
                 }
                 evidence={
-                    <AlertsPanel alerts={alerts} expandedAlert={expandedAlert} setExpandedAlert={setExpandedAlert} />
+                    <AlertsPanel
+                        alerts={alerts}
+                        expandedAlert={expandedAlert}
+                        setExpandedAlert={setExpandedAlert}
+                        incidentId={incidentId}
+                        onRecorrelated={onRefreshParent}
+                    />
                 }
                 activity={
                     <ActivityAndImpactRow

@@ -1,11 +1,13 @@
 import { Suspense, lazy } from 'react';
-import { Routes, Route, Navigate } from 'react-router-dom';
+import { Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { ProgressBar } from '../design-system/components/Dropdown';
 import { RequireAuth } from './RequireAuth';
 import { AppShell } from '../components/shell/AppShell';
 import { LandingPage } from '../pages/LandingPage/LandingPage';
 import { LoginPage } from '../pages/LoginPage/LoginPage';
 import { Dashboard } from '../components/Dashboard';
+import { ProductionOverviewPage } from '../pages/ProductionOverviewPage/ProductionOverviewPage';
+import { AlertInboxPage } from '../pages/AlertInboxPage/AlertInboxPage';
 import { IncidentsPage } from '../pages/IncidentsPage/IncidentsPage';
 import { AgentOperationsPage } from '../pages/AgentOperationsPage/AgentOperationsPage';
 import { SettingsPage } from '../pages/SettingsPage/SettingsPage';
@@ -45,6 +47,14 @@ function RouteFallback() {
     );
 }
 
+function AppHome() {
+    const location = useLocation();
+    if (new URLSearchParams(location.search).has('incident')) {
+        return <Navigate to={`/app/command-center${location.search}${location.hash}`} replace />;
+    }
+    return <ProductionOverviewPage />;
+}
+
 export function AppRoutes() {
     return (
         <Routes>
@@ -58,7 +68,9 @@ export function AppRoutes() {
                     </RequireAuth>
                 }
             >
-                <Route index element={<Dashboard />} />
+                <Route index element={<AppHome />} />
+                <Route path="command-center" element={<Dashboard />} />
+                <Route path="alert-inbox" element={<AlertInboxPage />} />
                 <Route path="incidents" element={<IncidentsPage />} />
                 <Route path="agent-operations" element={<AgentOperationsPage />} />
                 <Route
