@@ -113,10 +113,8 @@ function NotificationBell({ onSelectIncident }: { onSelectIncident: (id: string)
 }
 
 function TopBar({ onSelectIncident, onToggleNav, navCollapsed, onOpenMobileNav, onOpenCommandPalette }: { onSelectIncident: (id: string) => void; onToggleNav: () => void; navCollapsed: boolean; onOpenMobileNav: () => void; onOpenCommandPalette: () => void }) {
-    const shortcutLabel = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/i.test(navigator.platform) ? '⌘K' : 'Ctrl K';
-
     return (
-        <div className="h-[64px] flex items-center justify-between px-4 sm:px-5 lg:px-6 flex-shrink-0 border-b border-[#0F3F32]/[0.06] bg-[#F3F6F2]/95 backdrop-blur-xl z-20 relative">
+        <div className="h-[68px] flex items-center justify-between px-4 sm:px-6 flex-shrink-0 border-b border-[#0F3F32]/10 bg-[#FCFDFB] z-20 relative">
             <div className="flex items-center gap-2.5 min-w-0">
                 {/*
                  * UI MODERNIZATION (Phase 4): mobile/tablet hamburger --
@@ -141,15 +139,15 @@ function TopBar({ onSelectIncident, onToggleNav, navCollapsed, onOpenMobileNav, 
                 <motion.div
                     whileHover={{ scale: 1.06 }}
                     transition={{ type: 'spring', stiffness: 300, damping: 15 }}
-                    className="relative flex items-center justify-center w-8 h-8 rounded-xl bg-primary/10 ring-1 ring-primary/20 text-primary"
+                    className="relative flex items-center justify-center w-9 h-9 rounded-xl bg-primary/10 ring-1 ring-primary/25 text-primary"
                 >
-                    <Logomark className="w-4.5 h-4.5" />
+                    <Logomark className="w-5 h-5" />
                 </motion.div>
-                <div className="min-w-0 flex items-center gap-2.5">
-                    <h1 className="font-bold text-[#13231E] text-[16px] leading-tight tracking-[-0.02em]">
+                <div className="min-w-0 flex flex-col justify-center">
+                    <h1 className="font-semibold text-[#13231E] text-[15px] leading-tight tracking-tight">
                         Nemo<span className="text-[#0C6F58]">Guard</span>
                     </h1>
-                    <span className="hidden sm:inline-flex rounded-full bg-[#E1F3EC] px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.08em] text-[#0C6F58]">Production</span>
+                    <p className="text-[11px] text-[#62716B] leading-tight">Production operations</p>
                 </div>
             </div>
 
@@ -164,12 +162,15 @@ function TopBar({ onSelectIncident, onToggleNav, navCollapsed, onOpenMobileNav, 
                  */}
                 <button
                     onClick={onOpenCommandPalette}
-                    className="relative hidden lg:flex items-center gap-2 pl-9 pr-3 py-2 bg-white/75 border border-[#0F3F32]/10 rounded-xl text-[12.5px] text-[#62716B] hover:text-[#13231E] hover:bg-white w-64 xl:w-72 transition-all text-left shadow-[0_8px_24px_-22px_rgba(7,63,50,.45)]"
+                    className="relative hidden lg:flex items-center gap-2 pl-8 pr-3 py-2 bg-[#EDF3EE] border border-[#0F3F32]/10 rounded-xl text-[13px] text-[#62716B] hover:text-[#13231E] hover:bg-[#E1F3EC] w-56 transition-all text-left"
                 >
                     <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-[#62716B]" />
                     <span className="flex-1">Search operations…</span>
-                    <kbd className="text-[9.5px] font-mono px-1.5 py-0.5 rounded ring-1 ring-[#0F3F32]/10 flex-shrink-0">{shortcutLabel}</kbd>
+                    <kbd className="text-[9.5px] font-mono px-1 py-0.5 rounded ring-1 ring-[#0F3F32]/10 flex-shrink-0">⌘K</kbd>
                 </button>
+                <span className="hidden md:inline-flex items-center rounded-xl bg-[#E1F3EC] px-3 py-2 text-[12px] font-semibold text-[#0C6F58]">Production</span>
+                <span className="hidden xl:inline-flex items-center rounded-xl border border-[#0F3F32]/10 bg-[#FCFDFB] px-3 py-2 text-[12px] font-medium text-[#62716B]">Last 30 days</span>
+
                 <ThemeToggle />
                 <NotificationBell onSelectIncident={onSelectIncident} />
                 <UserMenu />
@@ -184,10 +185,7 @@ export function AppShell() {
     // hidden overlay drawer that required an extra click before every
     // navigation) -- collapsed state persists across sessions via
     // localStorage so a user's preference sticks.
-    const [navCollapsed, setNavCollapsed] = useState(() => {
-        const stored = localStorage.getItem('nemoguard_nav_collapsed');
-        return stored == null ? true : stored === '1';
-    });
+    const [navCollapsed, setNavCollapsed] = useState(() => localStorage.getItem('nemoguard_nav_collapsed') === '1');
     const [mobileNavOpen, setMobileNavOpen] = useState(false);
     const [paletteKey, setPaletteKey] = useState(0);
 

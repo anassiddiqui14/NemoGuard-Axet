@@ -25,11 +25,11 @@ export function GlobalNavRail({ collapsed }: Props) {
     return (
         <motion.aside
             initial={false}
-            animate={{ width: collapsed ? 74 : 220 }}
+            animate={{ width: collapsed ? 74 : 236 }}
             transition={{ type: 'spring', stiffness: 300, damping: 32 }}
-            className="hidden md:flex flex-col flex-shrink-0 h-full overflow-hidden border-r border-white/[0.06] bg-[#073F32] shadow-[10px_0_28px_-30px_rgba(7,63,50,.8)]"
+            className="hidden md:flex flex-col flex-shrink-0 h-full overflow-hidden border-r border-white/10 bg-[#073F32]"
         >
-            <nav className={`flex-1 py-3.5 space-y-1.5 overflow-y-auto ${collapsed ? 'px-2' : 'px-2.5'}`}>
+            <nav className={`flex-1 py-3 space-y-1 overflow-y-auto ${collapsed ? 'px-2' : 'px-2.5'}`}>
                 {items.map((item) => {
                     const link = (
                         <NavLink
