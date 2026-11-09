@@ -31,6 +31,7 @@ export function MobileNavDrawer({ open, onClose }: { open: boolean; onClose: () 
         if (!open) return;
 
         const previousOverflow = document.body.style.overflow;
+        const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
         document.body.style.overflow = 'hidden';
         panelRef.current?.focus();
 
@@ -46,7 +47,7 @@ export function MobileNavDrawer({ open, onClose }: { open: boolean; onClose: () 
             if (focusable.length === 0) return;
             const first = focusable[0];
             const last = focusable[focusable.length - 1];
-            if (e.shiftKey && document.activeElement === first) {
+            if (e.shiftKey && (document.activeElement === first || document.activeElement === panelRef.current)) {
                 e.preventDefault();
                 last.focus();
             } else if (!e.shiftKey && document.activeElement === last) {
@@ -59,6 +60,7 @@ export function MobileNavDrawer({ open, onClose }: { open: boolean; onClose: () 
         return () => {
             document.removeEventListener('keydown', handleKeyDown);
             document.body.style.overflow = previousOverflow;
+            if (previousFocus?.isConnected) previousFocus.focus();
         };
     }, [open, onClose]);
 

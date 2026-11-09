@@ -15,7 +15,6 @@ import {
     MessageCircle,
     RefreshCw,
     ShieldCheck,
-    Sparkles,
     TriangleAlert,
     Workflow,
     Wrench,
@@ -125,6 +124,15 @@ type OperationsSnapshot = {
         baseline: number;
     } | null;
 };
+
+function CommanderSignalIcon() {
+    return (
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true" className="h-6 w-6 motion-safe:animate-[v22ContentEnter_400ms_ease-out_both]">
+            <circle cx="12" cy="12" r="2.5" fill="currentColor" />
+            <path d="M5.5 5.5a9.2 9.2 0 0 1 13 0M5.5 18.5a9.2 9.2 0 0 0 13 0M8 8a5.7 5.7 0 0 1 8 0M8 16a5.7 5.7 0 0 0 8 0" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+        </svg>
+    );
+}
 
 function relativeTime(value?: string | null) {
     if (!value) return 'not recorded';
@@ -286,8 +294,14 @@ export function ProductionOverviewPage() {
 
     if (!snapshot && loading) {
         return (
-            <main className="v22-canvas h-full overflow-y-auto px-4 py-5 sm:px-7 sm:py-7">
-                <div className="mx-auto max-w-[1600px] animate-pulse space-y-5">
+            <main className="v22-canvas h-full overflow-y-auto px-4 py-5 sm:px-7 sm:py-7" aria-busy="true">
+                <div className="mx-auto max-w-[1600px]">
+                    <p role="status" className="mb-4 flex items-center gap-2 text-sm font-medium text-[#62716B]">
+                        <span aria-hidden="true" className="h-2 w-2 rounded-full bg-[#0C6F58] motion-safe:animate-pulse" />
+                        Loading the operations snapshot…
+                    </p>
+                </div>
+                <div aria-hidden="true" className="mx-auto max-w-[1600px] motion-safe:animate-pulse space-y-5">
                     <div className="h-12 w-72 rounded-2xl bg-[#DDE6E0]" />
                     <div className="grid grid-cols-1 gap-5 xl:grid-cols-12">
                         <div className="h-72 rounded-[24px] bg-[#DDE6E0] xl:col-span-8" />
@@ -339,12 +353,12 @@ export function ProductionOverviewPage() {
                 )}
 
                 <div className="grid grid-cols-1 gap-5 xl:grid-cols-12">
-                    <Surface className="relative overflow-hidden bg-[#073F32] p-6 text-white xl:col-span-8 sm:p-7">
+                    <Surface variant="brand" className="relative overflow-hidden p-6 text-white xl:col-span-8 sm:p-7">
                         <div className="absolute -right-20 -top-24 h-72 w-72 rounded-full bg-[#8FE4C9]/15 blur-3xl" />
                         <div className="absolute -bottom-32 left-1/3 h-64 w-64 rounded-full bg-[#15876D]/20 blur-3xl" />
                         <div className="relative flex min-h-[250px] flex-col justify-between gap-8">
                             <div className="flex items-center justify-between gap-4">
-                                <span className="flex h-11 w-11 items-center justify-center rounded-2xl border border-white/10 bg-white/10 text-[#8FE4C9]"><Sparkles size={20} /></span>
+                                <span className="flex h-11 w-11 items-center justify-center rounded-2xl border border-white/10 bg-white/10 text-[#8FE4C9]"><CommanderSignalIcon /></span>
                                 <span className="rounded-full border border-white/10 bg-white/[0.08] px-3 py-1.5 text-[10.5px] font-semibold text-white/70">Deterministic Commander Brief</span>
                             </div>
                             <div>

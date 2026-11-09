@@ -20,6 +20,35 @@ function Ring({ children, ...props }: SVGProps<SVGSVGElement> & { children: Reac
     );
 }
 
+export function OverviewIcon(props: SVGProps<SVGSVGElement>) {
+    return (
+        <Ring {...props}>
+            <path d="M5.8 9.4 10 5.8l4.2 3.6v4.8H5.8V9.4Z" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round" />
+            <path d="M8.7 14.2v-3h2.6v3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+        </Ring>
+    );
+}
+
+export function AlertInboxIcon(props: SVGProps<SVGSVGElement>) {
+    return (
+        <Ring {...props}>
+            <path d="M5.3 9.2 6.8 6h6.4l1.5 3.2v4.5H5.3V9.2Z" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round" />
+            <path d="M5.5 10h2.7l.8 1.2h2l.8-1.2h2.7" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+        </Ring>
+    );
+}
+
+export function PreferencesIcon(props: SVGProps<SVGSVGElement>) {
+    return (
+        <Ring {...props}>
+            <path d="M5.8 7h8.4M5.8 10h8.4M5.8 13h8.4" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+            <circle cx="8" cy="7" r="1.2" fill="currentColor" />
+            <circle cx="12" cy="10" r="1.2" fill="currentColor" />
+            <circle cx="8.8" cy="13" r="1.2" fill="currentColor" />
+        </Ring>
+    );
+}
+
 export function CommandCenterIcon(props: SVGProps<SVGSVGElement>) {
     return (
         <Ring {...props}>

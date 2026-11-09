@@ -476,6 +476,14 @@
     box-shadow: var(--v22-shadow);
   }
 
+  /* Higher specificity than the default card prevents its light background
+     from overriding brand surfaces, regardless of utility generation order. */
+  .v22-card.v22-card-brand {
+    background: var(--v22-brand-deep);
+    border-color: rgba(255, 255, 255, 0.14);
+    color: #fff;
+  }
+
   .v22-card-muted {
     background: var(--v22-surface-muted);
     border: 1px solid var(--v22-border);

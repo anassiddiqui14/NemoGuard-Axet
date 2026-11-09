@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useCallback, useState } from 'react';
 import { Outlet, useNavigate } from 'react-router-dom';
-import { Search, Bell, Sun, Moon, Clock, FileCheck2, PanelLeftClose, PanelLeftOpen, Menu } from 'lucide-react';
+import { Search, Bell, Sun, Moon, Clock, FileCheck2, Menu } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { Toaster } from 'react-hot-toast';
 import { useTheme } from '../../contexts/ThemeContext';
@@ -112,29 +112,12 @@ function NotificationBell({ onSelectIncident }: { onSelectIncident: (id: string)
     );
 }
 
-function TopBar({ onSelectIncident, onToggleNav, navCollapsed, onOpenMobileNav, onOpenCommandPalette }: { onSelectIncident: (id: string) => void; onToggleNav: () => void; navCollapsed: boolean; onOpenMobileNav: () => void; onOpenCommandPalette: () => void }) {
+function TopBar({ onSelectIncident, onOpenMobileNav, onOpenCommandPalette }: { onSelectIncident: (id: string) => void; onOpenMobileNav: () => void; onOpenCommandPalette: () => void }) {
     return (
         <div className="h-[68px] flex items-center justify-between px-4 sm:px-6 flex-shrink-0 border-b border-[#0F3F32]/10 bg-[#FCFDFB] z-20 relative">
             <div className="flex items-center gap-2.5 min-w-0">
-                {/*
-                 * UI MODERNIZATION (Phase 4): mobile/tablet hamburger --
-                 * previously there was no way to open navigation at all
-                 * below the md breakpoint, since GlobalNavRail is
-                 * `hidden md:flex` with no replacement. This button is the
-                 * inverse visibility of the desktop collapse toggle below
-                 * (md:hidden here, hidden md:inline-flex there) so exactly
-                 * one navigation control shows at any given width.
-                 *
-                 * Both nav toggles below now use IconButton (spec Section
-                 * 18/73) -- the mobile one already had aria-label/title,
-                 * but the desktop one previously had `title` only, with no
-                 * `aria-label`.
-                 */}
                 <IconButton onClick={onOpenMobileNav} label="Open navigation" className="md:hidden -ml-1 mr-1 flex-shrink-0">
                     <Menu className="w-4.5 h-4.5" />
-                </IconButton>
-                <IconButton onClick={onToggleNav} label={navCollapsed ? 'Expand navigation' : 'Collapse navigation'} className="hidden md:inline-flex -ml-1 mr-1 flex-shrink-0">
-                    {navCollapsed ? <PanelLeftOpen className="w-4.5 h-4.5" /> : <PanelLeftClose className="w-4.5 h-4.5" />}
                 </IconButton>
                 <motion.div
                     whileHover={{ scale: 1.06 }}
@@ -181,29 +164,17 @@ function TopBar({ onSelectIncident, onToggleNav, navCollapsed, onOpenMobileNav, 
 
 export function AppShell() {
     const navigate = useNavigate();
-    // The nav rail is now a persistent, collapsible sidebar (instead of a
-    // hidden overlay drawer that required an extra click before every
-    // navigation) -- collapsed state persists across sessions via
-    // localStorage so a user's preference sticks.
-    const [navCollapsed, setNavCollapsed] = useState(() => localStorage.getItem('nemoguard_nav_collapsed') === '1');
     const [mobileNavOpen, setMobileNavOpen] = useState(false);
     const [paletteKey, setPaletteKey] = useState(0);
+    const closeMobileNav = useCallback(() => setMobileNavOpen(false), []);
 
     const handleSelectIncident = (incidentId: string) => {
         navigate(`/app?incident=${encodeURIComponent(incidentId)}`);
     };
 
-    const toggleNav = () => {
-        setNavCollapsed((prev) => {
-            const next = !prev;
-            localStorage.setItem('nemoguard_nav_collapsed', next ? '1' : '0');
-            return next;
-        });
-    };
-
     return (
         <div className="flex flex-col h-screen w-full bg-[#F3F6F2] overflow-hidden font-sans">
-            <MobileNavDrawer open={mobileNavOpen} onClose={() => setMobileNavOpen(false)} />
+            <MobileNavDrawer open={mobileNavOpen} onClose={closeMobileNav} />
             {/*
              * PHASE 1 FIX (NemoGuard UI Modernization Spec, Section 46/13):
              * <Toaster/> was previously mounted only inside Dashboard.tsx,
@@ -232,8 +203,6 @@ export function AppShell() {
             />
             <TopBar
                 onSelectIncident={handleSelectIncident}
-                onToggleNav={toggleNav}
-                navCollapsed={navCollapsed}
                 onOpenMobileNav={() => setMobileNavOpen(true)}
                 onOpenCommandPalette={() => setPaletteKey((k) => k + 1)}
             />
@@ -248,7 +217,7 @@ export function AppShell() {
              */}
             <CommandPalette openSignal={paletteKey} />
             <div className="flex flex-1 min-h-0 overflow-hidden">
-                <GlobalNavRail collapsed={navCollapsed} />
+                <GlobalNavRail />
                 <main className="flex-1 overflow-hidden">
                     <Outlet />
                 </main>
