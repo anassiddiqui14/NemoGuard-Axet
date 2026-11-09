@@ -43,6 +43,9 @@ from app.api.auth import (
 
 app = FastAPI(title="NemoGuard - Pipeline Incident Commander", version="2.0.0")
 
+from app.api.incident_knowledge import router as incident_knowledge_router
+app.include_router(incident_knowledge_router)
+
 _startup_t0 = __import__("time").perf_counter()
 setup_telemetry("nemoguard_api")
 print(f"[startup-timing] telemetry setup complete at +{__import__('time').perf_counter() - _startup_t0:.2f}s")
@@ -240,6 +243,8 @@ async def startup_event():
 
     from app.store import alert_inbox
     alert_inbox.initialize(db)
+    from app.domain import incident_knowledge
+    incident_knowledge.initialize(db)
 
     _bootstrap_admin_if_configured(db)
     print(f"[startup-timing] bootstrap admin complete at +{__import__('time').perf_counter() - _startup_t0:.2f}s")
@@ -323,6 +328,7 @@ def get_status():
         "inference_provider": "axet" if inference_status == "configured" else "not_configured",
         "inference_status": inference_status,
         "outlook_bridge_contract": 1,
+        "outlook_bridge_attachments": True,
         "last_checked_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -756,6 +762,11 @@ async def ingest_outlook_bridge(payload: dict, request: Request):
             or len(subject) > 2000 or not isinstance(body, str) or not body.strip()
             or "\x00" in subject or "\x00" in body or len(body.encode("utf-8")) > 400000):
         raise HTTPException(status_code=400, detail="Invalid Outlook email subject or body")
+    from app.domain.outlook_attachments import validate_attachments
+    try:
+        attachments = validate_attachments(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     delivery_key = request.headers.get("Idempotency-Key", "").strip()
     if not delivery_key or len(delivery_key) > 200 or not delivery_key.isascii():
         raise HTTPException(status_code=400, detail="A stable ASCII Idempotency-Key of at most 200 characters is required")
@@ -765,7 +776,7 @@ async def ingest_outlook_bridge(payload: dict, request: Request):
     db = get_database()
     if not alert_inbox.receive(db, delivery_key, digest, subject, body, canonical):
         raise HTTPException(status_code=409, detail="Idempotency-Key was already used with a different payload")
-    request.state.reviewed_documents = [{"kind": "EMAIL_BODY", "title": subject[:200] or "Outlook email", "content": body}]
+    request.state.reviewed_documents = [{"kind": "EMAIL_BODY", "title": subject[:200] or "Outlook email", "content": body}, *attachments]
     request.state.reviewed_by = "automatic-outlook-bridge"
     try:
         result = await ingest_webhook(payload, request)
@@ -841,10 +852,23 @@ def get_outlook_inbox_item(delivery_key: str, current_user: User = Depends(requi
             "SELECT alert_id, actor_id, reason, created_at FROM outlook_inbox_promotion WHERE delivery_key=%s",
             (delivery_key,),
         ).fetchone() if row else None
+        payload_row = conn.execute(
+            "SELECT p.payload_json, i.payload_hash FROM outlook_inbox_payload p "
+            "JOIN outlook_inbox i ON i.delivery_key=p.delivery_key "
+            "WHERE i.delivery_key=%s AND i.tenant_id=%s AND i.workspace_id=%s",
+            (delivery_key, current_user.tenant_id, current_user.workspace_id),
+        ).fetchone() if row else None
     if not row:
         raise HTTPException(status_code=404, detail="Inbox item not found")
+    payload = {}
+    if payload_row and hashlib.sha256(payload_row[0].encode("utf-8")).hexdigest() == payload_row[1]:
+        payload = json.loads(payload_row[0])
     return JSONResponse({
         "delivery_key": delivery_key, "subject": row[0], "body": row[1], "state": row[2],
+        "attachments": payload.get("attachments", []),
+        "omitted_attachments": payload.get("omitted_attachments", []),
+        "attachments_recorded": "attachments" in payload and "omitted_attachments" in payload,
+        "payload_available": bool(payload_row and payload),
         "received_at": row[3], "updated_at": row[4], "result": json.loads(row[5]),
         "reviews": [{"assessment": r[0], "reason": r[1], "actor_id": r[2], "created_at": r[3]} for r in reviews],
         "promotion": None if not promotion else {
@@ -964,6 +988,19 @@ def promote_outlook_inbox_item(
             raise HTTPException(status_code=404, detail="Inbox item not found")
         if claimed.rowcount != 1 or json.loads(item[3]).get("status") != "ignored":
             raise HTTPException(status_code=409, detail="Only ignored emails can be promoted")
+        original = conn.execute(
+            "SELECT p.payload_json, i.payload_hash FROM outlook_inbox_payload p "
+            "JOIN outlook_inbox i ON i.delivery_key=p.delivery_key "
+            "WHERE i.delivery_key=%s AND i.tenant_id=%s AND i.workspace_id=%s",
+            (delivery_key, current_user.tenant_id, current_user.workspace_id),
+        ).fetchone()
+        if not original or hashlib.sha256(original[0].encode("utf-8")).hexdigest() != original[1]:
+            raise HTTPException(status_code=409, detail="Original delivery payload is unavailable or invalid")
+        from app.domain.outlook_attachments import validate_attachments
+        try:
+            documents = validate_attachments(json.loads(original[0]))
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=409, detail="Original attachment data is invalid") from exc
         conn.execute(
             "INSERT INTO alert (alert_id, tenant_id, workspace_id, opened_ts, severity, alert_type, source_system, message, status) "
             "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
@@ -978,6 +1015,14 @@ def promote_outlook_inbox_item(
             (f"DOC-{uuid.uuid4().hex}", alert_id, "EMAIL_BODY",
              item[0][:200] or "Outlook email", item[1], "automatic-outlook-bridge", timestamp),
         )
+        for document in documents:
+            conn.execute(
+                "INSERT INTO reviewed_alert_document "
+                "(document_id, alert_id, document_kind, title, content, submitted_by, created_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (f"DOC-{uuid.uuid4().hex}", alert_id, document["kind"], document["title"],
+                 document["content"], "automatic-outlook-bridge", timestamp),
+            )
         conn.execute(
             "INSERT INTO outlook_inbox_promotion (delivery_key, alert_id, actor_id, reason, created_at) "
             "VALUES (%s,%s,%s,%s,%s)",
@@ -1151,10 +1196,12 @@ async def cancel_incident(
             raise HTTPException(status_code=409, detail=str(exc))
 
         now = datetime.now(timezone.utc).isoformat()
-        conn.execute(
-            "UPDATE incident SET status = %s, updated_at = %s WHERE incident_id = %s",
-            (IncidentState.CANCELLED.value, now, incident_id),
+        cancelled = conn.execute(
+            "UPDATE incident SET status = %s, updated_at = %s WHERE incident_id = %s AND status = %s",
+            (IncidentState.CANCELLED.value, now, incident_id, current_status),
         )
+        if cancelled.rowcount != 1:
+            raise HTTPException(status_code=409, detail="Incident state changed; cancellation was not applied.")
         conn.execute(
             "UPDATE action_plan SET status = 'CANCELLED' WHERE incident_id = %s "
             "AND status IN ('PENDING_APPROVAL','NEEDS_REVIEW','APPROVED')",
@@ -1264,13 +1311,60 @@ async def approve_plan(incident_id: str, plan_id: str, req: ApprovalRequest, cur
         )
 
     now = datetime.now(timezone.utc).isoformat()
+    has_knowledge_table = db.table_exists("incident_knowledge")
     with db.get_connection() as conn:
+        # Claim the incident first. This write serializes with the conditional
+        # re-investigation claim on both supported databases.
+        claimed = conn.execute(
+            "UPDATE incident SET status = %s, updated_at = %s WHERE incident_id = %s "
+            "AND tenant_id = %s AND (workspace_id = %s OR workspace_id IS NULL) "
+            "AND status IN ('PLAN_READY','AWAITING_APPROVAL')",
+            (IncidentState.EXECUTING.value, now, incident_id, current_user.tenant_id, current_user.workspace_id),
+        )
+        if claimed.rowcount != 1:
+            raise HTTPException(status_code=409, detail="Incident is no longer at a plan-review checkpoint.")
+        cursor = conn.execute(
+            "SELECT * FROM action_plan WHERE action_plan_id = %s AND incident_id = %s",
+            (plan_id, incident_id),
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Plan not found for this incident")
+        current_plan = dict(zip([col[0] for col in cursor.description], row))
+        latest = conn.execute(
+            "SELECT action_plan_id FROM action_plan WHERE incident_id = %s "
+            "ORDER BY plan_version DESC, created_at DESC LIMIT 1",
+            (incident_id,),
+        ).fetchone()
+        if current_plan.get("status") != "PENDING_APPROVAL" or not latest or latest[0] != plan_id:
+            raise HTTPException(status_code=409, detail="Plan is no longer available for approval.")
+        cursor = conn.execute("SELECT * FROM action_step WHERE action_plan_id = %s ORDER BY sequence_no ASC", (plan_id,))
+        current_steps = [dict(zip([col[0] for col in cursor.description], row)) for row in cursor.fetchall()]
+        if not current_steps:
+            raise HTTPException(status_code=409, detail="A plan without steps cannot be approved.")
+        if compute_plan_hash(current_plan, current_steps) != req.plan_hash:
+            raise HTTPException(status_code=409, detail="Plan changed since it was presented for approval.")
+        if conn.execute(
+            "SELECT 1 FROM reviewed_alert_document d JOIN incident_alert ia ON ia.alert_id = d.alert_id "
+            "WHERE ia.incident_id = %s LIMIT 1", (incident_id,),
+        ).fetchone():
+            raise HTTPException(status_code=409, detail="Email-supplied evidence requires independent review.")
+        if has_knowledge_table and conn.execute(
+            "SELECT 1 FROM incident_knowledge WHERE incident_id=%s AND tenant_id=%s "
+            "AND workspace_id=%s AND status='PENDING' LIMIT 1",
+            (incident_id, current_user.tenant_id, current_user.workspace_id),
+        ).fetchone():
+            raise HTTPException(status_code=409, detail="Incident references are awaiting admin review.")
+        updated = conn.execute(
+            "UPDATE action_plan SET status='APPROVED' WHERE action_plan_id=%s AND incident_id=%s AND status='PENDING_APPROVAL'",
+            (plan_id, incident_id),
+        )
+        if updated.rowcount != 1:
+            raise HTTPException(status_code=409, detail="Plan is no longer available for approval.")
         conn.execute("""
             INSERT INTO approval (approval_id, incident_id, action_plan_id, requested_at, expires_at, decision, decided_at, approver_id, plan_hash)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (f"APP-{uuid.uuid4().hex[:8]}", incident_id, plan_id, now, now, req.decision, now, current_user.user_id, req.plan_hash))
-        
-        conn.execute("UPDATE action_plan SET status = 'APPROVED' WHERE action_plan_id = %s", (plan_id,))
         
         # Log audit
         conn.execute("""

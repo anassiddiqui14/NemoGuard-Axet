@@ -49,7 +49,7 @@ class Launcher:
         self.window = window
         self.process = None
         window.title("NemoGuard Outlook Bridge")
-        window.geometry("560x310")
+        window.geometry("560x360")
         window.protocol("WM_DELETE_WINDOW", self.close)
         self.status = tk.StringVar(value="Checking Outlook…")
         self.mailbox = tk.StringVar()
@@ -64,7 +64,7 @@ class Launcher:
         self.start_button.pack(side="left", padx=5)
         self.stop_button = ttk.Button(buttons, text="Stop monitoring", command=self.stop, state="disabled")
         self.stop_button.pack(side="left", padx=5)
-        ttk.Label(window, text="Keep this window and classic Outlook open. Attachments are excluded.", wraplength=520).pack(pady=10)
+        ttk.Label(window, text="Keep this window and classic Outlook open. New email bodies and supported .log, .txt and .csv attachments are sent to NemoGuard and may be sent to its configured model. Pending content is stored locally until delivery.", wraplength=520).pack(pady=10)
         window.after(100, self.detect)
 
     def detect(self):
@@ -82,7 +82,7 @@ class Launcher:
             self.selector["values"] = names
             if preferred:
                 self.mailbox.set(preferred)
-                self.start(show_error=False)
+                self.status.set("Mailbox selected. Review the data-flow notice and click Start monitoring.")
             elif names:
                 self.status.set("Choose the mailbox containing the test folder, then click Start monitoring.")
             else:
@@ -108,6 +108,12 @@ class Launcher:
             self.status.set(reason)
             if show_error:
                 messagebox.showwarning("Monitoring cannot start", reason)
+            return
+        if not messagebox.askyesno(
+            "Confirm data transfer",
+            "New email bodies and supported .log, .txt and .csv attachments will be sent to NemoGuard and may be sent to its configured model. Pending content is stored locally until delivery. Unsupported attachments are omitted. Continue?",
+        ):
+            self.status.set("Monitoring not started.")
             return
         try:
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)

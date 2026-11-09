@@ -6,7 +6,15 @@ type Result = { status?: string; reasoning?: string; incident_id?: string; messa
 type InboxItem = { delivery_key: string; subject: string; state: string; received_at: string; updated_at: string; result: Result };
 type Review = { assessment: string; reason: string; actor_id: string; created_at: string };
 type Promotion = { alert_id: string; actor_id: string; reason: string; created_at: string };
-type Detail = InboxItem & { body: string; reviews: Review[]; promotion: Promotion | null };
+type Detail = InboxItem & {
+  body: string;
+  reviews: Review[];
+  promotion: Promotion | null;
+  attachments?: Array<{ name: string; text: string }>;
+  omitted_attachments?: Array<{ name: string; reason: string }>;
+  attachments_recorded?: boolean;
+  payload_available?: boolean;
+};
 type BridgeReport = { last_scan_at: string; pending: number; blocked: number; baseline: number };
 
 function stamp(value: string) {
@@ -150,7 +158,10 @@ export function AlertInboxPage() {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ severity, reason: promotionReason.trim() }),
       });
-      if (!response.ok) throw new Error('Promotion failed. Refresh the item before retrying.');
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(typeof body.detail === 'string' ? body.detail : 'Promotion failed. Refresh the item before retrying.');
+      }
       const result = await response.json();
       setPromotionMessage(`Alert ${result.alert_id} created. No incident was created or linked.`);
       setPromotionReason('');
@@ -206,6 +217,21 @@ export function AlertInboxPage() {
               </div>}
               {retryMessage && <p role="status" className="text-sm text-text-secondary">{retryMessage}</p>}
               <div><h3 className="text-sm font-semibold">Email body <span className="font-normal text-text-muted">(untrusted source)</span></h3><pre className="mt-2 max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-black/10 p-3 font-sans text-sm text-text-secondary">{detail.body}</pre></div>
+              <div className="space-y-2">
+                <h3 className="text-sm font-semibold">Attachments <span className="font-normal text-text-muted">(untrusted source)</span></h3>
+                {detail.payload_available === false && <p role="alert" className="text-xs text-warning">Original delivery payload is unavailable or failed its integrity check; attachment availability is unknown.</p>}
+                {(detail.attachments ?? []).map((attachment, index) => (
+                  <details key={`${attachment.name}-${index}`} className="rounded-lg border border-white/10 p-3">
+                    <summary className="cursor-pointer break-words text-sm">{attachment.name}</summary>
+                    <pre className="mt-2 max-h-96 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-text-secondary">{attachment.text}</pre>
+                  </details>
+                ))}
+                {(detail.omitted_attachments ?? []).map((attachment, index) => (
+                  <p key={`${attachment.name}-${index}`} className="break-words text-xs text-warning">{attachment.name}: not ingested ({attachment.reason.replace(/_/g, ' ')}).</p>
+                ))}
+                {detail.payload_available && detail.attachments_recorded === false && <p className="text-xs text-warning">This older delivery did not record attachment information; availability is unknown.</p>}
+                {detail.payload_available && detail.attachments_recorded && !(detail.attachments ?? []).length && !(detail.omitted_attachments ?? []).length && <p className="text-xs text-text-muted">No attachments were recorded for this delivery.</p>}
+              </div>
               {detail.promotion && <div className="rounded-lg border border-white/10 p-3 text-sm text-text-secondary">
                 Promoted as alert {detail.promotion.alert_id} by {detail.promotion.actor_id} on {stamp(detail.promotion.created_at)}: {detail.promotion.reason}. No incident was automatically created or linked.
               </div>}
@@ -220,7 +246,7 @@ export function AlertInboxPage() {
                 <label className="block text-sm">Reason
                   <textarea required maxLength={2000} value={promotionReason} onChange={e => setPromotionReason(e.target.value)} className="mt-1 block w-full rounded border border-white/15 bg-app-bg p-2" rows={2} />
                 </label>
-                <button disabled={promoting || !promotionReason.trim()} className="rounded-lg bg-primary px-4 py-2 text-sm text-white disabled:opacity-50">{promoting ? 'Creating…' : 'Create alert'}</button>
+                <button disabled={promoting || !promotionReason.trim() || detail.payload_available === false} className="rounded-lg bg-primary px-4 py-2 text-sm text-white disabled:opacity-50">{promoting ? 'Creating…' : 'Create alert'}</button>
               </form>}
               {promotionMessage && <p role="status" className="text-sm text-text-secondary">{promotionMessage}</p>}
               <div><h3 className="text-sm font-semibold">Operator assessment</h3><p className="mt-1 text-xs text-text-muted">An assessment records your judgment only. It does not create an incident or change classification or correlation.</p>

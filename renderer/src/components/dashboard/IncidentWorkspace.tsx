@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { AnimatePresence } from 'framer-motion';
 import { ngToast } from '../../design-system/toast';
 import { ArrowLeft, AlertTriangle } from 'lucide-react';
@@ -13,6 +13,7 @@ import { EvidenceModal } from './EvidenceModal';
 import { CancelIncidentModal } from './CancelIncidentModal';
 import { PlanApprovalModal } from '../PlanApprovalModal';
 import { WorkspaceTabs } from './WorkspaceTabs';
+import { IncidentKnowledgePanel } from './IncidentKnowledgePanel';
 import { EmptyState } from './shared';
 import type { IncidentSummary } from './shared';
 
@@ -53,16 +54,11 @@ export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParen
     const [expandedAlert, setExpandedAlert] = useState<string | null>(null);
     const [isModalOpen, setIsModalOpen] = useState(false);
     const [triageStarting, setTriageStarting] = useState(false);
-    const [safetyAcknowledged, setSafetyAcknowledged] = useState(false);
     const [cancelling, setCancelling] = useState(false);
     const [isCancelModalOpen, setIsCancelModalOpen] = useState(false);
 
     const { evidence, hypothesis, hypotheses, plan, impact, alerts, loading: dataLoading } = useIncidentData(incidentId);
     const { events: liveEvents, status: sseStatus } = useIncidentEvents(incidentId);
-
-    useEffect(() => {
-        setSafetyAcknowledged(false);
-    }, [plan?.action_plan_id]);
 
     const handleExecute = async () => {
         if (!selectedIncident || !plan) return;
@@ -225,7 +221,7 @@ export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParen
     const isNeedsReview = plan?.status === 'NEEDS_REVIEW';
     const isIncidentResolved = selectedIncident?.status?.toUpperCase() === 'RESOLVED';
     const isPlanExecuted = plan?.status === 'EXECUTED' || plan?.status === 'APPROVED';
-    const canApprove = !!plan && !isPlanExecuted && !isIncidentResolved && (!isNeedsReview || safetyAcknowledged);
+    const canApprove = !!plan && plan.status === 'PENDING_APPROVAL' && !isPlanExecuted && !isIncidentResolved;
 
     if (!incidentId) {
         return (
@@ -271,18 +267,27 @@ export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParen
                     />
                 }
                 investigation={
-                    <AgentAndHypothesisRow
-                        activeIncidentId={incidentId}
-                        incidentStatus={selectedIncident?.status ?? 'UNKNOWN'}
-                        liveEvents={liveEvents}
-                        hypothesis={hypothesis}
-                        evidence={evidence}
-                        impact={impact}
-                        plan={plan}
-                        incident={selectedIncident}
-                        dataLoading={dataLoading}
-                        onViewEvidence={() => setIsEvidenceModalOpen(true)}
-                    />
+                    <div className="space-y-4">
+                        <AgentAndHypothesisRow
+                            activeIncidentId={incidentId}
+                            incidentStatus={selectedIncident?.status ?? 'UNKNOWN'}
+                            liveEvents={liveEvents}
+                            hypothesis={hypothesis}
+                            evidence={evidence}
+                            impact={impact}
+                            plan={plan}
+                            incident={selectedIncident}
+                            dataLoading={dataLoading}
+                            onViewEvidence={() => setIsEvidenceModalOpen(true)}
+                        />
+                        <IncidentKnowledgePanel
+                            key={incidentId}
+                            incidentId={incidentId}
+                            initialJob={selectedIncident?.primary_job_id}
+                            incidentStatus={selectedIncident?.status}
+                            hasPlan={!!plan}
+                        />
+                    </div>
                 }
                 evidence={
                     <AlertsPanel
@@ -311,8 +316,6 @@ export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParen
                         dataLoading={dataLoading}
                         incidentStatus={selectedIncident?.status}
                         isNeedsReview={isNeedsReview}
-                        safetyAcknowledged={safetyAcknowledged}
-                        setSafetyAcknowledged={setSafetyAcknowledged}
                         canApprove={canApprove}
                         isIncidentResolved={isIncidentResolved}
                         onViewPlan={() => setIsModalOpen(true)}

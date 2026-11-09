@@ -1,7 +1,7 @@
 """Read new messages from one classic Outlook folder and deliver them to NemoGuard.
 
-This script sends email subjects and bodies to NemoGuard, which may send them
-and existing incident context to its configured model. Attachments are excluded.
+This script sends email subjects, bodies and supported text attachments to NemoGuard,
+which may send them and existing incident context to its configured model.
 It never changes, moves, or deletes Outlook messages.
 """
 import argparse
@@ -14,6 +14,7 @@ import re
 import subprocess
 import sqlite3
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -21,6 +22,9 @@ import urllib.request
 
 FOLDER_NAME = "NemoGuard Test Alerts"
 MAX_BODY_CHARS = 100_000
+MAX_ATTACHMENTS = 10
+MAX_ATTACHMENT_BYTES = 2 * 1024 * 1024
+MAX_TOTAL_ATTACHMENT_BYTES = 5 * 1024 * 1024
 ACCEPTED = {
     "ingested", "ingested_and_correlated", "ingested_and_incident_created",
     "ingested_and_incident_auto_resolved",
@@ -74,9 +78,9 @@ def discover_designer_url(prefix, include_container=False):
         status = json.loads(response.read(4096))
     if not isinstance(status, dict):
         raise RuntimeError("Designer backend returned an invalid status.")
-    if status.get("database") != "healthy" or status.get("orchestrator") != "healthy":
+    if status.get("database") != "healthy" or status.get("orchestrator") not in ("healthy", "available"):
         raise RuntimeError("Designer backend is unhealthy.")
-    if status.get("outlook_bridge_contract") != 1:
+    if status.get("outlook_bridge_contract") != 1 or status.get("outlook_bridge_attachments") is not True:
         raise RuntimeError("Designer backend lacks the required Outlook bridge contract.")
     url = base + "/backend/api/ingest/outlook-bridge"
     return (name, url) if include_container else url
@@ -152,7 +156,7 @@ def send_payload(url, secret, key, payload, opener=None):
                 return "done", status
             return "retry", "unconfirmed_response"
     except urllib.error.HTTPError as exc:
-        if exc.code in (400, 403, 404, 409):
+        if exc.code in (400, 403, 404, 409, 413):
             return "blocked", f"http_{exc.code}"
         return "retry", f"http_{exc.code}"
     except (OSError, ValueError, UnicodeError):
@@ -211,7 +215,14 @@ class Outbox:
     def known(self, key):
         return self.conn.execute("SELECT 1 FROM messages WHERE message_key=?", (key,)).fetchone() is not None
 
-    def add(self, key, subject, body):
+    def block(self, key, detail):
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO messages VALUES (?, NULL, 'blocked', ?)",
+                (key, detail),
+            )
+
+    def add(self, key, subject, body, attachments=None, omitted_attachments=None):
         problem = None
         if len(subject) > 2000 or len(body) > MAX_BODY_CHARS:
             problem = "message_too_large"
@@ -229,6 +240,8 @@ class Outbox:
             "type": "Email alert",
             "monitor_name": subject or "(no subject)",
             "message": body,
+            "attachments": attachments or [],
+            "omitted_attachments": omitted_attachments or [],
         })
         with self.conn:
             self.conn.execute(
@@ -285,6 +298,41 @@ def select_folder(namespace, mailbox, folder_name=FOLDER_NAME):
     return folders[0], str(matches[0].StoreID)
 
 
+def capture_attachments(item):
+    """Capture complete UTF-8 text attachments without trusting filenames as paths."""
+    collection = getattr(item, "Attachments", None)
+    count = collection.Count if collection is not None else 0
+    if count > MAX_ATTACHMENTS:
+        raise ValueError("too_many_attachments")
+    attachments, omitted = [], []
+    total = 0
+    with tempfile.TemporaryDirectory(prefix="nemoguard-attachment-") as directory:
+        for index in range(1, count + 1):
+            attachment = collection.Item(index)
+            name = str(attachment.FileName or "").replace("\\", "/").split("/")[-1]
+            if not name or len(name) > 200 or "\x00" in name:
+                raise ValueError("invalid_attachment_name")
+            if not name.lower().endswith((".log", ".txt", ".csv")):
+                omitted.append({"name": name, "reason": "unsupported_format"})
+                continue
+            if int(attachment.Size) > MAX_ATTACHMENT_BYTES:
+                raise ValueError("attachment_too_large")
+            path = Path(directory) / str(index)
+            attachment.SaveAsFile(str(path))
+            with path.open("rb") as source:
+                raw = source.read(MAX_ATTACHMENT_BYTES + 1)
+            if len(raw) > MAX_ATTACHMENT_BYTES:
+                raise ValueError("attachment_too_large")
+            text = raw.decode("utf-8-sig")
+            if not text.strip() or "\x00" in text:
+                raise ValueError("invalid_attachment_text")
+            total += len(text.encode("utf-8"))
+            if total > MAX_TOTAL_ATTACHMENT_BYTES:
+                raise ValueError("attachments_too_large")
+            attachments.append({"name": name, "text": text})
+    return attachments, omitted
+
+
 def scan_folder(folder, store_id, outbox):
     # Enumerate fully before committing a baseline: a failed scan must not
     # silently classify an incomplete snapshot as the completed baseline.
@@ -309,7 +357,18 @@ def scan_folder(folder, store_id, outbox):
         # Outlook Body provides plain text; reading does not mark mail as read.
         subject = str(item.Subject or "")
         body = str(item.Body or "")
-        if outbox.add(key, subject, body):
+        try:
+            attachments, omitted = capture_attachments(item)
+        except (ValueError, UnicodeError):
+            outbox.block(key, "attachment_capture_failed")
+            print("A message attachment could not be captured completely and was blocked for review.")
+            continue
+        except Exception as exc:
+            # Outlook COM errors can be transient. Leave this item unknown so
+            # a later scan retries it; continue processing other messages.
+            print(f"Outlook attachment read failed ({type(exc).__name__}); will retry.")
+            continue
+        if outbox.add(key, subject, body, attachments, omitted):
             added += 1
         else:
             print("A message had an empty body or exceeded the size limit and was blocked for review.")
@@ -385,7 +444,7 @@ def main(argv=None):
 
         target_identity = args.url or "axet-designer:" + args.axet_designer_prefix
         outbox = Outbox(args.state, args.mailbox, FOLDER_NAME, target_identity)
-        print("Monitoring the dedicated test folder. Attachments are excluded.")
+        print("Monitoring the dedicated test folder. Supported text attachments are included.")
         print("Pending message text is stored locally in the state file until delivery is confirmed.")
         while True:
             try:
@@ -400,8 +459,9 @@ def main(argv=None):
                         if (not args.url.endswith("/ingest/outlook-bridge")
                                 or not isinstance(status, dict)
                                 or status.get("outlook_bridge_contract") != 1
+                                or status.get("outlook_bridge_attachments") is not True
                                 or status.get("database") != "healthy"
-                                or status.get("orchestrator") != "healthy"):
+                                or status.get("orchestrator") not in ("healthy", "available")):
                             raise RuntimeError("Incompatible backend.")
                         url = args.url
                 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):

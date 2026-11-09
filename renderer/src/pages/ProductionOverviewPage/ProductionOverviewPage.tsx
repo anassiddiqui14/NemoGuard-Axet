@@ -294,7 +294,7 @@ export function ProductionOverviewPage() {
 
     if (!snapshot && loading) {
         return (
-            <main className="v22-canvas h-full overflow-y-auto px-4 py-5 sm:px-7 sm:py-7" aria-busy="true">
+            <main className="v22-overview v22-canvas h-full overflow-y-auto px-4 py-5 sm:px-7 sm:py-7" aria-busy="true">
                 <div className="mx-auto max-w-[1600px]">
                     <p role="status" className="mb-4 flex items-center gap-2 text-sm font-medium text-[#62716B]">
                         <span aria-hidden="true" className="h-2 w-2 rounded-full bg-[#0C6F58] motion-safe:animate-pulse" />
@@ -315,7 +315,7 @@ export function ProductionOverviewPage() {
 
     if (!snapshot) {
         return (
-            <main className="v22-canvas flex h-full items-center justify-center p-8">
+            <main className="v22-overview v22-canvas flex h-full items-center justify-center p-8">
                 <div className="max-w-md text-center">
                     <TriangleAlert className="mx-auto text-[#DE565E]" size={28} />
                     <h1 className="mt-4 text-xl font-bold text-[#13231E]">Operations snapshot unavailable</h1>
@@ -329,16 +329,16 @@ export function ProductionOverviewPage() {
     const stale = Boolean(error && updatedAt);
 
     return (
-        <main className="v22-canvas h-full overflow-y-auto px-4 py-5 sm:px-7 sm:py-7">
+        <main className="v22-overview v22-canvas h-full overflow-y-auto px-4 py-5 sm:px-7 sm:py-7">
             <div className="v22-content-enter mx-auto max-w-[1600px] space-y-5 pb-24">
                 <header className="flex flex-wrap items-end justify-between gap-4">
                     <div>
                         <div className="flex items-center gap-2 text-[10.5px] font-bold uppercase tracking-[0.18em] text-[#0C6F58]">
                             <span className={`h-2 w-2 rounded-full ${stale ? 'bg-[#E5A52B]' : 'bg-[#18A566]'}`} />
-                            Production intelligence
+                            Production
                         </div>
-                        <h1 className="mt-2 text-[30px] font-bold tracking-[-0.05em] text-[#13231E] sm:text-[34px]">Know what matters now.</h1>
-                        <p className="mt-1 max-w-2xl text-[12.5px] text-[#62716B]">NemoGuard turns the evidence it already has into one explainable operational view. Unknowns stay unknown.</p>
+                        <h1 className="mt-2 text-[30px] font-bold tracking-[-0.05em] text-[#13231E] sm:text-[34px]">Production overview</h1>
+                        <p className="mt-1 max-w-2xl text-[12.5px] text-[#62716B]">Incidents, alerts and investigation coverage.</p>
                     </div>
                     <div className="rounded-2xl border border-[#0F3F32]/10 bg-white/60 px-4 py-2.5 text-right backdrop-blur-sm">
                         <div className="flex items-center justify-end gap-1.5 text-[11px] font-bold text-[#13231E]"><RefreshCw size={12} />{stale ? 'Showing last known state' : 'Live snapshot'}</div>
@@ -348,7 +348,7 @@ export function ProductionOverviewPage() {
 
                 {stale && (
                     <div className="rounded-2xl border border-[#E5A52B]/25 bg-[#FFF1DE] px-4 py-3 text-[12px] text-[#8E551C]">
-                        Refresh failed ({error}). NemoGuard is preserving the last successful snapshot instead of blanking the dashboard.
+                        Refresh failed ({error}). Showing the last successful snapshot.
                     </div>
                 )}
 
@@ -359,7 +359,7 @@ export function ProductionOverviewPage() {
                         <div className="relative flex min-h-[250px] flex-col justify-between gap-8">
                             <div className="flex items-center justify-between gap-4">
                                 <span className="flex h-11 w-11 items-center justify-center rounded-2xl border border-white/10 bg-white/10 text-[#8FE4C9]"><CommanderSignalIcon /></span>
-                                <span className="rounded-full border border-white/10 bg-white/[0.08] px-3 py-1.5 text-[10.5px] font-semibold text-white/70">Deterministic Commander Brief</span>
+                                <span className="rounded-full border border-white/10 bg-white/[0.08] px-3 py-1.5 text-[10.5px] font-semibold text-white/70">Incident summary</span>
                             </div>
                             <div>
                                 <h2 className="max-w-3xl text-[28px] font-bold leading-[1.12] tracking-[-0.045em] sm:text-[32px]">{commander.headline}</h2>
@@ -376,7 +376,7 @@ export function ProductionOverviewPage() {
                         <div className="flex items-start justify-between gap-4">
                             <div>
                                 <p className="text-[15px] font-bold text-[#13231E]">Shift Brief</p>
-                                <p className="mt-1 text-[11.5px] text-[#62716B]">Last {shift.window_hours} hours · persisted operational facts</p>
+                                <p className="mt-1 text-[11.5px] text-[#62716B]">Last {shift.window_hours} hours</p>
                             </div>
                             <span className="flex h-10 w-10 items-center justify-center rounded-2xl border border-[#0C6F58]/15 bg-[#E1F3EC] text-[#0C6F58]"><Clock3 size={18} /></span>
                         </div>
@@ -402,7 +402,7 @@ export function ProductionOverviewPage() {
                         <div className="flex items-start justify-between gap-4">
                             <div>
                                 <p className="text-[15px] font-bold text-[#13231E]">Needs Attention</p>
-                                <p className="mt-1 text-[11.5px] text-[#62716B]">Deterministic ranking by severity, workflow state, SLA urgency and verification outcome.</p>
+                                <p className="mt-1 text-[11.5px] text-[#62716B]">Ranked by severity, workflow state, SLA and verification outcome.</p>
                             </div>
                             <span className={`rounded-full px-3 py-1.5 text-[10px] font-bold ${snapshot.needs_attention.length ? 'bg-[#FFF1DE] text-[#A85D12]' : 'bg-[#E1F3EC] text-[#0C6F58]'}`}>{snapshot.needs_attention.length} item{snapshot.needs_attention.length === 1 ? '' : 's'}</span>
                         </div>
@@ -418,8 +418,8 @@ export function ProductionOverviewPage() {
                     <Surface className="p-5 xl:col-span-5 sm:p-6">
                         <div className="flex items-start justify-between gap-4">
                             <div>
-                                <p className="text-[15px] font-bold text-[#13231E]">What NemoGuard Needs</p>
-                                <p className="mt-1 text-[11.5px] text-[#62716B]">Investigation coverage · explicit gaps, not hidden uncertainty.</p>
+                                <p className="text-[15px] font-bold text-[#13231E]">Investigation coverage</p>
+                                <p className="mt-1 text-[11.5px] text-[#62716B]">Available context and missing information.</p>
                             </div>
                             <div className="text-right">
                                 <div className="text-[28px] font-bold leading-none tracking-[-0.05em] text-[#13231E] tabular-nums">{coverage.score == null ? '—' : `${coverage.score}%`}</div>
@@ -459,7 +459,7 @@ export function ProductionOverviewPage() {
                         <div className="flex items-start justify-between gap-4">
                             <div>
                                 <p className="text-[15px] font-bold text-[#13231E]">Incident & Alert Activity</p>
-                                <p className="mt-1 text-[11.5px] text-[#62716B]">Fourteen-day persisted activity, not simulated telemetry.</p>
+                                <p className="mt-1 text-[11.5px] text-[#62716B]">Recorded activity over the last 14 days.</p>
                             </div>
                             <Activity size={18} className="text-[#0C6F58]" />
                         </div>
@@ -470,10 +470,10 @@ export function ProductionOverviewPage() {
                                         <linearGradient id="alertsFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#0C6F58" stopOpacity={0.24} /><stop offset="100%" stopColor="#0C6F58" stopOpacity={0.01} /></linearGradient>
                                         <linearGradient id="incidentsFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#3777D6" stopOpacity={0.18} /><stop offset="100%" stopColor="#3777D6" stopOpacity={0.01} /></linearGradient>
                                     </defs>
-                                    <CartesianGrid stroke="rgba(15,63,50,.08)" vertical={false} />
+                                    <CartesianGrid stroke="var(--chart-grid)" vertical={false} />
                                     <XAxis dataKey="label" axisLine={false} tickLine={false} tick={{ fill: '#8C9994', fontSize: 10 }} minTickGap={24} />
                                     <YAxis allowDecimals={false} axisLine={false} tickLine={false} tick={{ fill: '#8C9994', fontSize: 10 }} />
-                                    <ChartTooltip contentStyle={{ borderRadius: 16, border: '1px solid rgba(15,63,50,.12)', background: '#FCFDFB', boxShadow: '0 18px 40px -28px rgba(7,63,50,.45)', fontSize: 11 }} />
+                                    <ChartTooltip contentStyle={{ borderRadius: 16, border: '1px solid var(--chart-tooltip-border)', background: 'var(--chart-tooltip-bg)', color: 'var(--chart-tooltip-text)', boxShadow: '0 18px 40px -28px rgba(7,63,50,.45)', fontSize: 11 }} />
                                     <Area type="monotone" dataKey="alerts" name="Alerts" stroke="#0C6F58" strokeWidth={2.1} fill="url(#alertsFill)" activeDot={{ r: 4 }} />
                                     <Area type="monotone" dataKey="incidents" name="Incidents" stroke="#3777D6" strokeWidth={2} fill="url(#incidentsFill)" activeDot={{ r: 4 }} />
                                     <Area type="monotone" dataKey="resolved" name="Resolved" stroke="#18A566" strokeWidth={1.6} fillOpacity={0} strokeDasharray="4 4" />
@@ -486,7 +486,7 @@ export function ProductionOverviewPage() {
                         <div className="flex items-start justify-between gap-4">
                             <div>
                                 <p className="text-[15px] font-bold text-[#13231E]">System Health</p>
-                                <p className="mt-1 text-[11.5px] text-[#62716B]">Healthy means probed; configured means configured.</p>
+                                <p className="mt-1 text-[11.5px] text-[#62716B]">Service status and configuration.</p>
                             </div>
                             <ShieldCheck size={18} className="text-[#0C6F58]" />
                         </div>
@@ -499,7 +499,7 @@ export function ProductionOverviewPage() {
                         <div className="flex items-start justify-between gap-4">
                             <div>
                                 <p className="text-[15px] font-bold text-[#13231E]">Agent Activity</p>
-                                <p className="mt-1 text-[11.5px] text-[#62716B]">Projection from actual audit events — not process-health claims.</p>
+                                <p className="mt-1 text-[11.5px] text-[#62716B]">Recent activity from audit events; not agent health.</p>
                             </div>
                             <Bot size={18} className="text-[#0C6F58]" />
                         </div>
@@ -571,8 +571,8 @@ export function ProductionOverviewPage() {
                 </div>
 
                 <footer className="flex flex-wrap items-center justify-between gap-3 px-1 text-[10.5px] text-[#8C9994]">
-                    <span>NemoGuard V22 · operational truth before automation</span>
-                    <span>Production data is never simulated on this page.</span>
+                    <span>NemoGuard V22</span>
+                    <span>Snapshot data</span>
                 </footer>
             </div>
 

@@ -3,6 +3,7 @@ import { NavLink } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { useNavItems } from '../../hooks/useNavItems';
+import { Logomark } from '../../pages/LandingPage/Brand';
 
 const NAV_COLLAPSED_KEY = 'nemoguard_nav_collapsed';
 
@@ -34,7 +35,7 @@ export function GlobalNavRail() {
             className={`relative hidden md:flex ${collapsed ? 'w-[72px]' : 'w-[208px] lg:w-[224px]'} flex-col flex-shrink-0 h-full border-r border-white/10 bg-[#073F32] transition-[width] duration-200 ease-out motion-reduce:transition-none`}
         >
             <div className={`h-12 flex items-end pb-2 text-[10px] font-semibold uppercase tracking-[0.16em] text-white/70 ${collapsed ? 'justify-center' : 'px-5'}`}>
-                {collapsed ? <span aria-hidden="true">NG</span> : 'Workspace'}
+                {collapsed ? <Logomark className="h-5 w-5 text-[#8FE4C9]" /> : 'Workspace'}
             </div>
             <nav id="desktop-primary-navigation" aria-label="Primary navigation" className="flex-1 overflow-y-auto px-2.5 pb-4">
                 <ul className="space-y-1">

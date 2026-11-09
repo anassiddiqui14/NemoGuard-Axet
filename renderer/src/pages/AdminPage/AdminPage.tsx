@@ -1,6 +1,7 @@
-import { ShieldCheck, Sparkles } from 'lucide-react';
+import { ShieldCheck } from 'lucide-react';
 import { Logomark } from '../LandingPage/Brand';
 import { CapabilityPolicyTab } from './CapabilityPolicyTab';
+import { KnowledgeReview } from './KnowledgeReview';
 
 /**
  * V22 admin intentionally exposes only controls that have a matching,
@@ -35,17 +36,7 @@ export function AdminPage() {
                     <CapabilityPolicyTab />
                 </div>
 
-                <div className="rounded-[22px] border border-[#0F3F32]/10 bg-[#EDF3EE] p-5">
-                    <div className="flex items-start gap-3">
-                        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-white text-[#0C6F58]"><Sparkles size={16} /></span>
-                        <div>
-                            <p className="text-[12.5px] font-bold text-[#13231E]">Future governance surfaces are intentionally withheld</p>
-                            <p className="mt-1 text-[11.5px] leading-relaxed text-[#62716B]">
-                                Incident Memory, false-resolution audits, model evaluation/settings, and team routing remain planned capabilities. V22 does not expose them as functional controls until matching server-side contracts and persistence exist.
-                            </p>
-                        </div>
-                    </div>
-                </div>
+                <KnowledgeReview />
             </div>
         </div>
     );

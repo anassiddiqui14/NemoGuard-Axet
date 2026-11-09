@@ -176,6 +176,38 @@ class ReviewedIngestionTests(unittest.TestCase):
         self.assertFalse(state["critic_passed"])
         self.assertEqual(state["final_plan"]["steps"][0]["action"], "Manual review")
 
+    def test_reference_context_reaches_all_investigation_agents(self):
+        from app.domain.agents.langgraph_investigator import LangGraphInvestigator
+
+        calls = {}
+
+        class Agent:
+            def __init__(self, name, result):
+                self.name = name
+                self.result = result
+
+            async def analyze(self, *args, **kwargs):
+                calls[self.name] = kwargs
+                return self.result
+
+        investigator = LangGraphInvestigator.__new__(LangGraphInvestigator)
+        investigator.rca_agent = Agent("rca", {"finding": "Possible failure"})
+        investigator.dep_agent = Agent("dependency", {"impacts": []})
+        investigator.runbook_agent = Agent("runbook", {"steps": []})
+        investigator.critic = Agent("critic", {
+            "passed": True,
+            "final_plan": {"steps": [{"action": "Review", "tool": "manual", "risk": "LOW"}]},
+        })
+        investigator.graph = investigator._build_graph()
+        asyncio.run(investigator.investigate(
+            "synthetic", feedback_context="Operator guidance",
+            reference_context="Untrusted reference KN-123",
+        ))
+        for name in ("rca", "dependency", "runbook", "critic"):
+            self.assertEqual(calls[name]["reference_context"], "Untrusted reference KN-123")
+        self.assertEqual(calls["rca"]["feedback_context"], "Operator guidance")
+        self.assertEqual(calls["critic"]["feedback_context"], "Operator guidance")
+
     def test_read_only_dispatcher_rejects_write_tools(self):
         with patch.object(agent_tools, "execute_tool_call") as execute:
             result = asyncio.run(agent_tools.execute_read_only_tool_call(
@@ -233,6 +265,24 @@ class ReviewedIngestionTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM action_plan WHERE incident_id=%s", (incident_id,)
             ).fetchone()[0], 1)
 
+    def test_reinvestigation_restores_status_when_investigator_initialization_fails(self):
+        from app.domain.agents import langgraph_investigator
+
+        incident_id = self.ingest()["incident_id"]
+        self.obj.save_agent_findings(
+            incident_id,
+            {"hypotheses": [], "evidence": [], "impacts": [], "action_plan": {"steps": []}},
+            critic_status="INCONCLUSIVE",
+        )
+        with patch.object(langgraph_investigator, "LangGraphInvestigator", side_effect=RuntimeError("initialization failed")):
+            result = asyncio.run(self.obj.reinvestigate_from_commander_guidance(
+                incident_id, "re-investigate", False, "test-guidance"
+            ))
+        self.assertIn("error", result)
+        with self.db.get_connection() as conn:
+            status = conn.execute("SELECT status FROM incident WHERE incident_id=%s", (incident_id,)).fetchone()[0]
+        self.assertEqual(status, "PLAN_READY")
+
     def test_email_recovery_does_not_auto_resolve(self):
         now = "2026-01-01T00:00:00Z"
         with self.db.get_connection() as conn:
@@ -258,6 +308,249 @@ class ReviewedIngestionTests(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT count(*) FROM alert").fetchone()[0], 0)
             self.assertEqual(conn.execute("SELECT count(*) FROM webhook_delivery").fetchone()[0], 0)
             self.assertEqual(conn.execute("SELECT count(*) FROM reviewed_alert_document").fetchone()[0], 0)
+
+    def test_submitted_sop_reaches_investigation_and_requires_review(self):
+        from app.domain import incident_knowledge
+        from app.domain.agents import langgraph_investigator
+
+        result = self.ingest(docs=[])
+        incident_id = result["incident_id"]
+        incident_knowledge.initialize(self.db)
+        with self.db.get_connection() as conn:
+            conn.execute(
+                "UPDATE incident SET tenant_id=%s, workspace_id=%s, primary_job_id=%s, status='DETECTED' WHERE incident_id=%s",
+                ("tenant-a", "workspace-a", "job-a", incident_id),
+            )
+        knowledge_id = incident_knowledge.submit(
+            self.db, "tenant-a", "workspace-a", incident_id, "job-a",
+            "SOP", "Recovery procedure", "Check the queue before restarting.", "operator",
+        )
+        captured = {}
+
+        class Investigator:
+            async def investigate(self, *args, **kwargs):
+                captured["reference_context"] = kwargs["reference_context"]
+                return {
+                    "rca_result": {"finding": "Possible queue issue", "confidence": 0.1},
+                    "impact_result": {"impacts": []},
+                    "runbook_result": {"steps": []},
+                    "critic_status": "PASSED",
+                    "final_plan": {
+                        "rationale": "Review queue",
+                        "expected_outcome": "Queue inspected",
+                        "steps": [{"action": "Check queue", "tool": "manual", "risk": "LOW"}],
+                    },
+                }
+
+        with patch.object(langgraph_investigator, "LangGraphInvestigator", Investigator):
+            triage = self.obj.triage_incident(incident_id)
+        self.assertTrue(triage["saved_plan"])
+        self.assertIn(knowledge_id, captured["reference_context"])
+        self.assertIn("Check the queue before restarting.", captured["reference_context"])
+        self.assertIn("Pending items are operator-submitted", captured["reference_context"])
+        with self.db.get_connection() as conn:
+            plan = conn.execute(
+                "SELECT status,rationale FROM action_plan WHERE incident_id=%s ORDER BY created_at DESC LIMIT 1",
+                (incident_id,),
+            ).fetchone()
+        self.assertEqual(plan[0], "NEEDS_REVIEW")
+        self.assertIn("REFERENCE REVIEW REQUIRED", plan[1])
+
+    def test_commander_reinvestigation_uses_pending_sop(self):
+        from unittest.mock import AsyncMock
+        from app.domain import incident_knowledge
+        from app.domain.agents import langgraph_investigator
+        from app.domain.commander import conversation
+
+        incident_id = self.ingest(docs=[])["incident_id"]
+        incident_knowledge.initialize(self.db)
+        with self.db.get_connection() as conn:
+            conn.execute(
+                "UPDATE incident SET tenant_id=%s,workspace_id=%s,primary_job_id=%s WHERE incident_id=%s",
+                ("tenant-a", "workspace-a", "job-a", incident_id),
+            )
+        self.obj.save_agent_findings(
+            incident_id, {"hypotheses": [], "evidence": [], "impacts": [],
+                          "action_plan": {"rationale": "Initial", "steps": []}},
+            critic_status="INCONCLUSIVE",
+        )
+        item_id = incident_knowledge.submit(
+            self.db, "tenant-a", "workspace-a", incident_id, "job-a",
+            "SOP", "Procedure", "Inspect the queue.", "operator",
+        )
+        captured = {}
+
+        class Investigator:
+            async def investigate(self, *args, **kwargs):
+                captured["reference"] = kwargs["reference_context"]
+                return {
+                    "rca_result": {"finding": "Possible issue", "confidence": 0.1},
+                    "impact_result": {"impacts": []},
+                    "runbook_result": {"finding": "Review " + item_id, "steps": []},
+                    "critic_status": "PASSED",
+                    "final_plan": {
+                        "rationale": "Inspect queue",
+                        "expected_outcome": "Queue inspected",
+                        "steps": [{"action": "Inspect queue", "tool": "manual", "risk": "LOW"}],
+                    },
+                }
+
+        async def request():
+            conv = conversation.CommanderConversation(db=self.db)
+            conv.agent.react_to_guidance = AsyncMock(return_value="Request recorded.")
+            result = await conv.guide(
+                incident_id, "tenant-a", "Please re-investigate using the submitted incident references.",
+                "operator", guidance_type="INVESTIGATION_DIRECTION", is_fact=False,
+            )
+            self.assertTrue(result["reinvestigation_triggered"])
+            await asyncio.gather(*list(conversation._BACKGROUND_TASKS))
+
+        with patch.object(langgraph_investigator, "LangGraphInvestigator", Investigator):
+            asyncio.run(request())
+        self.assertIn(item_id, captured["reference"])
+        self.assertIn("Inspect the queue.", captured["reference"])
+        with self.db.get_connection() as conn:
+            plan = conn.execute(
+                "SELECT status,rationale FROM action_plan WHERE incident_id=%s ORDER BY plan_version DESC LIMIT 1",
+                (incident_id,),
+            ).fetchone()
+        self.assertEqual(plan[0], "NEEDS_REVIEW")
+        self.assertIn(item_id, plan[1])
+
+    def test_truncated_approved_sop_keeps_plan_in_review(self):
+        from app.domain import incident_knowledge
+        from app.domain.agents import langgraph_investigator
+
+        incident_id = self.ingest(docs=[])["incident_id"]
+        incident_knowledge.initialize(self.db)
+        with self.db.get_connection() as conn:
+            conn.execute(
+                "UPDATE incident SET tenant_id=%s, workspace_id=%s, primary_job_id=%s, status='DETECTED' WHERE incident_id=%s",
+                ("tenant-a", "workspace-a", "job-a", incident_id),
+            )
+        for number in range(2):
+            item_id = incident_knowledge.submit(
+                self.db, "tenant-a", "workspace-a", incident_id, "job-a",
+                "SOP", f"Long procedure {number}", "x" * 70000, "operator",
+            )
+            self.assertTrue(incident_knowledge.review(
+                self.db, "tenant-a", "workspace-a", item_id, "APPROVED", "admin",
+            ))
+
+        class Investigator:
+            async def investigate(self, *args, **kwargs):
+                return {
+                    "rca_result": {"finding": "Unknown"},
+                    "impact_result": {"impacts": []},
+                    "runbook_result": {"steps": []},
+                    "critic_status": "PASSED",
+                    "final_plan": {"rationale": "Review", "steps": [
+                        {"action": "Manual review", "tool": "manual", "risk": "LOW"}
+                    ]},
+                }
+
+        with patch.object(langgraph_investigator, "LangGraphInvestigator", Investigator):
+            self.assertTrue(self.obj.triage_incident(incident_id)["saved_plan"])
+        with self.db.get_connection() as conn:
+            status, rationale = conn.execute(
+                "SELECT status,rationale FROM action_plan WHERE incident_id=%s",
+                (incident_id,),
+            ).fetchone()
+        self.assertEqual(status, "NEEDS_REVIEW")
+        self.assertIn("context limits", rationale)
+
+    def test_complete_long_sop_reaches_investigator(self):
+        from app.domain import incident_knowledge
+        from app.domain.agents import langgraph_investigator
+
+        incident_id = self.ingest(docs=[])["incident_id"]
+        incident_knowledge.initialize(self.db)
+        with self.db.get_connection() as conn:
+            conn.execute(
+                "UPDATE incident SET tenant_id=%s, workspace_id=%s, primary_job_id=%s, status='DETECTED' WHERE incident_id=%s",
+                ("tenant-a", "workspace-a", "job-a", incident_id),
+            )
+        content = "x" * 9000 + " END-OF-PROCEDURE"
+        item_id = incident_knowledge.submit(
+            self.db, "tenant-a", "workspace-a", incident_id, "job-a",
+            "SOP", "Long procedure", content, "operator",
+        )
+        self.assertTrue(incident_knowledge.review(
+            self.db, "tenant-a", "workspace-a", item_id, "APPROVED", "admin",
+        ))
+        captured = {}
+
+        class Investigator:
+            async def investigate(self, *args, **kwargs):
+                captured["reference"] = kwargs["reference_context"]
+                return {
+                    "rca_result": {"finding": "Unknown"},
+                    "impact_result": {"impacts": []},
+                    "runbook_result": {"steps": []},
+                    "critic_status": "PASSED",
+                    "final_plan": {"rationale": "Review", "steps": [
+                        {"action": "Manual review", "tool": "manual", "risk": "LOW"}
+                    ]},
+                }
+
+        with patch.object(langgraph_investigator, "LangGraphInvestigator", Investigator):
+            self.assertTrue(self.obj.triage_incident(incident_id)["saved_plan"])
+        reference = json.loads(captured["reference"].split("\n", 1)[1])
+        self.assertEqual(reference["items"][0]["content"], content)
+        self.assertFalse(reference["items"][0]["content_truncated"])
+        with self.db.get_connection() as conn:
+            status = conn.execute(
+                "SELECT status FROM action_plan WHERE incident_id=%s", (incident_id,)
+            ).fetchone()[0]
+        self.assertEqual(status, "PENDING_APPROVAL")
+
+    def test_approved_sop_is_available_to_a_new_investigation(self):
+        from app.domain import incident_knowledge
+        from app.domain.agents import langgraph_investigator
+
+        incident_id = self.ingest(docs=[])["incident_id"]
+        incident_knowledge.initialize(self.db)
+        with self.db.get_connection() as conn:
+            conn.execute(
+                "UPDATE incident SET tenant_id=%s, workspace_id=%s, primary_job_id=%s, status='DETECTED' WHERE incident_id=%s",
+                ("tenant-a", "workspace-a", "job-a", incident_id),
+            )
+        item_id = incident_knowledge.submit(
+            self.db, "tenant-a", "workspace-a", incident_id, "job-a",
+            "SOP", "Recovery", "Inspect the queue.", "operator",
+        )
+        self.assertTrue(incident_knowledge.review(
+            self.db, "tenant-a", "workspace-a", item_id, "APPROVED", "admin",
+        ))
+        captured = {}
+
+        class Investigator:
+            async def investigate(self, *args, **kwargs):
+                captured["reference"] = kwargs["reference_context"]
+                return {
+                    "rca_result": {"finding": "Possible queue issue", "confidence": 0.1},
+                    "impact_result": {"impacts": []},
+                    "runbook_result": {"finding": f"Review procedure {item_id}", "steps": []},
+                    "critic_status": "INCONCLUSIVE",
+                    "final_plan": {
+                        "rationale": "Inspect the queue",
+                        "expected_outcome": "Queue inspected",
+                        "steps": [{"action": "Inspect queue", "tool": "manual", "risk": "LOW"}],
+                    },
+                }
+
+        with patch.object(langgraph_investigator, "LangGraphInvestigator", Investigator):
+            self.assertTrue(self.obj.triage_incident(incident_id)["saved_plan"])
+        self.assertIn(item_id, captured["reference"])
+        self.assertIn("Inspect the queue.", captured["reference"])
+        self.assertIn('"status": "APPROVED"', captured["reference"])
+        with self.db.get_connection() as conn:
+            plan = conn.execute(
+                "SELECT status,rationale FROM action_plan WHERE incident_id=%s ORDER BY created_at DESC LIMIT 1",
+                (incident_id,),
+            ).fetchone()
+        self.assertEqual(plan[0], "NEEDS_REVIEW")
+        self.assertIn(item_id, plan[1])
 
     def test_email_plan_remains_needs_review(self):
         result = self.ingest()

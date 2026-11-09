@@ -562,10 +562,10 @@ def build_operations_snapshot(
         commander_summary = f"Highest priority: {top['title']} — {top['detail']}"
     elif open_incidents:
         commander_headline = f"{len(open_incidents)} open incident{'s' if len(open_incidents) != 1 else ''}; no urgent operator action detected."
-        commander_summary = "NemoGuard is continuing to monitor the active incident lifecycle."
+        commander_summary = "Review open incidents for their current status."
     else:
-        commander_headline = "No active incident currently requires operator attention."
-        commander_summary = "Alert intake and platform health remain visible below; unknown states are reported explicitly."
+        commander_headline = "No urgent items identified."
+        commander_summary = "Review alert intake and system status below. Missing data may limit this summary."
 
     return {
         "generated_at": now.isoformat(),

@@ -11,6 +11,13 @@ from app.domain.activities.execution_activity import execute_plan_activity
 logging.basicConfig(level=logging.INFO)
 
 async def main():
+    # Workers can start before the API. Ensure the additive knowledge tables
+    # exist before accepting investigations, rather than silently omitting
+    # operator-submitted references.
+    from app.domain import incident_knowledge
+    from app.store.database_factory import get_database
+    incident_knowledge.initialize(get_database())
+
     temporal_url = os.getenv("TEMPORAL_URL", "localhost:7233")
     logging.info(f"Connecting to Temporal server at {temporal_url}")
     

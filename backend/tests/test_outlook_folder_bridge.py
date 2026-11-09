@@ -87,6 +87,50 @@ class BridgeTests(unittest.TestCase):
             "SELECT payload FROM messages WHERE message_key=?", (key,)
         ).fetchone()[0])
 
+    def test_attachments_survive_retry_and_unsupported_are_reported(self):
+        class Attachment:
+            def __init__(self, name, content):
+                self.FileName, self.content, self.Size = name, content, len(content)
+
+            def SaveAsFile(self, path):
+                Path(path).write_bytes(self.content)
+
+        self.outbox.baseline([])
+        item = self.mail("new")
+        item.Attachments = Collection([
+            Attachment("full.log", b"start\n" + b"x" * 5000 + b"\nEND"),
+            Attachment("image.png", b"binary"),
+        ])
+        self.assertEqual(bridge.scan_folder(SimpleNamespace(Items=Collection([item])), "store", self.outbox), ("scanned", 1))
+        key, payload = self.outbox.pending()[0]
+        data = json.loads(payload)
+        self.assertTrue(data["attachments"][0]["text"].endswith("END"))
+        self.assertEqual(data["omitted_attachments"], [{"name": "image.png", "reason": "unsupported_format"}])
+        self.outbox.record(key, "retry", "network")
+        self.outbox.close()
+        self.outbox = bridge.Outbox(self.path, "Test mailbox", bridge.FOLDER_NAME, self.url)
+        self.assertEqual(self.outbox.pending(), [(key, payload)])
+
+    def test_oversized_attachment_blocks_delivery(self):
+        self.outbox.baseline([])
+        item = self.mail("large-attachment")
+        item.Attachments = Collection([SimpleNamespace(FileName="large.log", Size=bridge.MAX_ATTACHMENT_BYTES + 1)])
+        self.assertEqual(bridge.scan_folder(SimpleNamespace(Items=Collection([item])), "store", self.outbox), ("scanned", 0))
+        self.assertEqual(self.outbox.pending(), [])
+        self.assertEqual(self.outbox.counts()["blocked"], 1)
+
+    def test_transient_attachment_error_retries_without_blocking_other_messages(self):
+        self.outbox.baseline([])
+        first = self.mail("first")
+        second = self.mail("second")
+        folder = SimpleNamespace(Items=Collection([first, second]))
+        with patch.object(bridge, "capture_attachments", side_effect=[OSError("temporary"), ([], [])]):
+            self.assertEqual(bridge.scan_folder(folder, "store", self.outbox), ("scanned", 1))
+        self.assertFalse(self.outbox.known(bridge.message_key("store", "first")))
+        self.assertTrue(self.outbox.known(bridge.message_key("store", "second")))
+        self.assertEqual(bridge.scan_folder(folder, "store", self.outbox), ("scanned", 1))
+        self.assertEqual(len(self.outbox.pending()), 2)
+
     def test_no_baseline_when_enumeration_fails(self):
         folder = SimpleNamespace(Items=Collection([self.mail("")]))
         with self.assertRaises(RuntimeError):
@@ -113,6 +157,18 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(bridge.send_payload(self.url, "secret", key, payload, opener), ("done", "ignored"))
         self.assertEqual(opener.requests[0].data, opener.requests[1].data)
         self.assertEqual(opener.requests[0].get_header("Idempotency-key"), key)
+
+    def test_gateway_size_rejection_blocks_and_preserves_payload(self):
+        self.outbox.add("key", "Subject", "Body", [{"name": "job.log", "text": "log"}])
+        key, payload = self.outbox.pending()[0]
+        error = HTTPError(self.url, 413, "too large", {}, io.BytesIO())
+        outcome, detail = bridge.send_payload(self.url, "secret", key, payload, Opener([error]))
+        self.assertEqual((outcome, detail), ("blocked", "http_413"))
+        self.outbox.record(key, outcome, detail)
+        row = self.outbox.conn.execute(
+            "SELECT status, payload FROM messages WHERE message_key=?", (key,)
+        ).fetchone()
+        self.assertEqual(row, ("blocked", payload))
 
     def test_heartbeat_sends_counts_only_and_tolerates_failure(self):
         class HeartbeatResponse(Response):
@@ -180,8 +236,8 @@ class BridgeTests(unittest.TestCase):
             prefix + "def\t172.17.0.1:31000->1880/tcp",
         ]
         opener = Opener([
-            {"database": "healthy", "orchestrator": "healthy", "outlook_bridge_contract": 1},
-            {"database": "healthy", "orchestrator": "healthy", "outlook_bridge_contract": 1},
+            {"database": "healthy", "orchestrator": "available", "outlook_bridge_contract": 1, "outlook_bridge_attachments": True},
+            {"database": "healthy", "orchestrator": "available", "outlook_bridge_contract": 1, "outlook_bridge_attachments": True},
         ])
         with patch.object(bridge.subprocess, "run", side_effect=[
             SimpleNamespace(stdout=output) for output in outputs

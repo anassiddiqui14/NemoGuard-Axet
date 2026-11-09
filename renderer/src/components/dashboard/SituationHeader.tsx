@@ -219,9 +219,9 @@ export function SafetyReviewBanner({ feedback }: { feedback?: string }) {
                 <ShieldAlert className="w-4 h-4 text-critical" />
             </div>
             <div>
-                <div className="text-[13px] font-semibold text-critical mb-1">Safety Agent flagged this plan</div>
-                <div className="text-[12px] text-text-secondary leading-relaxed">
-                    {feedback || 'The Grounding Critic could not fully verify evidence-to-conclusion grounding for this plan. Review carefully before approving.'}
+                <div className="text-[13px] font-semibold text-critical mb-1">Plan requires review</div>
+                <div className="text-[12px] text-text-secondary leading-relaxed whitespace-pre-wrap">
+                    {feedback || 'Review the investigation and complete the required safety checks before approval.'}
                 </div>
             </div>
         </div>

@@ -22,7 +22,7 @@ Operators can move an alert's correlation from one existing incident to another 
 
 The updated bridge sends a best-effort report after a folder scan containing local pending, blocked, and baseline counts. The backend records the report receipt time. These values describe a snapshot from one bridge, not complete production coverage or current service health. Multiple bridges using the same tenant and workspace overwrite one another's latest report. A missing or old report does not establish why the bridge stopped.
 
-The first bridge scan baselines existing messages without sending them. Messages removed before a scan and items blocked locally, including oversized or empty messages, are not represented as inbox emails. Counts of blocked or baselined messages do not include their contents. Email attachments are not sent by this bridge.
+The first bridge scan baselines existing messages without sending them. Messages removed before a scan and items blocked locally, including oversized or empty messages, are not represented as inbox emails. Counts of blocked or baselined messages do not include their contents. The updated bridge can capture supported UTF-8 text attachments and report unsupported files as omitted. The local changes are not deployed; live Outlook, gateway limits, and agent behavior remain unverified. Captured attachment text is retained with the original delivery and is unverified external evidence. See `OUTLOOK_FOLDER_BRIDGE.md` for limits and local storage risks.
 
 The inbox refreshes periodically, but the timestamp and warning must be checked before relying on a report. The list is limited to 200 entries and currently has no pagination.
 

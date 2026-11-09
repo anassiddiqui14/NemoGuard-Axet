@@ -46,6 +46,46 @@ class IncidentOrchestrator:
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
             """, (self._generate_id("AUD"), incident_id, "SYSTEM", actor, event_type, summary, datetime.now(timezone.utc).isoformat()))
 
+    def _reference_context(self, incident_id: str):
+        from app.domain import incident_knowledge
+        if not self.db.table_exists("incident_knowledge"):
+            return "", False
+        context = incident_knowledge.context_for_incident(self.db, incident_id)
+        # The context retrieval is limited; review gating must not depend on
+        # which records happened to fit in that limited result set.
+        with self.db.get_connection() as conn:
+            has_pending = bool(conn.execute(
+                "SELECT 1 FROM incident_knowledge k JOIN incident i "
+                "ON i.incident_id=k.incident_id AND i.tenant_id=k.tenant_id "
+                "AND i.workspace_id=k.workspace_id "
+                "WHERE k.incident_id=%s AND k.status='PENDING' LIMIT 1",
+                (incident_id,),
+            ).fetchone())
+        # A reviewer may change an item's status after the context snapshot
+        # was read. A plan that saw pending content must remain in review
+        # even if the item was subsequently approved or rejected.
+        has_pending = has_pending or any(item["status"] == "PENDING" for item in context["items"])
+        contents = [item.get("content") or "" for item in context["items"]]
+        incomplete = (
+            len(contents) >= 20
+            or any(len(text) > incident_knowledge.MAX_CONTEXT_PER_REFERENCE for text in contents)
+            or sum(map(len, contents)) > incident_knowledge.MAX_CONTEXT_TOTAL
+        )
+        return incident_knowledge.context_as_text(context), has_pending or incomplete
+
+    @staticmethod
+    def _plan_rationale(plan, runbook, impact):
+        """Retain agent assessments, including requests for missing context."""
+        sections = []
+        for label, result in (("Runbook assessment", runbook), ("Dependency assessment", impact)):
+            finding = result.get("finding") if isinstance(result, dict) else None
+            if isinstance(finding, str) and finding.strip():
+                sections.append(f"{label} (agent-generated, verify): {finding.strip()[:2000]}")
+        rationale = plan.get("rationale")
+        if isinstance(rationale, str) and rationale.strip():
+            sections.append(rationale.strip())
+        return "\n\n".join(sections)
+
     def triage_incident(self, incident_id: str, has_runbook: bool = True):
         import asyncio
         import json
@@ -83,7 +123,8 @@ class IncidentOrchestrator:
                 })
 
         try:
-            final_state = asyncio.run(investigator.investigate(incident_id, alerts_data, audit_callback=self._log_audit))
+            reference_context, has_pending = self._reference_context(incident_id)
+            final_state = asyncio.run(investigator.investigate(incident_id, alerts_data, audit_callback=self._log_audit, reference_context=reference_context))
             
             rca_res = final_state.get("rca_result", {})
             impact_res = final_state.get("impact_result", {})
@@ -108,7 +149,7 @@ class IncidentOrchestrator:
                 "hypotheses": rca_hypotheses,
                 "impacts": impact_res.get("impacts", []),
                 "action_plan": {
-                    "rationale": plan_res.get("rationale", ""),
+                    "rationale": self._plan_rationale(plan_res, runbook_res, impact_res),
                     "expected_outcome": plan_res.get("expected_outcome", ""),
                     "risk": plan_res.get("risk", "MEDIUM"),
                     "steps": plan_res.get("steps", [])
@@ -127,6 +168,7 @@ class IncidentOrchestrator:
             result = self.save_agent_findings(
                 incident_id, llm_response,
                 critic_status=critic_status, critic_feedback=critic_feedback,
+                pending_knowledge=has_pending,
             )
             saved_plan = bool(result and result.get("status") == "success" and result.get("plan_id"))
         except Exception as e:
@@ -224,7 +266,7 @@ class IncidentOrchestrator:
     def save_agent_findings(
         self, incident_id: str, llm_response: Dict[str, Any], critic_passed: bool = None,
         critic_feedback: str = "", parent_plan_id: str = None, feedback_reference: str = None,
-        plan_version: int = 1, critic_status: str = None,
+        plan_version: int = 1, critic_status: str = None, pending_knowledge: bool = False,
     ) -> Dict[str, Any]:
         """
         Saves the JSON output from the NemoClaw agents into the database.
@@ -304,6 +346,16 @@ class IncidentOrchestrator:
             }
             
         with self.db.get_connection() as conn:
+            # Lock the incident before persisting a new plan. Never overwrite
+            # an executing or terminal incident with stale agent output.
+            claim = conn.execute(
+                "UPDATE incident SET updated_at=updated_at WHERE incident_id=%s "
+                "AND status IN ('DETECTED','CORRELATING','TRIAGING','INVESTIGATING',"
+                "'PLAN_READY','AWAITING_APPROVAL','MANUAL_ACTION_REQUIRED')",
+                (incident_id,),
+            )
+            if claim.rowcount != 1:
+                return {"error": "Incident state does not permit saving investigation findings."}
             # Ensure SYSTEM agent_run exists for foreign keys
             conn.execute("""
                 INSERT INTO agent_run (agent_run_id, incident_id, agent_name, objective, status)
@@ -381,8 +433,10 @@ class IncidentOrchestrator:
                 "WHERE ia.incident_id = %s LIMIT 1",
                 (incident_id,),
             ).fetchone()
-            plan_status = "PENDING_APPROVAL" if critic_status == "PASSED" and not reviewed_source else "NEEDS_REVIEW"
+            plan_status = "PENDING_APPROVAL" if critic_status == "PASSED" and not reviewed_source and not pending_knowledge else "NEEDS_REVIEW"
             rationale = plan_data.get("rationale", "")
+            if pending_knowledge:
+                rationale = "[REFERENCE REVIEW REQUIRED] Reference material is pending approval or exceeds the investigation context limits. Pending material requires admin review and a new investigation. If content was truncated, review the full procedure manually; automatic plan approval is unavailable.\n\n" + rationale
             if reviewed_source:
                 rationale = (
                     "[UNVERIFIED EMAIL EVIDENCE] This plan includes "
@@ -683,13 +737,26 @@ class IncidentOrchestrator:
             row = cursor.fetchone()
             incident_run_id = row[0] if row and row[0] else ""
 
+        if not steps:
+            raise ValueError("Cannot execute a plan without steps.")
         intents = action_steps_to_intents(steps, incident_run_id=incident_run_id)
         compiled = plan_compiler.compile_plan(incident_id, plan_id, plan_version, intents)
+        if len(intents) != len(steps) or len(compiled.actions) != len(steps):
+            raise ValueError("Cannot execute an incomplete compiled plan.")
+
+        # Commit the claim before external effects. If a worker crashes after
+        # an effect, the plan stays EXECUTING rather than becoming retryable.
+        with self.db.get_connection() as conn:
+            claim = conn.execute(
+                "UPDATE action_plan SET status = 'EXECUTING', compiled_plan_hash = %s "
+                "WHERE action_plan_id = %s AND incident_id = %s AND status = 'APPROVED' AND plan_version = %s",
+                (compiled.plan_hash, plan_id, incident_id, plan_version),
+            )
+            if claim.rowcount != 1:
+                raise ValueError("Plan is no longer approved or has already been claimed for execution.")
 
         all_verified = True
         with self.db.get_connection() as conn:
-            conn.execute("UPDATE action_plan SET status = 'EXECUTING', compiled_plan_hash = %s WHERE action_plan_id = %s", (compiled.plan_hash, plan_id))
-
             for step, action in zip(steps, compiled.actions):
                 conn.execute(
                     "UPDATE action_step SET capability_id = %s, capability_version = %s, status = 'EXECUTING' WHERE action_step_id = %s",
@@ -700,7 +767,7 @@ class IncidentOrchestrator:
 
                 exec_now = datetime.now(timezone.utc).isoformat()
                 verified = record.verification.status == VerificationStatus.PASSED
-                if record.verification.status in (VerificationStatus.FAILED, VerificationStatus.INCONCLUSIVE):
+                if record.result.status.value != "SUCCESS" or not verified:
                     all_verified = False
 
                 step_status = "SUCCEEDED" if record.result.status.value == "SUCCESS" and verified else "FAILED"
@@ -728,10 +795,12 @@ class IncidentOrchestrator:
                     _json.dumps(record.verification.details), "[]", exec_now,
                 ))
 
-                self._log_audit(
-                    incident_id, "Executor", "ACTION_EXECUTED",
-                    f"Capability {action.capability_id} executed with result={record.result.status.value}, "
-                    f"verification={record.verification.status.value}.",
+                conn.execute(
+                    "INSERT INTO audit_event (audit_event_id, incident_id, actor_type, actor_id, event_type, event_summary, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (self._generate_id("AUD"), incident_id, "SYSTEM", "Executor", "ACTION_EXECUTED",
+                     f"Capability {action.capability_id} executed with result={record.result.status.value}, "
+                     f"verification={record.verification.status.value}.", exec_now),
                 )
 
             if all_verified:
@@ -742,6 +811,13 @@ class IncidentOrchestrator:
                 conn.execute("UPDATE incident SET status = %s WHERE incident_id = %s", (IncidentState.FAILED.value, incident_id))
 
         if all_verified:
+            from app.domain import incident_knowledge
+            if self.db.table_exists("incident_history_memory"):
+                try:
+                    incident_knowledge.record_history(self.db, incident_id)
+                except Exception:
+                    import logging
+                    logging.getLogger(__name__).exception("Could not record incident history for %s", incident_id)
             self._log_audit(incident_id, "Verifier", "VERIFICATION_PASSED", "Independent verification passed for all executed actions.")
             self._log_audit(incident_id, "Commander", "INCIDENT_RESOLVED", "Incident resolved successfully — verified against real system state.")
         else:
@@ -752,12 +828,15 @@ class IncidentOrchestrator:
         """Handles user feedback on an existing action plan and generates a revised plan."""
         with self.db.get_connection() as conn:
             # 1. Fetch existing plan
-            cursor = conn.execute("SELECT action_plan_id, rationale, expected_outcome, overall_risk FROM action_plan WHERE incident_id = %s ORDER BY created_at DESC LIMIT 1", (incident_id,))
+            cursor = conn.execute("SELECT action_plan_id, rationale, expected_outcome, overall_risk, plan_version, status FROM action_plan WHERE incident_id = %s ORDER BY plan_version DESC, created_at DESC LIMIT 1", (incident_id,))
             plan_row = cursor.fetchone()
             if not plan_row:
                 return {"error": "No existing action plan found for this incident."}
-            
+            if plan_row[5] not in ("PENDING_APPROVAL", "NEEDS_REVIEW"):
+                return {"error": "This plan cannot be revised in its current state."}
+
             plan_id = plan_row[0]
+            original_version = plan_row[4]
             existing_plan = {
                 "rationale": plan_row[1],
                 "expected_outcome": plan_row[2],
@@ -830,6 +909,22 @@ class IncidentOrchestrator:
             + llm_response.get("rationale", "")
         )
         with self.db.get_connection() as conn:
+            # Serialize with approval and re-investigation on the incident.
+            claim = conn.execute(
+                "UPDATE incident SET updated_at=updated_at WHERE incident_id=%s "
+                "AND status IN ('PLAN_READY','AWAITING_APPROVAL','MANUAL_ACTION_REQUIRED')",
+                (incident_id,),
+            )
+            if claim.rowcount != 1:
+                return {"error": "Incident state changed; feedback was not applied."}
+            current = conn.execute(
+                "SELECT action_plan_id, plan_version, status FROM action_plan WHERE incident_id=%s "
+                "ORDER BY plan_version DESC, created_at DESC LIMIT 1",
+                (incident_id,),
+            ).fetchone()
+            if not current or current[0] != plan_id or current[1] != original_version or current[2] not in ("PENDING_APPROVAL", "NEEDS_REVIEW"):
+                return {"error": "Plan changed; feedback was not applied."}
+
             # Delete old steps
             conn.execute("DELETE FROM action_step WHERE action_plan_id = %s", (plan_id,))
             
@@ -963,15 +1058,26 @@ class IncidentOrchestrator:
         # DURING the run, not just after it completes.
         try:
             with self.db.get_connection() as conn:
-                conn.execute(
-                    "UPDATE incident SET status = %s, updated_at = %s WHERE incident_id = %s",
-                    (IncidentState.INVESTIGATING.value, datetime.now(timezone.utc).isoformat(), incident_id),
+                claim = conn.execute(
+                    "UPDATE incident SET status = %s, updated_at = %s WHERE incident_id = %s AND status = %s",
+                    (IncidentState.INVESTIGATING.value, datetime.now(timezone.utc).isoformat(), incident_id, current_status),
                 )
+                if claim.rowcount != 1:
+                    return {"status": "skipped", "reason": "incident state changed; re-investigation was not started"}
+                current_plan = conn.execute(
+                    "SELECT action_plan_id, plan_version, status FROM action_plan WHERE incident_id=%s "
+                    "ORDER BY plan_version DESC, created_at DESC LIMIT 1",
+                    (incident_id,),
+                ).fetchone()
+                if (not current_plan or current_plan[0] != rejected_plan_id
+                        or (current_plan[1] or 1) != prev_version
+                        or current_plan[2] not in ("PENDING_APPROVAL", "NEEDS_REVIEW")):
+                    # Raising rolls back the incident claim with the transaction.
+                    raise RuntimeError("Plan changed; re-investigation was not started")
         except Exception as e:
             print(f"reinvestigate_from_commander_guidance: could not transition {incident_id} to INVESTIGATING: {e}")
+            return {"error": "Could not start re-investigation"}
 
-        from app.domain.agents.langgraph_investigator import LangGraphInvestigator
-        investigator = LangGraphInvestigator()
         feedback_context = (
             "RECENT OPERATOR GUIDANCE (JSON; observations are not independently verified):\n"
             f"{json.dumps(guidance_history, ensure_ascii=False)}\n\n"
@@ -981,9 +1087,12 @@ class IncidentOrchestrator:
             "current hypotheses and plan against all relevant guidance."
         )
         try:
+            from app.domain.agents.langgraph_investigator import LangGraphInvestigator
+            investigator = LangGraphInvestigator()
+            reference_context, has_pending = self._reference_context(incident_id)
             final_state = await investigator.investigate(
                 incident_id, alerts_data, audit_callback=self._log_audit,
-                feedback_context=feedback_context,
+                feedback_context=feedback_context, reference_context=reference_context,
             )
         except Exception as e:
             self._log_audit(incident_id, "SYSTEM", "REINVESTIGATION_FAILED", f"Re-investigation after Commander Live guidance failed: {e}")
@@ -993,8 +1102,8 @@ class IncidentOrchestrator:
             try:
                 with self.db.get_connection() as conn:
                     conn.execute(
-                        "UPDATE incident SET status = %s, updated_at = %s WHERE incident_id = %s",
-                        (current_status, datetime.now(timezone.utc).isoformat(), incident_id),
+                        "UPDATE incident SET status = %s, updated_at = %s WHERE incident_id = %s AND status = %s",
+                        (current_status, datetime.now(timezone.utc).isoformat(), incident_id, IncidentState.INVESTIGATING.value),
                     )
             except Exception as restore_exc:
                 print(f"reinvestigate_from_commander_guidance: could not restore status for {incident_id}: {restore_exc}")
@@ -1002,6 +1111,7 @@ class IncidentOrchestrator:
 
         rca_res = final_state.get("rca_result", {})
         impact_res = final_state.get("impact_result", {})
+        runbook_res = final_state.get("runbook_result", {})
         plan_res = final_state.get("final_plan", {})
         rca_hypotheses = rca_res.get("hypotheses") or [{
             "statement": rca_res.get("finding", "Unknown root cause"),
@@ -1013,7 +1123,7 @@ class IncidentOrchestrator:
             "hypotheses": rca_hypotheses,
             "impacts": impact_res.get("impacts", []),
             "action_plan": {
-                "rationale": plan_res.get("rationale", ""),
+                "rationale": self._plan_rationale(plan_res, runbook_res, impact_res),
                 "expected_outcome": plan_res.get("expected_outcome", ""),
                 "risk": plan_res.get("risk", "MEDIUM"),
                 "steps": plan_res.get("steps", []),
@@ -1035,15 +1145,15 @@ class IncidentOrchestrator:
                 critic_feedback=final_state.get("critic_feedback", ""),
                 parent_plan_id=rejected_plan_id,
                 feedback_reference=guidance_id,
-                plan_version=prev_version + 1,
+                plan_version=prev_version + 1, pending_knowledge=has_pending,
             )
         except Exception as e:
             self._log_audit(incident_id, "SYSTEM", "REINVESTIGATION_FAILED", f"Saving the revised plan after Commander Live guidance failed: {e}")
             try:
                 with self.db.get_connection() as conn:
                     conn.execute(
-                        "UPDATE incident SET status = %s, updated_at = %s WHERE incident_id = %s",
-                        (current_status, datetime.now(timezone.utc).isoformat(), incident_id),
+                        "UPDATE incident SET status = %s, updated_at = %s WHERE incident_id = %s AND status = %s",
+                        (current_status, datetime.now(timezone.utc).isoformat(), incident_id, IncidentState.INVESTIGATING.value),
                     )
             except Exception as restore_exc:
                 print(f"reinvestigate_from_commander_guidance: could not restore status for {incident_id}: {restore_exc}")
@@ -1056,8 +1166,8 @@ class IncidentOrchestrator:
             try:
                 with self.db.get_connection() as conn:
                     conn.execute(
-                        "UPDATE incident SET status = %s, updated_at = %s WHERE incident_id = %s",
-                        (current_status, datetime.now(timezone.utc).isoformat(), incident_id),
+                        "UPDATE incident SET status = %s, updated_at = %s WHERE incident_id = %s AND status = %s",
+                        (current_status, datetime.now(timezone.utc).isoformat(), incident_id, IncidentState.INVESTIGATING.value),
                     )
             except Exception as restore_exc:
                 print(f"reinvestigate_from_commander_guidance: could not restore status for {incident_id}: {restore_exc}")

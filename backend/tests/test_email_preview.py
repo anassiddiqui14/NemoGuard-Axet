@@ -135,7 +135,9 @@ class PreviewTests(unittest.TestCase):
             with db.get_connection() as conn:
                 conn.execute("CREATE TABLE webhook_delivery (delivery_key TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, result_json TEXT NOT NULL)")
                 conn.execute("CREATE TABLE reviewed_alert_document (document_id TEXT PRIMARY KEY, alert_id TEXT NOT NULL REFERENCES alert(alert_id), document_kind TEXT NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL, submitted_by TEXT NOT NULL, created_at TEXT NOT NULL)")
-            payload = {"source": "Outlook email", "monitor_name": "Synthetic job", "message": "Synthetic failure"}
+            payload = {"source": "Outlook email", "monitor_name": "Synthetic job", "message": "Synthetic failure",
+                       "attachments": [{"name": "job.log", "text": "ERROR\n" + "x" * 12000 + "\nFINAL"}],
+                       "omitted_attachments": [{"name": "image.png", "reason": "unsupported_format"}]}
             headers = {"X-NemoGuard-Webhook-Secret": "test-webhook-secret", "Idempotency-Key": "outlook:integration"}
             from app.store import alert_inbox
             import app.api.main as api
@@ -159,7 +161,11 @@ class PreviewTests(unittest.TestCase):
                 self.assertEqual(row[0], "Automatic Outlook email (unreviewed)")
                 self.assertEqual(row[1], "LOW")
                 self.assertIn('"operator_reviewed": false', row[2])
-                self.assertEqual(conn.execute("SELECT COUNT(*) FROM reviewed_alert_document").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM reviewed_alert_document").fetchone()[0], 2)
+                attachment = conn.execute("SELECT content, submitted_by FROM reviewed_alert_document WHERE document_kind=%s", ("EMAIL_ATTACHMENT",)).fetchone()
+                self.assertTrue(attachment[0].endswith("FINAL"))
+                self.assertEqual(attachment[1], "automatic-outlook-bridge")
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM evidence WHERE incident_id=%s", (first.json()["incident_id"],)).fetchone()[0], 2)
 
     def test_inbox_retains_ignored_and_rejects_conflicts(self):
         import app.api.main as api
@@ -205,7 +211,9 @@ class PreviewTests(unittest.TestCase):
         self.db.init_schema()
         with self.db.get_connection() as conn:
             conn.execute("CREATE TABLE reviewed_alert_document (document_id TEXT PRIMARY KEY, alert_id TEXT NOT NULL REFERENCES alert(alert_id), document_kind TEXT NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL, submitted_by TEXT NOT NULL, created_at TEXT NOT NULL)")
-        payload = {"source": "Outlook email", "monitor_name": "Failure", "message": "Synthetic body"}
+        payload = {"source": "Outlook email", "monitor_name": "Failure", "message": "Synthetic body",
+                   "attachments": [{"name": "job.log", "text": "full log END"}],
+                   "omitted_attachments": [{"name": "image.png", "reason": "unsupported_format"}]}
         headers = {"X-NemoGuard-Webhook-Secret": "test-webhook-secret", "Idempotency-Key": "outlook:promote"}
         with patch.object(api, "ingest_webhook", new_callable=AsyncMock, return_value={"status": "ignored"}):
             self.assertEqual(self.client.post("/api/v2/ingest/outlook-bridge", json=payload, headers=headers).status_code, 200)
@@ -222,9 +230,12 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual(detail["state"], "promoted")
         self.assertEqual(detail["result"]["status"], "ignored")
         self.assertEqual(detail["promotion"]["alert_id"], result.json()["alert_id"])
+        self.assertEqual(detail["attachments"], payload["attachments"])
+        self.assertEqual(detail["omitted_attachments"], payload["omitted_attachments"])
         with self.db.get_connection() as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM alert").fetchone()[0], 1)
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM reviewed_alert_document").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM reviewed_alert_document").fetchone()[0], 2)
+            self.assertEqual(conn.execute("SELECT content FROM reviewed_alert_document WHERE document_kind=%s", ("EMAIL_ATTACHMENT",)).fetchone()[0], "full log END")
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM incident").fetchone()[0], 0)
 
     def test_promotion_rolls_back_when_document_insert_fails(self):
@@ -300,7 +311,8 @@ class PreviewTests(unittest.TestCase):
                     "source_system": "Outlook", "message": "Reported failure",
                 }}
 
-        payload = {"source": "Outlook email", "monitor_name": "Retry", "message": "Synthetic body", "type": "Email alert"}
+        payload = {"source": "Outlook email", "monitor_name": "Retry", "message": "Synthetic body", "type": "Email alert",
+                   "attachments": [{"name": "retry.log", "text": "Complete log after retry"}]}
         headers = {"X-NemoGuard-Webhook-Secret": "test-webhook-secret", "Idempotency-Key": "outlook:operator-retry"}
         operator = {"Authorization": "Bearer " + token("operator")}
         viewer = {"Authorization": "Bearer " + token("viewer")}
@@ -318,6 +330,7 @@ class PreviewTests(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM alert").fetchone()[0], 1)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM incident").fetchone()[0], 1)
             self.assertEqual(conn.execute("SELECT actor_id FROM outlook_inbox_retry").fetchone()[0], "test")
+            self.assertEqual(conn.execute("SELECT content FROM reviewed_alert_document WHERE document_kind=%s", ("EMAIL_ATTACHMENT",)).fetchone()[0], "Complete log after retry")
 
     def test_inbox_retains_classification_failure(self):
         import app.api.main as api

@@ -2,8 +2,9 @@
 
 This local Windows test utility polls the top-level **NemoGuard Test Alerts**
 folder of an explicitly selected classic Outlook mailbox. It submits newly
-observed messages' plain-text subject and body to NemoGuard; attachments are
-not included. It does not intentionally mark, move, or delete messages.
+observed messages' plain-text subject, body and supported text attachments to
+NemoGuard. This local implementation is not deployed and live Outlook and gateway
+behavior remain unverified. It does not intentionally mark, move, or delete messages.
 
 ## Before starting
 
@@ -30,7 +31,7 @@ not included. It does not intentionally mark, move, or delete messages.
   environment or prompts without echoing. Do not put it in chat, a command line,
   a screenshot, or source control.
 - Use a Windows account and computer approved to hold the content: the local
-  SQLite state file stores pending subjects and bodies **unencrypted**. It
+  SQLite state file stores pending subjects, bodies and attachment text **unencrypted**. It
   relies on the file system's inherited permissions; the script does not
   enforce a private ACL. SQLite may retain deleted text in database pages or
   journals. Protect and dispose of it under your organization's policy.
@@ -41,6 +42,7 @@ After deploying the compatible backend, open classic Outlook and double-click
 **Launch NemoGuard Bridge.vbs** in the repository root. The launcher prefers
 the mailbox associated with the existing bridge queue, or Outlook's default
 mailbox if no queue exists. If neither can be identified, select a mailbox.
+Review the data-transfer notice and confirm before starting monitoring.
 The bridge verifies that the test folder exists before monitoring. Keep the
 launcher and Outlook open; use **Stop monitoring** or close it to stop.
 
@@ -93,9 +95,15 @@ Press `Ctrl+C` to stop. The bridge does not automatically start on login.
 - A network error, 401, 429, or server failure leaves the same payload and
   idempotency key pending for retry. For a wrong secret, stop and restart the
   bridge with the correct one. A 400, 403, 404, or 409 blocks that message for
-  manual investigation; no automatic retry/unblock interface exists yet.
-- Empty-body and oversized messages are blocked; attachments are never
-  inspected. The console reports counts and outcomes, not message contents.
+  manual investigation; no automatic retry/unblock interface exists yet. A
+  413 response also blocks delivery and retains the payload; the gateway's
+  effective request-size limit must be verified separately.
+- UTF-8 `.log`, `.txt` and `.csv` attachments are captured without truncation:
+  at most 10 attachments, 2 MiB per supported attachment and 5 MiB combined.
+  Unsupported formats are listed as omitted. Empty, invalid or oversized
+  supported attachments block the message; no automatic unblock exists.
+  Previously baselined or queued messages are not retroactively enriched.
+  The console reports counts and outcomes, not message contents.
 - The default state is `%LOCALAPPDATA%\NemoGuard\outlook-bridge.sqlite`.
   Preserve it across restarts: deleting it resets the baseline and retry
   history. State is bound to the mailbox, folder, and selected designer

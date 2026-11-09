@@ -25,7 +25,7 @@ import { CommandPalette } from '../../design-system/components/CommandPalette';
 function ThemeToggle() {
     const { theme, toggleTheme } = useTheme();
     return (
-        <IconButton onClick={toggleTheme} label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}>
+        <IconButton onClick={toggleTheme} label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'} className="!text-[#405c52] hover:!text-[#13231E] hover:!bg-[#E1F3EC]">
             <AnimatePresence mode="wait" initial={false}>
                 {theme === 'dark' ? (
                     <motion.span key="moon" initial={{ rotate: -90, opacity: 0 }} animate={{ rotate: 0, opacity: 1 }} exit={{ rotate: 90, opacity: 0 }} transition={{ duration: 0.2 }} className="block">
@@ -55,7 +55,7 @@ function NotificationBell({ onSelectIncident }: { onSelectIncident: (id: string)
 
     return (
         <div className="relative" ref={ref}>
-            <IconButton onClick={() => setOpen((o) => !o)} label="Notifications" active={open} className="relative">
+            <IconButton onClick={() => setOpen((o) => !o)} label="Notifications" active={open} className="relative !text-[#405c52] hover:!text-[#13231E] hover:!bg-[#E1F3EC]">
                 <Bell className="w-4 h-4" />
                 {notifications.length > 0 && (
                     <motion.span
@@ -116,7 +116,7 @@ function TopBar({ onSelectIncident, onOpenMobileNav, onOpenCommandPalette }: { o
     return (
         <div className="h-[68px] flex items-center justify-between px-4 sm:px-6 flex-shrink-0 border-b border-[#0F3F32]/10 bg-[#FCFDFB] z-20 relative">
             <div className="flex items-center gap-2.5 min-w-0">
-                <IconButton onClick={onOpenMobileNav} label="Open navigation" className="md:hidden -ml-1 mr-1 flex-shrink-0">
+                <IconButton onClick={onOpenMobileNav} label="Open navigation" className="md:hidden -ml-1 mr-1 flex-shrink-0 !text-[#405c52] hover:!text-[#13231E] hover:!bg-[#E1F3EC]">
                     <Menu className="w-4.5 h-4.5" />
                 </IconButton>
                 <motion.div

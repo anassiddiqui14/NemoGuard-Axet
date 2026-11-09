@@ -1,5 +1,7 @@
 """Concurrent Outlook deliveries against a temporary SQLite database."""
 import concurrent.futures
+import hashlib
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -82,7 +84,12 @@ class ConcurrencyTests(unittest.TestCase):
             alert_inbox.initialize(db)
             with db.get_connection() as conn:
                 conn.execute("CREATE TABLE reviewed_alert_document (document_id TEXT PRIMARY KEY, alert_id TEXT NOT NULL REFERENCES alert(alert_id), document_kind TEXT NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL, submitted_by TEXT NOT NULL, created_at TEXT NOT NULL)")
-            alert_inbox.receive(db, "outlook:promotion", "hash", "Synthetic", "Synthetic body")
+            payload = json.dumps({"source": "Outlook email", "monitor_name": "Synthetic",
+                                  "message": "Synthetic body", "attachments": [
+                                      {"name": "job.log", "text": "Complete error log"}]},
+                                 sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            alert_inbox.receive(db, "outlook:promotion", digest, "Synthetic", "Synthetic body", payload)
             alert_inbox.record_result(db, "outlook:promotion", {"status": "ignored"})
             token = create_access_token({"sub": "test", "roles": ["operator"]})
 
@@ -105,6 +112,31 @@ class ConcurrencyTests(unittest.TestCase):
             with db.get_connection() as conn:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM alert").fetchone()[0], 1)
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM outlook_inbox_promotion").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT content FROM reviewed_alert_document WHERE document_kind=%s", ("EMAIL_ATTACHMENT",)).fetchone()[0], "Complete error log")
+
+    def test_legacy_record_without_payload_does_not_promote(self):
+        from app.api.auth import create_access_token
+        with tempfile.TemporaryDirectory() as directory:
+            db = SqliteDatabase(str(Path(directory) / "inbox.db"))
+            db.init_schema()
+            alert_inbox.initialize(db)
+            alert_inbox.receive(db, "outlook:legacy", "hash", "Synthetic", "Synthetic body")
+            alert_inbox.record_result(db, "outlook:legacy", {"status": "ignored"})
+            token = create_access_token({"sub": "test", "roles": ["operator"]})
+            client = TestClient(api.app)
+            try:
+                with patch.object(api, "get_database", return_value=db):
+                    response = client.post(
+                        "/api/v2/outlook-inbox/outlook:legacy/promote",
+                        headers={"Authorization": "Bearer " + token},
+                        json={"severity": "high", "reason": "Investigate"},
+                    )
+            finally:
+                client.close()
+            self.assertEqual(response.status_code, 409)
+            with db.get_connection() as conn:
+                self.assertEqual(conn.execute("SELECT state FROM outlook_inbox WHERE delivery_key=%s", ("outlook:legacy",)).fetchone()[0], "needs_review")
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM alert").fetchone()[0], 0)
 
 
 if __name__ == "__main__":

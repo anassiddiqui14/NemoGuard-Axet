@@ -10,8 +10,6 @@ interface Props {
     dataLoading: boolean;
     incidentStatus?: string;
     isNeedsReview: boolean;
-    safetyAcknowledged: boolean;
-    setSafetyAcknowledged: (v: boolean) => void;
     canApprove: boolean;
     isIncidentResolved?: boolean;
     onViewPlan: () => void;
@@ -33,7 +31,7 @@ function StatusBadge({ isIncidentResolved, isNeedsReview, plan, incidentStatus }
             ) : isManualActionRequired ? (
                 <motion.span key="manual-action-required" {...fadeInUp} className="text-[10px] font-bold px-2 py-1 rounded-full bg-warning/15 text-warning ring-1 ring-warning/30 inline-block">MANUAL ACTION REQUIRED</motion.span>
             ) : isFailed ? (
-                <motion.span key="failed" {...fadeInUp} className="text-[10px] font-bold px-2 py-1 rounded-full bg-critical/15 text-critical ring-1 ring-critical/30 inline-block">VERIFICATION FAILED</motion.span>
+                <motion.span key="failed" {...fadeInUp} className="text-[10px] font-bold px-2 py-1 rounded-full bg-critical/15 text-critical ring-1 ring-critical/30 inline-block">FAILED</motion.span>
             ) : isVerifying ? (
                 <motion.span key="verifying" {...fadeInUp} className="text-[10px] font-bold px-2 py-1 rounded-full bg-info/15 text-info ring-1 ring-info/30 inline-block">VERIFYING</motion.span>
             ) : isExecuting ? (
@@ -66,50 +64,40 @@ function StatusRow({ done, active, label }: { done: boolean; active: boolean; la
     );
 }
 
-function FormulationStatus({ hypothesis, evidence, plan, dataLoading, executed }: { hypothesis: any; evidence: any[]; plan: any; dataLoading: boolean; executed: boolean }) {
+function FormulationStatus({ hypothesis, evidence, plan, dataLoading }: { hypothesis: any; evidence: any[]; plan: any; dataLoading: boolean }) {
     return (
         <motion.div layout className="rounded-xl p-4 bg-white/[0.02] ring-1 ring-white/[0.05]">
             <div className="font-medium text-[12px] text-text-secondary mb-3.5">Recovery formulation status</div>
             <div className="space-y-3">
                 <StatusRow done={!!hypothesis} active={dataLoading} label="Root cause hypothesis created" />
-                <StatusRow done={evidence.length > 0} active={dataLoading && !!hypothesis} label="Blast radius calculated" />
-                <StatusRow done={!!plan} active={!plan && (dataLoading || !!hypothesis)} label="Matching approved runbook" />
-                <StatusRow done={!!plan && plan.status !== 'PENDING_APPROVAL' && plan.status !== 'NEEDS_REVIEW'} active={!!plan} label="Evaluating action risk" />
-                <StatusRow done={executed} active={!!plan && !executed} label="Preparing verification checks" />
+                <StatusRow done={evidence.length > 0} active={dataLoading && !!hypothesis} label="Evidence recorded" />
+                <StatusRow done={!!plan} active={!plan && (dataLoading || !!hypothesis)} label="Recovery plan created" />
             </div>
         </motion.div>
     );
 }
 
-function SafetyBlock({ isIncidentResolved, isNeedsReview, plan, safetyAcknowledged, setSafetyAcknowledged }: {
-    isIncidentResolved?: boolean; isNeedsReview: boolean; plan: any; safetyAcknowledged: boolean; setSafetyAcknowledged: (v: boolean) => void;
+function SafetyBlock({ isIncidentResolved, isNeedsReview, plan }: {
+    isIncidentResolved?: boolean; isNeedsReview: boolean; plan: any;
 }) {
     return (
         <AnimatePresence>
             {!isIncidentResolved && isNeedsReview && plan && (
                 <motion.div {...fadeInUp} className="space-y-2.5">
                     <SafetyReviewBanner feedback={plan.rationale} />
-                    <label className="flex items-start gap-2 text-[11px] text-text-secondary cursor-pointer px-1">
-                        <input
-                            type="checkbox"
-                            checked={safetyAcknowledged}
-                            onChange={(e) => setSafetyAcknowledged(e.target.checked)}
-                            className="mt-0.5 accent-critical"
-                        />
-                        I have reviewed the safety concern and choose to proceed anyway.
-                    </label>
+                    <p className="text-[11px] text-text-secondary px-1">This plan cannot be approved while it needs review. Revise the plan and complete safety review first.</p>
                 </motion.div>
             )}
         </AnimatePresence>
     );
 }
 
-function ActionButtons({ plan, canApprove, isIncidentResolved, isNeedsReview, safetyAcknowledged, onViewPlan, onExecute, incidentStatus }: {
-    plan: any; canApprove: boolean; isIncidentResolved?: boolean; isNeedsReview: boolean; safetyAcknowledged: boolean; onViewPlan: () => void; onExecute: () => void; incidentStatus?: string;
+function ActionButtons({ plan, canApprove, isIncidentResolved, isNeedsReview, onViewPlan, onExecute, incidentStatus }: {
+    plan: any; canApprove: boolean; isIncidentResolved?: boolean; isNeedsReview: boolean; onViewPlan: () => void; onExecute: () => void; incidentStatus?: string;
 }) {
     const s = (incidentStatus || '').toUpperCase();
     const isManualActionRequired = s === 'MANUAL_ACTION_REQUIRED';
-    const isExecutingOrLater = s === 'EXECUTING' || s === 'VERIFYING' || s === 'FAILED';
+    const isExecutingOrLater = s === 'EXECUTING' || s === 'VERIFYING';
     return (
         <>
             <motion.button
@@ -126,9 +114,13 @@ function ActionButtons({ plan, canApprove, isIncidentResolved, isNeedsReview, sa
                 onClick={onExecute}
                 className="focus-ring press-scale w-full text-[13px] px-4 py-2.5 rounded-xl bg-gradient-to-r from-primary to-agent-active text-white hover:brightness-110 transition font-semibold disabled:opacity-30 disabled:cursor-not-allowed shadow-lg shadow-primary/20 flex items-center justify-center gap-2"
             >
-                {!isIncidentResolved && isNeedsReview && !safetyAcknowledged && <ShieldAlert className="w-3.5 h-3.5" />}
+                {!isIncidentResolved && isNeedsReview && <ShieldAlert className="w-3.5 h-3.5" />}
                 {isIncidentResolved
-                    ? 'Plan Executed'
+                    ? 'Incident resolved'
+                    : s === 'FAILED'
+                        ? 'Recovery failed'
+                    : isNeedsReview
+                        ? 'Review required'
                     : isManualActionRequired
                         ? 'Manual action required'
                         : isExecutingOrLater
@@ -146,11 +138,9 @@ function ActionButtons({ plan, canApprove, isIncidentResolved, isNeedsReview, sa
 export function RecoveryRail(props: Props) {
     const {
         hypothesis, evidence, plan, dataLoading, incidentStatus, isNeedsReview,
-        safetyAcknowledged, setSafetyAcknowledged, canApprove, isIncidentResolved,
+        canApprove, isIncidentResolved,
         onViewPlan, onExecute, embedded = false,
     } = props;
-
-    const executed = plan?.status === 'EXECUTED' || plan?.status === 'APPROVED' || !!isIncidentResolved;
 
     if (embedded) {
         return (
@@ -176,14 +166,12 @@ export function RecoveryRail(props: Props) {
                             isIncidentResolved={isIncidentResolved}
                             isNeedsReview={isNeedsReview}
                             plan={plan}
-                            safetyAcknowledged={safetyAcknowledged}
-                            setSafetyAcknowledged={setSafetyAcknowledged}
                         />
                     </div>
                 )}
 
                 <div className="p-5 grid gap-4 md:grid-cols-[1.1fr_0.9fr] items-start">
-                    <FormulationStatus hypothesis={hypothesis} evidence={evidence} plan={plan} dataLoading={dataLoading} executed={executed} />
+                    <FormulationStatus hypothesis={hypothesis} evidence={evidence} plan={plan} dataLoading={dataLoading} />
 
                     <div className="flex flex-col gap-2.5">
                         {!isNeedsReview && plan?.rationale && (
@@ -196,7 +184,6 @@ export function RecoveryRail(props: Props) {
                             canApprove={canApprove}
                             isIncidentResolved={isIncidentResolved}
                             isNeedsReview={isNeedsReview}
-                            safetyAcknowledged={safetyAcknowledged}
                             onViewPlan={onViewPlan}
                             onExecute={onExecute}
                             incidentStatus={incidentStatus}
@@ -234,10 +221,8 @@ export function RecoveryRail(props: Props) {
                     isIncidentResolved={isIncidentResolved}
                     isNeedsReview={isNeedsReview}
                     plan={plan}
-                    safetyAcknowledged={safetyAcknowledged}
-                    setSafetyAcknowledged={setSafetyAcknowledged}
                 />
-                <FormulationStatus hypothesis={hypothesis} evidence={evidence} plan={plan} dataLoading={dataLoading} executed={executed} />
+                <FormulationStatus hypothesis={hypothesis} evidence={evidence} plan={plan} dataLoading={dataLoading} />
             </div>
 
             <div className="p-4 flex flex-col gap-2.5 mt-auto">
@@ -246,7 +231,6 @@ export function RecoveryRail(props: Props) {
                     canApprove={canApprove}
                     isIncidentResolved={isIncidentResolved}
                     isNeedsReview={isNeedsReview}
-                    safetyAcknowledged={safetyAcknowledged}
                     onViewPlan={onViewPlan}
                     onExecute={onExecute}
                     incidentStatus={incidentStatus}

@@ -61,6 +61,19 @@ class LauncherTests(unittest.TestCase):
                 launcher.preferred_mailbox(namespace, ["first"], path)
             self.assertEqual(launcher.preferred_mailbox(namespace, names, path.parent / "missing"), "first")
 
+    def test_declined_data_transfer_never_spawns_bridge(self):
+        obj = launcher.Launcher.__new__(launcher.Launcher)
+        obj.process = None
+        obj.mailbox = Variable("selected")
+        obj.status = Variable()
+        with patch.object(launcher, "discover_designer_url", return_value="http://localhost"), \
+                patch.object(launcher.messagebox, "askyesno", return_value=False) as confirmation, \
+                patch.object(launcher.subprocess, "Popen") as spawn:
+            obj.start()
+            confirmation.assert_called_once()
+            spawn.assert_not_called()
+            self.assertEqual(obj.status.get(), "Monitoring not started.")
+
     def test_preflight_failure_never_spawns_bridge(self):
         obj = launcher.Launcher.__new__(launcher.Launcher)
         obj.process = None
