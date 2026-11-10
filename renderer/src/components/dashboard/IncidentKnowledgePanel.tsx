@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { authFetch } from '../../contexts/AuthGateContext';
 import { useCurrentUser } from '../../hooks/useCurrentUser';
+import { ContributionReview } from './ContributionReview';
 
 type KnowledgeItem = {
     knowledge_id: string;
@@ -28,6 +29,8 @@ type KnowledgeResponse = {
     submissions: KnowledgeItem[];
     history: HistoryItem[];
     items_truncated?: boolean;
+    job_match_source?: string | null;
+    sop_decision?: string | null;
 };
 
 function fileToBase64(file: File): Promise<string> {
@@ -123,6 +126,26 @@ export function IncidentKnowledgePanel({ incidentId, initialJob, incidentStatus,
         }
     };
 
+    const confirmNoSop = async () => {
+        if (!window.confirm('Confirm that no SOP is available for this incident?')) return;
+        setBusy(true);
+        setError(null);
+        setMessage('');
+        try {
+            const response = await authFetch(`/api/v2/incidents/${encodeURIComponent(incidentId)}/knowledge/no-sop`, { method: 'POST' });
+            const body = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(typeof body.detail === 'string' ? body.detail : `Unable to record decision (HTTP ${response.status}).`);
+            await load();
+            setMessage(hasPlan
+                ? 'Decision recorded. Request re-investigation when ready.'
+                : 'Decision recorded. Start triage from the Overview tab.');
+        } catch (err) {
+            setError(err instanceof Error ? err.message : 'Unable to record decision.');
+        } finally {
+            setBusy(false);
+        }
+    };
+
     const requestReinvestigation = async () => {
         setBusy(true);
         setError(null);
@@ -209,6 +232,7 @@ export function IncidentKnowledgePanel({ incidentId, initialJob, incidentStatus,
                     <div className="space-y-1 text-xs text-text-secondary">
                         <button type="button" disabled={busy} onClick={() => { setError(null); void load().catch((err: unknown) => setError(err instanceof Error ? err.message : 'Unable to load references.')); }} className="rounded-lg border border-border-color px-3 py-1.5 text-text-primary disabled:opacity-50">Refresh reference statuses</button>
                         {data.items_truncated && <p role="alert" className="text-warning">Only the first 20 matching references are shown. Additional references require manual review.</p>}
+                        {data.job_match_source === 'unverified_email_identifier' && <p role="status" className="text-warning">A possible SOP match was found in the alert email. Confirm the workflow and SOP applicability before relying on it.</p>}
                         {data.items.length === 0 && <p>No submitted or approved references matched this incident.</p>}
                         {data.items.map((item) => (
                             <details key={item.knowledge_id} className="rounded-xl border border-border-color p-3">
@@ -243,6 +267,7 @@ export function IncidentKnowledgePanel({ incidentId, initialJob, incidentStatus,
                             <p className="text-text-muted">Past incidents are references, not proof of the current cause.</p>
                         </div>
                     )}
+                    {canEdit && <ContributionReview key={incidentId} incidentId={incidentId} canDraft={status === 'RESOLVED'} initialJob={initialJob} />}
                     {canEdit && canReinvestigate && (
                         <button type="button" disabled={busy} onClick={() => void requestReinvestigation()} className="rounded-lg border border-border-color px-4 py-2 text-xs font-semibold text-text-primary disabled:opacity-50">
                             Re-investigate using references
@@ -251,8 +276,14 @@ export function IncidentKnowledgePanel({ incidentId, initialJob, incidentStatus,
                     {canEdit && !canSubmit && (
                         <p className="text-xs text-text-secondary">References can be submitted when the incident is detected or at a plan-review checkpoint, not during investigation or execution.</p>
                     )}
-                    {canEdit && canSubmit && !hasPlan && status === 'DETECTED' && (
-                        <p className="text-xs text-text-secondary">After submitting a reference, start triage from the Overview tab.</p>
+                    {canEdit && canSubmit && (
+                        <div className="space-y-2 text-xs text-text-secondary">
+                            <p>Is there an SOP for this failure? Submit it below, or confirm none is available before starting triage.</p>
+                            {!data.sop_decision && !data.items.some((item) => item.kind === 'SOP') && (
+                                <button type="button" disabled={busy} onClick={() => void confirmNoSop()} className="rounded-lg border border-border-color px-4 py-2 font-semibold text-text-primary disabled:opacity-50">No SOP is available</button>
+                            )}
+                            {data.sop_decision === 'NO_SOP' && <p>No-SOP decision recorded. {hasPlan ? 'Request re-investigation when ready.' : 'Start triage from the Overview tab.'}</p>}
+                        </div>
                     )}
                     {canEdit && canSubmit && <form onSubmit={submit} className="grid gap-3 text-xs">
                         <label className="grid gap-1">Reference type

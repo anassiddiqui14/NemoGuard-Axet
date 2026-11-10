@@ -1087,6 +1087,7 @@ async def triage_incident(incident_id: str, current_user: User = Depends(get_cur
     itself rather than left to this route to handle separately.
     """
     global temporal_client
+    _require_incident_in_tenant(get_database(), incident_id, current_user.tenant_id, current_user.workspace_id)
     from app.domain.triage_scheduler import schedule_triage
     result = await schedule_triage(temporal_client, incident_id)
 
@@ -1094,6 +1095,8 @@ async def triage_incident(incident_id: str, current_user: User = Depends(get_cur
         raise HTTPException(status_code=404, detail="Incident not found")
     if result["status"] == "TRIAGE_ALREADY_ACTIVE":
         raise HTTPException(status_code=409, detail="Triage already in progress for this incident")
+    if result["status"] == "SOP_GATE_FAILED":
+        raise HTTPException(status_code=503, detail="Unable to check SOP availability; triage was not started.")
     if result["status"] == "TEMPORAL_START_FAILED":
         # Truthful detail text: only claim restoration happened if the
         # scheduler's atomic conditional restore actually reported success

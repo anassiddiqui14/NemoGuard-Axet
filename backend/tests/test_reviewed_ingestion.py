@@ -55,6 +55,27 @@ class ReviewedIngestionTests(unittest.TestCase):
             submitted_by="operator-1",
         ))
 
+    def confirm_no_sop_for_test(self, incident_id):
+        from app.domain import incident_knowledge
+
+        incident_knowledge.initialize(self.db)
+        with self.db.get_connection() as conn:
+            conn.execute(
+                "UPDATE incident SET tenant_id=%s,workspace_id=%s WHERE incident_id=%s",
+                ("tenant-a", "workspace-a", incident_id),
+            )
+        self.assertTrue(incident_knowledge.confirm_no_sop(
+            self.db, "tenant-a", "workspace-a", incident_id, "operator",
+        ))
+
+    def claim_for_test_triage(self, incident_id):
+        with self.db.get_connection() as conn:
+            result = conn.execute(
+                "UPDATE incident SET status='INVESTIGATING' WHERE incident_id=%s AND status='DETECTED'",
+                (incident_id,),
+            )
+            self.assertEqual(result.rowcount, 1)
+
     def test_new_incident_retry_and_evidence(self):
         result = self.ingest()
         self.assertEqual(result["status"], "ingested_and_incident_created")
@@ -187,6 +208,10 @@ class ReviewedIngestionTests(unittest.TestCase):
 
         result = self.ingest()
         incident_id = result["incident_id"]
+        with self.db.get_connection() as conn:
+            conn.execute("UPDATE incident SET status='DETECTED' WHERE incident_id=%s", (incident_id,))
+        self.confirm_no_sop_for_test(incident_id)
+        self.claim_for_test_triage(incident_id)
         with patch.object(langgraph_investigator, "LangGraphInvestigator", FailingInvestigator):
             triage = self.obj.triage_incident(incident_id)
         self.assertFalse(triage["saved_plan"])
@@ -309,6 +334,7 @@ class ReviewedIngestionTests(unittest.TestCase):
                     (f"g{revision}", incident_id, "now", "UI", "INVESTIGATION_DIRECTION",
                      "HUMAN_OBSERVATION", text, revision, 0),
                 )
+        self.confirm_no_sop_for_test(incident_id)
         captured = {}
 
         class FailingInvestigator:
@@ -341,6 +367,7 @@ class ReviewedIngestionTests(unittest.TestCase):
             {"hypotheses": [], "evidence": [], "impacts": [], "action_plan": {"steps": []}},
             critic_status="INCONCLUSIVE",
         )
+        self.confirm_no_sop_for_test(incident_id)
         with patch.object(langgraph_investigator, "LangGraphInvestigator", side_effect=RuntimeError("initialization failed")):
             result = asyncio.run(self.obj.reinvestigate_from_commander_guidance(
                 incident_id, "re-investigate", False, "test-guidance"
@@ -409,6 +436,7 @@ class ReviewedIngestionTests(unittest.TestCase):
                     },
                 }
 
+        self.claim_for_test_triage(incident_id)
         with patch.object(langgraph_investigator, "LangGraphInvestigator", Investigator):
             triage = self.obj.triage_incident(incident_id)
         self.assertTrue(triage["saved_plan"])
@@ -516,6 +544,7 @@ class ReviewedIngestionTests(unittest.TestCase):
                     ]},
                 }
 
+        self.claim_for_test_triage(incident_id)
         with patch.object(langgraph_investigator, "LangGraphInvestigator", Investigator):
             self.assertTrue(self.obj.triage_incident(incident_id)["saved_plan"])
         with self.db.get_connection() as conn:
@@ -560,6 +589,7 @@ class ReviewedIngestionTests(unittest.TestCase):
                     ]},
                 }
 
+        self.claim_for_test_triage(incident_id)
         with patch.object(langgraph_investigator, "LangGraphInvestigator", Investigator):
             self.assertTrue(self.obj.triage_incident(incident_id)["saved_plan"])
         reference = json.loads(captured["reference"].split("\n", 1)[1])
@@ -606,6 +636,7 @@ class ReviewedIngestionTests(unittest.TestCase):
                     },
                 }
 
+        self.claim_for_test_triage(incident_id)
         with patch.object(langgraph_investigator, "LangGraphInvestigator", Investigator):
             self.assertTrue(self.obj.triage_incident(incident_id)["saved_plan"])
         self.assertIn(item_id, captured["reference"])

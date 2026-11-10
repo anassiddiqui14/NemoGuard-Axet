@@ -167,6 +167,11 @@ export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParen
             // is always surfaced as an explicit error and the function
             // returns without refreshing the parent as if triage had
             // actually started.
+            if (body.status === 'AWAITING_SOP') {
+                ngToast.info('Investigation is waiting for an SOP decision. Open the SOPs, dependencies and history panel to submit one or confirm none is available.');
+                onRefreshParent();
+                return;
+            }
             if (body.status === 'QUEUED_TEMPORAL' || body.status === 'QUEUED_DIRECT') {
                 ngToast.success(
                     body.status === 'QUEUED_DIRECT'

@@ -92,6 +92,10 @@ class IncidentOrchestrator:
         import uuid
         from datetime import datetime, timezone
         from app.domain.agents.langgraph_investigator import LangGraphInvestigator
+        from app.domain.incident_knowledge import pause_for_sop_if_needed
+
+        if pause_for_sop_if_needed(self.db, incident_id):
+            return {"status": "AWAITING_SOP", "saved_plan": False}
 
         # Phase 5: explicit investigation-run boundary. Emitted at the very
         # start of a first-pass (non-Commander) triage run so the frontend
@@ -1077,6 +1081,18 @@ class IncidentOrchestrator:
         except Exception as e:
             print(f"reinvestigate_from_commander_guidance: could not transition {incident_id} to INVESTIGATING: {e}")
             return {"error": "Could not start re-investigation"}
+
+        try:
+            from app.domain.incident_knowledge import pause_for_sop_if_needed
+            if pause_for_sop_if_needed(self.db, incident_id, current_status):
+                return {"status": "skipped", "reason": "awaiting an SOP decision before re-investigation"}
+        except Exception:
+            with self.db.get_connection() as conn:
+                conn.execute(
+                    "UPDATE incident SET status=%s WHERE incident_id=%s AND status='INVESTIGATING'",
+                    (current_status, incident_id),
+                )
+            return {"error": "Unable to check SOP availability; re-investigation was not started."}
 
         feedback_context = (
             "RECENT OPERATOR GUIDANCE (JSON; observations are not independently verified):\n"

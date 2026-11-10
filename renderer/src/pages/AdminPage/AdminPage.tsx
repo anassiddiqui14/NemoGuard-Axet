@@ -1,7 +1,9 @@
+import { useState } from 'react';
 import { ShieldCheck } from 'lucide-react';
 import { Logomark } from '../LandingPage/Brand';
 import { CapabilityPolicyTab } from './CapabilityPolicyTab';
 import { KnowledgeReview } from './KnowledgeReview';
+import { KnowledgeLibrary } from './KnowledgeLibrary';
 
 /**
  * V22 admin intentionally exposes only controls that have a matching,
@@ -14,6 +16,9 @@ import { KnowledgeReview } from './KnowledgeReview';
  * contracts exist.
  */
 export function AdminPage() {
+    const [reviewRevision, setReviewRevision] = useState(0);
+    const [libraryRevision, setLibraryRevision] = useState(0);
+
     return (
         <div className="v22-canvas h-full overflow-y-auto p-5 sm:p-7">
             <div className="mx-auto max-w-5xl space-y-5">
@@ -36,7 +41,8 @@ export function AdminPage() {
                     <CapabilityPolicyTab />
                 </div>
 
-                <KnowledgeReview />
+                <KnowledgeReview refreshRevision={reviewRevision} onChanged={() => setLibraryRevision((value) => value + 1)} />
+                <KnowledgeLibrary refreshRevision={libraryRevision} onChanged={() => setReviewRevision((value) => value + 1)} />
             </div>
         </div>
     );

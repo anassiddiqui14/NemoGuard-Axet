@@ -35,6 +35,8 @@ class IncidentLifecycleWorkflow:
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
         
+        if triage_result.get("status") == "AWAITING_SOP":
+            return {"status": "awaiting_sop"}
         if triage_result.get("status") != "EXECUTED" or not triage_result.get("saved_plan"):
             workflow.logger.warning(f"Triage failed or no plan saved for {incident_id}")
             return {"status": "failed", "reason": "Triage failed"}

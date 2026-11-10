@@ -154,6 +154,8 @@ async def _run_direct_triage(incident_id: str, previous_status: str) -> None:
     orchestrator = IncidentOrchestrator()
     try:
         result = await asyncio.to_thread(orchestrator.triage_incident, incident_id)
+        if result and result.get("status") == "AWAITING_SOP":
+            return
         if not result or not result.get("saved_plan"):
             restored = _restore_if_still_investigating(db, incident_id, previous_status)
             restoration_note = (
@@ -340,6 +342,15 @@ async def schedule_triage(temporal_client, incident_id: str) -> dict:
     # caller's entire subsequent Temporal/direct-triage work, which all
     # happens AFTER this transaction has already committed).
 
+    try:
+        from app.domain.incident_knowledge import pause_for_sop_if_needed
+        if pause_for_sop_if_needed(db, incident_id, previous_status):
+            return {"accepted": False, "incident_id": incident_id, "status": "AWAITING_SOP"}
+    except Exception as exc:
+        print(f"SOP gate failed for {incident_id}: {exc}")
+        restored = _restore_if_still_investigating(db, incident_id, previous_status)
+        return {"accepted": False, "incident_id": incident_id, "status": "SOP_GATE_FAILED", "restored": restored}
+
     if temporal_client:
         try:
             await _start_temporal_workflow(temporal_client, incident_id)
@@ -396,6 +407,16 @@ async def schedule_triage_for_new_incident(temporal_client, incident_id: str, fa
       {"accepted": True,  "incident_id": ..., "status": "QUEUED_DIRECT"}
       {"accepted": False, "incident_id": ..., "status": "TEMPORAL_START_FAILED", "restored": True|False}
     """
+    db = _get_db()
+    try:
+        from app.domain.incident_knowledge import pause_for_sop_if_needed
+        if pause_for_sop_if_needed(db, incident_id, fallback_status):
+            return {"accepted": False, "incident_id": incident_id, "status": "AWAITING_SOP"}
+    except Exception as exc:
+        print(f"SOP gate failed for {incident_id}: {exc}")
+        restored = _restore_if_still_investigating(db, incident_id, fallback_status)
+        return {"accepted": False, "incident_id": incident_id, "status": "SOP_GATE_FAILED", "restored": restored}
+
     if temporal_client:
         try:
             await _start_temporal_workflow(temporal_client, incident_id)

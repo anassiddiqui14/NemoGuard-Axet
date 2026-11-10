@@ -49,6 +49,120 @@ class IncidentKnowledgeTests(unittest.TestCase):
         self.assertFalse(knowledge.review(self.db, "tenant-a", "workspace-a", rejected, "APPROVED", "admin"))
         self.assertNotIn(rejected, [item["knowledge_id"] for item in knowledge.context_for_incident(self.db, "one")["items"]])
 
+    def test_no_sop_decision_is_scoped_durable_and_idempotent(self):
+        with self.db.get_connection() as conn:
+            conn.execute("UPDATE incident SET status='DETECTED' WHERE incident_id=%s", ("one",))
+        self.assertFalse(knowledge.confirm_no_sop(self.db, "tenant-a", "workspace-b", "one", "operator"))
+        self.assertTrue(knowledge.confirm_no_sop(self.db, "tenant-a", "workspace-a", "one", "operator"))
+        self.assertTrue(knowledge.confirm_no_sop(self.db, "tenant-a", "workspace-a", "one", "operator"))
+        with self.db.get_connection() as conn:
+            decision = conn.execute(
+                "SELECT decision,decided_by FROM incident_sop_decision WHERE incident_id=%s", ("one",),
+            ).fetchone()
+            messages = conn.execute(
+                "SELECT role,intent,created_by FROM incident_message WHERE incident_id=%s", ("one",),
+            ).fetchall()
+            conn.execute("UPDATE incident SET status='INVESTIGATING' WHERE incident_id=%s", ("one",))
+        self.assertEqual(tuple(decision), ("NO_SOP", "operator"))
+        self.assertEqual([tuple(row) for row in messages], [("OPERATOR", "SOP_DECISION", "operator")])
+        self.assertFalse(knowledge.confirm_no_sop(self.db, "tenant-a", "workspace-a", "one", "operator"))
+
+    def test_admin_edit_and_archive_are_scoped_and_audited(self):
+        item = knowledge.submit(self.db, "tenant-a", "workspace-a", "one", "job-1",
+                                "SOP", "Original", "Original procedure.", "operator")
+        self.assertTrue(knowledge.review(self.db, "tenant-a", "workspace-a", item, "APPROVED", "admin"))
+        self.assertFalse(knowledge.manage_item(
+            self.db, "tenant-a", "workspace-b", item, "admin", "Correction",
+            title="Edited", job_key="job-1", content="Updated procedure."))
+        self.assertTrue(knowledge.manage_item(
+            self.db, "tenant-a", "workspace-a", item, "admin", "Correction",
+            title="Edited", job_key="job-1", content="Updated procedure."))
+        self.assertEqual(knowledge.context_for_incident(self.db, "two")["items"], [])
+        edited = knowledge.list_items(self.db, "tenant-a", "workspace-a")[0]
+        self.assertEqual(edited["status"], "PENDING")
+        self.assertIsNone(edited["reviewed_by"])
+        self.assertEqual(edited["content"], "Updated procedure.")
+        self.assertTrue(knowledge.manage_item(
+            self.db, "tenant-a", "workspace-a", item, "admin", "Obsolete", archive=True))
+        self.assertEqual(knowledge.context_for_incident(self.db, "one")["items"], [])
+        self.assertFalse(knowledge.manage_item(
+            self.db, "tenant-a", "workspace-a", item, "admin", "Again", archive=True))
+        with self.db.get_connection() as conn:
+            changes = conn.execute(
+                "SELECT action,previous_json FROM incident_knowledge_change "
+                "WHERE knowledge_id=%s ORDER BY created_at", (item,),
+            ).fetchall()
+        self.assertEqual([row[0] for row in changes], ["EDIT", "ARCHIVE"])
+        self.assertIn("Original procedure.", changes[0][1])
+        self.assertIn("Updated procedure.", changes[1][1])
+
+    def test_approval_invalidates_workspace_plans_and_blocks_active_work(self):
+        item = knowledge.submit(self.db, "tenant-a", "workspace-a", "one", "job-1",
+                                "SOP", "Procedure", "Inspect logs.", "operator")
+        with self.db.get_connection() as conn:
+            for incident in ("one", "two", "other"):
+                conn.execute(
+                    "INSERT INTO agent_run (agent_run_id,incident_id,agent_name,objective,status) "
+                    "VALUES (%s,%s,%s,%s,%s)",
+                    ("agent-" + incident, incident, "test", "test", "COMPLETED"),
+                )
+                conn.execute(
+                    "INSERT INTO action_plan (action_plan_id,incident_id,agent_run_id,plan_version,status,"
+                    "overall_risk,rationale,expected_outcome,rollback_summary,created_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    ("plan-" + incident, incident, "agent-" + incident, 1,
+                     "PENDING_APPROVAL", "LOW", "Review", "Expected", "Rollback", "now"),
+                )
+            conn.execute("UPDATE incident SET status='INVESTIGATING' WHERE incident_id=%s", ("two",))
+        with self.assertRaises(ValueError):
+            knowledge.review(self.db, "tenant-a", "workspace-a", item, "APPROVED", "admin")
+        self.assertEqual(knowledge.list_items(self.db, "tenant-a", "workspace-a")[0]["status"], "PENDING")
+        with self.db.get_connection() as conn:
+            conn.execute("UPDATE incident SET status='PLAN_READY' WHERE incident_id=%s", ("two",))
+        self.assertTrue(knowledge.review(self.db, "tenant-a", "workspace-a", item, "APPROVED", "admin"))
+        with self.db.get_connection() as conn:
+            statuses = dict(conn.execute(
+                "SELECT incident_id,status FROM action_plan ORDER BY incident_id"
+            ).fetchall())
+        self.assertEqual(statuses, {"one": "NEEDS_REVIEW", "two": "NEEDS_REVIEW",
+                                    "other": "PENDING_APPROVAL"})
+
+    def test_document_change_invalidates_workspace_plans_and_blocks_active_work(self):
+        item = knowledge.submit(self.db, "tenant-a", "workspace-a", "one", "job-1",
+                                "SOP", "Original", "Original procedure.", "operator")
+        self.assertTrue(knowledge.review(self.db, "tenant-a", "workspace-a", item, "APPROVED", "admin"))
+        with self.db.get_connection() as conn:
+            for incident in ("one", "two", "other"):
+                conn.execute(
+                    "INSERT INTO agent_run (agent_run_id,incident_id,agent_name,objective,status) "
+                    "VALUES (%s,%s,%s,%s,%s)",
+                    ("agent-" + incident, incident, "test", "test", "COMPLETED"),
+                )
+                conn.execute(
+                    "INSERT INTO action_plan (action_plan_id,incident_id,agent_run_id,plan_version,status,"
+                    "overall_risk,rationale,expected_outcome,rollback_summary,created_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    ("plan-" + incident, incident, "agent-" + incident, 1,
+                     "PENDING_APPROVAL", "LOW", "Review", "Expected", "Rollback", "now"),
+                )
+            conn.execute("UPDATE incident SET status='INVESTIGATING' WHERE incident_id=%s", ("two",))
+        with self.assertRaises(ValueError):
+            knowledge.manage_item(self.db, "tenant-a", "workspace-a", item, "admin", "Correction",
+                                  title="Edited", job_key="job-1", content="Updated procedure.")
+        self.assertEqual(knowledge.list_items(self.db, "tenant-a", "workspace-a")[0]["content"],
+                         "Original procedure.")
+        with self.db.get_connection() as conn:
+            conn.execute("UPDATE incident SET status='PLAN_READY' WHERE incident_id=%s", ("two",))
+        self.assertTrue(knowledge.manage_item(
+            self.db, "tenant-a", "workspace-a", item, "admin", "Correction",
+            title="Edited", job_key="job-1", content="Updated procedure."))
+        with self.db.get_connection() as conn:
+            statuses = dict(conn.execute(
+                "SELECT incident_id,status FROM action_plan ORDER BY incident_id"
+            ).fetchall())
+        self.assertEqual(statuses, {"one": "NEEDS_REVIEW", "two": "NEEDS_REVIEW",
+                                    "other": "PENDING_APPROVAL"})
+
     def test_reference_pages_are_complete_and_scoped(self):
         content = "a" * 99990 + "FINAL-STEP"
         item = knowledge.submit(self.db, "tenant-a", "workspace-a", "one", "job-1",
@@ -103,6 +217,47 @@ class IncidentKnowledgeTests(unittest.TestCase):
         self.assertTrue(prompt["items"][2]["content_truncated"])
         self.assertEqual(prompt["items"][2]["content"], "")
         self.assertFalse(prompt["items_truncated"])
+
+    def test_approved_sop_reused_from_linked_email_without_asserting_job_identity(self):
+        item = knowledge.submit(self.db, "tenant-a", "workspace-a", "one", "wkfl_load_MDM_NSF",
+                                "SOP", "Recovery", "Verify input before recovery.", "operator")
+        self.assertTrue(knowledge.review(self.db, "tenant-a", "workspace-a", item, "APPROVED", "admin"))
+        with self.db.get_connection() as conn:
+            conn.execute("UPDATE incident SET primary_job_id=NULL WHERE incident_id=%s", ("two",))
+            conn.execute("UPDATE incident SET primary_job_id=NULL WHERE incident_id=%s", ("other",))
+            conn.execute("CREATE TABLE reviewed_alert_document (document_id TEXT PRIMARY KEY, alert_id TEXT, document_kind TEXT, title TEXT, content TEXT, submitted_by TEXT, created_at TEXT)")
+            for suffix, incident in (("a", "two"), ("b", "other")):
+                conn.execute("INSERT INTO alert (alert_id,tenant_id,workspace_id,opened_ts,severity,alert_type,source_system,message,status) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                             ("alert-" + suffix, "tenant-a", "workspace-a" if suffix == "a" else "workspace-b", "now", "high", "TEST", "Outlook", "failure", "open"))
+                conn.execute("INSERT INTO incident_alert (incident_id,alert_id,correlation_score,correlation_reasons_json,added_at) VALUES (%s,%s,%s,%s,%s)",
+                             (incident, "alert-" + suffix, 1, "[]", "now"))
+                conn.execute("INSERT INTO reviewed_alert_document VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                             ("doc-" + suffix, "alert-" + suffix, "EMAIL_BODY", "failure", "Workflow wkfl_load_MDM_NSF failed.", "automatic-outlook-bridge", "now"))
+        context = knowledge.context_for_incident(self.db, "two")
+        self.assertEqual(context["job_match_source"], "unverified_email_identifier")
+        self.assertEqual([item_["knowledge_id"] for item_ in context["items"]], [item])
+        self.assertEqual(knowledge.reference_page(self.db, "two", item)["content"], "Verify input before recovery.")
+        self.assertEqual(knowledge.context_for_incident(self.db, "other")["items"], [])
+        self.assertIsNone(knowledge.reference_page(self.db, "other", item))
+        with self.db.get_connection() as conn:
+            self.assertIsNone(conn.execute("SELECT primary_job_id FROM incident WHERE incident_id=%s", ("two",)).fetchone()[0])
+
+    def test_alert_matching_requires_one_exact_approved_scoped_identifier(self):
+        first = knowledge.submit(self.db, "tenant-a", "workspace-a", "one", "wkfl_load_MDM_NSF",
+                                 "SOP", "Recovery", "Review the source.", "operator")
+        second = knowledge.submit(self.db, "tenant-a", "workspace-a", "one", "wkfl_OTHER",
+                                  "SOP", "Other", "Review another workflow.", "operator")
+        self.assertTrue(knowledge.review(self.db, "tenant-a", "workspace-a", first, "APPROVED", "admin"))
+        text = "Workflow wkfl_load_MDM_NSF failed."
+        self.assertEqual(knowledge.match_approved_sop_job(self.db, "tenant-a", "workspace-a", text),
+                         "wkfl_load_MDM_NSF")
+        self.assertIsNone(knowledge.match_approved_sop_job(self.db, "tenant-a", "workspace-b", text))
+        self.assertIsNone(knowledge.match_approved_sop_job(self.db, "tenant-a", "workspace-a",
+                                                           "wkfl_load_MDM_NSF-extra"))
+        self.assertTrue(knowledge.review(self.db, "tenant-a", "workspace-a", second, "APPROVED", "admin"))
+        self.assertIsNone(knowledge.match_approved_sop_job(
+            self.db, "tenant-a", "workspace-a", "wkfl_load_MDM_NSF and wkfl_OTHER failed"
+        ))
 
     def test_job_identity_requires_scoped_execution_or_unambiguous_approval(self):
         with self.db.get_connection() as conn:

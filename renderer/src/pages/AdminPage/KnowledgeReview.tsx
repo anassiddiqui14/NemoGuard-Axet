@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { authFetch } from '../../contexts/AuthGateContext';
+import { KnowledgeSources } from './KnowledgeSources';
 
 type Item = {
     knowledge_id: string;
@@ -12,7 +13,7 @@ type Item = {
     submitted_at: string;
 };
 
-export function KnowledgeReview() {
+export function KnowledgeReview({ refreshRevision, onChanged }: { refreshRevision: number; onChanged: () => void }) {
     const [items, setItems] = useState<Item[]>([]);
     const [loading, setLoading] = useState(true);
     const [busy, setBusy] = useState<string | null>(null);
@@ -28,6 +29,8 @@ export function KnowledgeReview() {
 
     useEffect(() => {
         let active = true;
+        setLoading(true);
+        setError('');
         authFetch('/api/v2/admin/incident-knowledge')
             .then(async (res) => {
                 if (!res.ok) throw new Error(`Unable to load submissions (HTTP ${res.status}).`);
@@ -37,7 +40,7 @@ export function KnowledgeReview() {
             .catch((err: unknown) => { if (active) setError(err instanceof Error ? err.message : 'Unable to load submissions.'); })
             .finally(() => { if (active) setLoading(false); });
         return () => { active = false; };
-    }, []);
+    }, [refreshRevision]);
 
     const review = async (item: Item, decision: 'APPROVED' | 'REJECTED') => {
         setBusy(item.knowledge_id);
@@ -52,6 +55,7 @@ export function KnowledgeReview() {
                 const body = await response.json().catch(() => ({}));
                 throw new Error(typeof body.detail === 'string' ? body.detail : `Review failed (HTTP ${response.status}).`);
             }
+            onChanged();
             setItems((current) => current.filter((pending) => pending.knowledge_id !== item.knowledge_id));
             try {
                 await load();
@@ -77,6 +81,7 @@ export function KnowledgeReview() {
                     <h3 className="text-sm font-semibold text-[#13231E]">{item.title} · {item.kind}</h3>
                     <p className="text-xs text-[#62716B]">Job: {item.job_key} · Incident: {item.incident_id} · Submitted by {item.submitted_by} · {item.submitted_at}</p>
                     <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-[#EDF3EE] p-3 text-xs text-[#13231E]">{item.content}</pre>
+                    <KnowledgeSources knowledgeId={item.knowledge_id} />
                     <label className="block text-xs text-[#62716B]">Review note
                         <textarea maxLength={2000} value={note[item.knowledge_id] || ''} onChange={(e) => setNote((prev) => ({ ...prev, [item.knowledge_id]: e.target.value }))} className="mt-1 block w-full rounded-lg border border-[#BED2C7] bg-white p-2 text-[#13231E]" />
                     </label>

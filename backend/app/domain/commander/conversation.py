@@ -319,8 +319,12 @@ class CommanderConversation:
         # not a fixed template. The deterministic is_material classification
         # above is passed in as a fact for the model to reference, but the
         # classification decision itself was never delegated to the LLM.
-        context = self._load_context(incident_id)
-        commander_ack = await self.agent.react_to_guidance(incident_id, context, text, is_fact, is_material)
+        if (not is_fact and guidance_type == "INVESTIGATION_DIRECTION"
+                and text == "Please re-investigate using the submitted incident references."):
+            commander_ack = "Reference request recorded."
+        else:
+            context = self._load_context(incident_id)
+            commander_ack = await self.agent.react_to_guidance(incident_id, context, text, is_fact, is_material)
 
         # Perform the actual decision to re-run the investigation graph.
         # Runs in the background (fire-and-forget via asyncio.create_task,
