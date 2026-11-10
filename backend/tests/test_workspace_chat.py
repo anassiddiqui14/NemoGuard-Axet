@@ -13,6 +13,8 @@ from fastapi.testclient import TestClient
 from app.api.auth import create_access_token
 from app.api.main import app
 from app.domain import model_settings
+from app.store import alert_inbox
+from datetime import datetime, timezone
 from app.store.sqlite_database import SqliteDatabase
 
 
@@ -86,6 +88,63 @@ class WorkspaceChatTests(unittest.TestCase):
         self.assertNotIn("other-tenant", context)
         self.assertNotIn("unassigned", context)
         self.assertEqual(args["messages"][-1]["content"], "What needs attention?")
+
+    def test_today_count_is_scoped_and_requires_inbox_permission(self):
+        alert_inbox.initialize(self.db)
+        today = datetime.now(timezone.utc).isoformat()
+        with self.db.get_connection() as conn:
+            for key, tenant, workspace, subject in (
+                ("matching", "tenant-a", "ws-a", "Transcript error"),
+                ("different", "tenant-a", "ws-a", "Other job"),
+                ("other", "tenant-a", "ws-b", "Transcript error"),
+                ("foreign", "tenant-b", "ws-a", "Transcript error"),
+            ):
+                conn.execute(
+                    "INSERT INTO outlook_inbox (delivery_key,payload_hash,tenant_id,workspace_id,subject,body,state,received_at,updated_at,result_json) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (key, "hash", tenant, workspace, subject, "", "received", today, today, "{}"),
+                )
+        prompt = {"question": "how many transcript related errors I have received today?", "timezone": "UTC"}
+        self.assertEqual(self.client.post("/api/v2/workspace-chat", headers=headers(), json=prompt).status_code, 403)
+        token = create_access_token({"sub": "operator", "roles": ["operator"], "tenant_id": "tenant-a", "workspace_id": "ws-a"})
+        response = self.client.post("/api/v2/workspace-chat", headers={"Authorization": "Bearer " + token}, json=prompt)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["answer"].startswith("1 Outlook bridge message recorded"))
+        self.assertIn("not verified errors", response.json()["answer"])
+
+    def test_today_count_uses_local_day_across_daylight_saving(self):
+        alert_inbox.initialize(self.db)
+
+        class FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 3, 8, 16, 0, tzinfo=timezone.utc).astimezone(tz)
+
+        with self.db.get_connection() as conn:
+            for key, received in (
+                ("before", "2026-03-08T04:59:59+00:00"),
+                ("start", "2026-03-08T05:00:00+00:00"),
+                ("last", "2026-03-09T03:59:59+00:00"),
+                ("after", "2026-03-09T04:00:00+00:00"),
+            ):
+                conn.execute(
+                    "INSERT INTO outlook_inbox (delivery_key,payload_hash,tenant_id,workspace_id,subject,body,state,received_at,updated_at,result_json) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (key, "hash", "tenant-a", "ws-a", "transcript error", "", "received", received, received, "{}"),
+                )
+        token = create_access_token({"sub": "operator", "roles": ["operator"], "tenant_id": "tenant-a", "workspace_id": "ws-a"})
+        auth = {"Authorization": "Bearer " + token}
+        with patch("app.api.workspace_chat.datetime", FixedDatetime):
+            response = self.client.post(
+                "/api/v2/workspace-chat", headers=auth,
+                json={"question": "how many transcript related errors today?", "timezone": "America/New_York"},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["answer"].startswith("2 Outlook bridge messages"))
+        self.assertIn("2026-03-08", response.json()["answer"])
+        bad = self.client.post(
+            "/api/v2/workspace-chat", headers=auth,
+            json={"question": "how many transcript related errors today?", "timezone": "Not/AZone"},
+        )
+        self.assertEqual(bad.status_code, 400)
 
     def test_provider_errors_do_not_leak_details(self):
         model_settings.set_override(self.db, "tenant-a", "ws-a", "commander", "workspace-model", "admin")

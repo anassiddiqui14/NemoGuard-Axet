@@ -16,5 +16,6 @@ opentelemetry-sdk
 temporalio
 psycopg2-binary
 python-dotenv
+tzdata
 fastmcp
 extract-msg==0.58.1

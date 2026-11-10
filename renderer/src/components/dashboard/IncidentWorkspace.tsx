@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { AnimatePresence } from 'framer-motion';
 import { ngToast } from '../../design-system/toast';
 import { ArrowLeft, AlertTriangle } from 'lucide-react';
@@ -8,7 +8,7 @@ import { authFetch } from '../../contexts/AuthGateContext';
 import { SituationHeader } from './SituationHeader';
 import { AlertsPanel, AgentAndHypothesisRow, ActivityAndImpactRow } from './InvestigationPanels';
 import { RecoveryRail } from './RecoveryRail';
-import { CommanderPanel } from './CommanderPanel';
+import { useChatContext } from '../shell/ChatContext';
 import { EvidenceModal } from './EvidenceModal';
 import { CancelIncidentModal } from './CancelIncidentModal';
 import { PlanApprovalModal } from '../PlanApprovalModal';
@@ -50,6 +50,11 @@ interface Props {
  * dashboard.
  */
 export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParent, onBack, backButtonMobileOnly }: Props) {
+    const { setIncidentId } = useChatContext();
+    useEffect(() => {
+        setIncidentId(incidentId);
+        return () => setIncidentId(null);
+    }, [incidentId, setIncidentId]);
     const [isEvidenceModalOpen, setIsEvidenceModalOpen] = useState(false);
     const [expandedAlert, setExpandedAlert] = useState<string | null>(null);
     const [isModalOpen, setIsModalOpen] = useState(false);
@@ -328,18 +333,6 @@ export function IncidentWorkspace({ incidentId, selectedIncident, onRefreshParen
                     />
                 }
             />
-
-            {/* Commander is now a floating launcher (Intercom/Drift
-                pattern), rendered here at fixed position rather than as
-                one of WorkspaceTabs' tabs. Per direct user feedback: an
-                always-visible bottom panel was explicitly rejected ("bad
-                design, i never said bottom") in favor of matching how
-                modern chat/coding agents actually dock -- closed by
-                default, opened on demand, and it auto-opens the instant a
-                request starts so "Thinking" is never silently hidden
-                regardless of which workspace tab is active or whether the
-                operator had closed it. */}
-            <CommanderPanel incidentId={incidentId} />
 
             <AnimatePresence>
                 {isEvidenceModalOpen && hypothesis && (

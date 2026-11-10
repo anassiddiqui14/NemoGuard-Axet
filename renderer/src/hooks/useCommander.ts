@@ -35,6 +35,7 @@ export function useCommander(incidentId: string | null) {
     const [guidanceRevision, setGuidanceRevision] = useState(0);
     const [loading, setLoading] = useState(false);
     const [sending, setSending] = useState(false);
+    const [sendError, setSendError] = useState('');
 
     const refresh = useCallback(async () => {
         if (!incidentId) return;
@@ -65,6 +66,7 @@ export function useCommander(incidentId: string | null) {
         setPulse([]);
         setMessages([]);
         setGuidanceRevision(0);
+        setSendError('');
         if (!incidentId) {
             setLoading(false);
             return;
@@ -124,6 +126,7 @@ export function useCommander(incidentId: string | null) {
                 },
             ]);
             setSending(true);
+            setSendError('');
             sendingRef.current = true;
             try {
                 const res = await authFetch(`/api/v2/incidents/${incidentId}/commander/${endpoint}`, {
@@ -131,11 +134,19 @@ export function useCommander(incidentId: string | null) {
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(body),
                 });
-                if (!res.ok) return null;
+                if (!res.ok) {
+                    setSendError('No response was confirmed. Check the incident transcript before resending; guidance or facts may already have been recorded.');
+                    await refresh();
+                    return null;
+                }
                 const data = await res.json();
                 setGuidanceRevision(data.guidance_revision ?? 0);
                 await refresh();
                 return data;
+            } catch {
+                setSendError('No response was confirmed. Check the incident transcript before resending; guidance or facts may already have been recorded.');
+                await refresh();
+                return null;
             } finally {
                 setSending(false);
                 sendingRef.current = false;
@@ -161,5 +172,5 @@ export function useCommander(incidentId: string | null) {
         [sendTurn],
     );
 
-    return { pulse, messages, optimisticMessages, guidanceRevision, loading, sending, ask, guide, addFact };
+    return { pulse, messages, optimisticMessages, guidanceRevision, loading, sending, sendError, ask, guide, addFact };
 }

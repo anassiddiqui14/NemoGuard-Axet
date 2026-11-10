@@ -13,6 +13,7 @@ import { UserMenu } from './UserMenu';
 import { Logomark } from '../../pages/LandingPage/Brand';
 import { CommandPalette } from '../../design-system/components/CommandPalette';
 import { WorkspaceChat } from './WorkspaceChat';
+import { ChatContext } from './ChatContext';
 
 /*
  * UI MODERNIZATION (spec Section 18/73 -- genuine accessibility gap
@@ -167,6 +168,7 @@ export function AppShell() {
     const navigate = useNavigate();
     const [mobileNavOpen, setMobileNavOpen] = useState(false);
     const [paletteKey, setPaletteKey] = useState(0);
+    const [incidentId, setIncidentId] = useState<string | null>(null);
     const closeMobileNav = useCallback(() => setMobileNavOpen(false), []);
 
     const handleSelectIncident = (incidentId: string) => {
@@ -174,6 +176,7 @@ export function AppShell() {
     };
 
     return (
+        <ChatContext.Provider value={{ incidentId, setIncidentId }}>
         <div className="flex flex-col h-screen w-full bg-[#F3F6F2] overflow-hidden font-sans">
             <MobileNavDrawer open={mobileNavOpen} onClose={closeMobileNav} />
             {/*
@@ -225,5 +228,6 @@ export function AppShell() {
                 </main>
             </div>
         </div>
+        </ChatContext.Provider>
     );
 }

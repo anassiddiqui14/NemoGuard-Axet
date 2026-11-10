@@ -125,12 +125,12 @@ function ThinkingBubble({ mode }: { mode: 'ASK' | 'GUIDE' | 'ADD_FACT' }) {
     );
 }
 
-export function CommanderPanel({ incidentId }: { incidentId: string | null }) {
-    const { pulse, messages, optimisticMessages, loading, sending, ask, guide, addFact } = useCommander(incidentId);
+export function CommanderPanel({ incidentId, embedded = false }: { incidentId: string | null; embedded?: boolean }) {
+    const { pulse, messages, optimisticMessages, loading, sending, sendError, ask, guide, addFact } = useCommander(incidentId);
     const [mode, setMode] = useState<'ASK' | 'GUIDE' | 'ADD_FACT'>('ASK');
     const [text, setText] = useState('');
     const scrollRef = useRef<HTMLDivElement>(null);
-    const [open, setOpen] = useState(false);
+    const [open, setOpen] = useState(embedded);
     const [tab, setTab] = useState<'chat' | 'pulse'>('chat');
 
     // BUG FIX (user-reported): "when i close and re open chat, it should
@@ -230,7 +230,7 @@ export function CommanderPanel({ incidentId }: { incidentId: string | null }) {
     const visibleMessages = optimisticMessages.filter((om) => !messages.some((m) => m.role === om.role && m.content === om.content));
 
     return (
-        <div className="fixed bottom-6 right-6 z-40 flex flex-col items-end gap-3">
+        <div className={embedded ? 'flex h-full min-h-0 flex-col' : 'fixed bottom-6 right-6 z-40 flex flex-col items-end gap-3'}>
             <AnimatePresence>
                 {open && (
                     <motion.div
@@ -238,7 +238,7 @@ export function CommanderPanel({ incidentId }: { incidentId: string | null }) {
                         animate={{ opacity: 1, y: 0, scale: 1 }}
                         exit={{ opacity: 0, y: 16, scale: 0.96 }}
                         transition={{ type: 'spring', stiffness: 340, damping: 28 }}
-                        className="menu-panel rounded-2xl overflow-hidden shadow-2xl w-[min(92vw,420px)] h-[min(70vh,560px)] flex flex-col"
+                        className={embedded ? 'flex h-full min-h-0 flex-col overflow-hidden' : 'menu-panel rounded-2xl overflow-hidden shadow-2xl w-[min(92vw,420px)] h-[min(70vh,560px)] flex flex-col'}
                     >
                         <div className="px-4 py-3.5 flex items-center justify-between border-b border-white/[0.05] flex-shrink-0">
                             <div className="flex items-center gap-2">
@@ -252,9 +252,9 @@ export function CommanderPanel({ incidentId }: { incidentId: string | null }) {
                                     </span>
                                 )}
                             </div>
-                            <IconButton onClick={() => setOpen(false)} label="Close Commander">
+                            {!embedded && <IconButton onClick={() => setOpen(false)} label="Close Commander">
                                 <X className="w-4 h-4" />
-                            </IconButton>
+                            </IconButton>}
                         </div>
 
                         <div className="flex gap-1 px-3 pt-2.5 flex-shrink-0">
@@ -299,6 +299,7 @@ export function CommanderPanel({ incidentId }: { incidentId: string | null }) {
                                     )}
                                 </div>
                                 <div className="border-t border-white/[0.06] p-3 flex-shrink-0">
+                                    {sendError && <p role="alert" className="mb-2 text-xs text-critical">{sendError}</p>}
                                     <div className="flex gap-1.5 mb-2">
                                         {(['ASK', 'GUIDE', 'ADD_FACT'] as const).map((m) => (
                                             <button
@@ -362,7 +363,7 @@ export function CommanderPanel({ incidentId }: { incidentId: string | null }) {
                 so the operator has a persistent, ambient signal even with
                 the panel collapsed, without ever taking up page real
                 estate the way the earlier permanent-panel design did. */}
-            <motion.button
+            {!embedded && <motion.button
                 onClick={() => setOpen((o) => !o)}
                 whileTap={{ scale: 0.92 }}
                 aria-label={open ? 'Close Commander' : 'Open Commander'}
@@ -387,7 +388,7 @@ export function CommanderPanel({ incidentId }: { incidentId: string | null }) {
                         transition={{ duration: 1.2, repeat: Infinity }}
                     />
                 )}
-            </motion.button>
+            </motion.button>}
         </div>
     );
 }

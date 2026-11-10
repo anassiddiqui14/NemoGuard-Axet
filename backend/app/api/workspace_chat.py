@@ -1,6 +1,9 @@
 """Authenticated, read-only workspace chat."""
 import json
 import os
+import re
+from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -30,6 +33,7 @@ class ChatTurn(BaseModel):
 class ChatRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
     history: list[ChatTurn] = Field(default_factory=list, max_length=10)
+    timezone: str = Field(default="UTC", min_length=1, max_length=100)
 
 
 @router.post("/workspace-chat")
@@ -41,6 +45,46 @@ async def workspace_chat(req: ChatRequest, user: User = Depends(get_current_user
         raise HTTPException(status_code=403, detail="A workspace is required.")
 
     db = get_database()
+    match = re.search(r"\bhow many\s+([A-Za-z0-9_-]{1,100})[\s-]+related\s+(?:errors?|alerts?|emails?|messages?)\b.*\btoday\b", question, re.IGNORECASE)
+    if match:
+        if not set(user.roles).intersection({"admin", "operator"}):
+            raise HTTPException(status_code=403, detail="Operator access is required to count inbox messages.")
+        try:
+            zone = ZoneInfo(req.timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise HTTPException(status_code=400, detail="Unknown time zone.")
+        if not db.table_exists("outlook_inbox"):
+            raise HTTPException(status_code=503, detail="The Outlook inbox is unavailable; no count can be calculated.")
+        today = datetime.now(zone).date()
+        start = datetime.combine(today, time.min, zone).astimezone(timezone.utc)
+        end = datetime.combine(today + timedelta(days=1), time.min, zone).astimezone(timezone.utc)
+        keyword = match.group(1)
+        with db.get_connection() as conn:
+            rows = conn.execute(
+                "SELECT received_at,subject,body FROM outlook_inbox "
+                "WHERE tenant_id=%s AND workspace_id=%s "
+                "AND received_at >= %s AND received_at < %s",
+                (user.tenant_id, user.workspace_id,
+                 (start.date() - timedelta(days=1)).isoformat(),
+                 (end.date() + timedelta(days=1)).isoformat()),
+            ).fetchall()
+        count = 0
+        invalid_dates = 0
+        for received_at, subject, body in rows:
+            try:
+                received = datetime.fromisoformat(str(received_at).replace("Z", "+00:00"))
+                if received.tzinfo is None:
+                    raise ValueError("Missing time zone")
+            except (ValueError, TypeError):
+                invalid_dates += 1
+                continue
+            if start <= received < end and keyword.casefold() in (str(subject or "") + "\n" + str(body or "")).casefold():
+                count += 1
+        qualification = f" {invalid_dates} messages in the inspected date range had invalid receipt timestamps and were excluded." if invalid_dates else ""
+        return JSONResponse({
+            "answer": f'{count} Outlook bridge message{"s" if count != 1 else ""} recorded in this workspace on {today.isoformat()} ({req.timezone}) contain{"s" if count == 1 else ""} "{keyword}" in the subject or body. These are keyword matches, not verified errors. Records include failed processing; messages not yet recorded in the inbox are excluded.{qualification}',
+            "context": "Workspace Outlook inbox receipt records; literal keyword match.",
+        }, headers={"Cache-Control": "no-store"})
     with db.get_connection() as conn:
         rows = conn.execute(
             "SELECT incident_id,title,status,severity FROM incident "
