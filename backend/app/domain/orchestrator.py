@@ -1176,8 +1176,16 @@ class IncidentOrchestrator:
     async def process_webhook(
         self, payload: Dict[str, Any], delivery_key: str, payload_hash: str,
         reviewed_documents: List[Dict[str, str]] = None, submitted_by: str = "",
+        trusted_scope=None,
     ) -> Dict[str, Any]:
         """Process a webhook with a transactional, persistent delivery receipt."""
+        if trusted_scope is not None:
+            if (not isinstance(trusted_scope, (tuple, list)) or len(trusted_scope) != 2
+                    or any(not isinstance(value, str) or not value.strip() for value in trusted_scope)):
+                raise ValueError("Invalid trusted ingestion scope")
+            tenant_id, workspace_id = (value.strip() for value in trusted_scope)
+        else:
+            tenant_id, workspace_id = "default_tenant", None
         def claim(conn):
             cursor = conn.execute(
                 "INSERT INTO webhook_delivery (delivery_key, payload_hash, result_json) "
@@ -1217,10 +1225,15 @@ class IncidentOrchestrator:
         # both backends' cursor.description.
         active_incidents = []
         with self.db.get_connection() as conn:
-            cursor = conn.execute(
+            query = (
                 "SELECT incident_id, title, summary, primary_run_id, status FROM incident "
                 "WHERE status NOT IN ('RESOLVED', 'CLOSED', 'CANCELLED', 'FAILED')"
             )
+            if trusted_scope is not None:
+                query += " AND tenant_id=%s AND workspace_id=%s"
+                cursor = conn.execute(query, (tenant_id, workspace_id))
+            else:
+                cursor = conn.execute(query)
             cols = [c[0] for c in cursor.description]
             active_incidents = [dict(zip(cols, row)) for row in cursor.fetchall()]
 
@@ -1266,9 +1279,9 @@ class IncidentOrchestrator:
 
             def audit(incident_id, event_type, summary):
                 conn.execute("""
-                    INSERT INTO audit_event (audit_event_id, incident_id, actor_type, actor_id, event_type, event_summary, created_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """, (f"AUD-{uuid.uuid4().hex}", incident_id, "SYSTEM", "Watcher Agent", event_type, summary, now))
+                    INSERT INTO audit_event (audit_event_id, incident_id, actor_type, actor_id, event_type, event_summary, created_at, tenant_id, workspace_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (f"AUD-{uuid.uuid4().hex}", incident_id, "SYSTEM", "Watcher Agent", event_type, summary, now, tenant_id, workspace_id))
 
             def link_reviewed_evidence(incident_id):
                 if not reviewed_documents:
@@ -1280,21 +1293,21 @@ class IncidentOrchestrator:
                 )
                 for document_id, kind, title, content in cursor.fetchall():
                     conn.execute("""
-                        INSERT INTO evidence (evidence_id, incident_id, evidence_type, source_system, source_record_id, title, excerpt, collected_at, reliability, metadata_json, authority)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        INSERT INTO evidence (evidence_id, incident_id, evidence_type, source_system, source_record_id, title, excerpt, collected_at, reliability, metadata_json, authority, tenant_id, workspace_id)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """, (
                         f"EVD-{uuid.uuid4().hex}", incident_id, kind,
                         "Automatic Outlook email (unreviewed)" if automatic else "Reviewed email export",
                         document_id, title, content, now, 0.2,
                         json.dumps({"submitted_by": submitted_by, "verification": "unverified_external",
                                     "operator_reviewed": not automatic}),
-                        "LOW",
+                        "LOW", tenant_id, workspace_id,
                     ))
 
             conn.execute("""
-                INSERT INTO alert (alert_id, run_id, opened_ts, severity, alert_type, source_system, message, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 'open')
-            """, (alert_id, run_id, now, severity, alert_type, source_system, message))
+                INSERT INTO alert (alert_id, run_id, opened_ts, severity, alert_type, source_system, message, status, tenant_id, workspace_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'open', %s, %s)
+            """, (alert_id, run_id, now, severity, alert_type, source_system, message, tenant_id, workspace_id))
 
             # Email documents may be automatically captured or operator-reviewed.
             # Both remain untrusted external claims.
@@ -1310,7 +1323,15 @@ class IncidentOrchestrator:
 
             # Check if AI correlated this to an existing incident
             correlated_incident_id = analysis.get("correlated_incident_id")
-            
+            if correlated_incident_id and trusted_scope is not None:
+                scoped = conn.execute(
+                    "SELECT 1 FROM incident WHERE incident_id=%s AND tenant_id=%s AND workspace_id=%s "
+                    "AND status NOT IN ('RESOLVED', 'CLOSED', 'CANCELLED', 'FAILED')",
+                    (correlated_incident_id, tenant_id, workspace_id),
+                ).fetchone()
+                if not scoped:
+                    correlated_incident_id = None
+
             if correlated_incident_id and any(i['incident_id'] == correlated_incident_id for i in active_incidents):
                 # Map to existing incident
                 conn.execute("""
@@ -1392,9 +1413,10 @@ class IncidentOrchestrator:
                 
                 conn.execute("""
                     INSERT INTO incident (
-                        incident_id, title, status, severity, detected_at, created_at, updated_at, 
-                        summary, primary_run_id, correlation_confidence, next_sla_breach_at, version
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        incident_id, title, status, severity, detected_at, created_at, updated_at,
+                        summary, primary_run_id, correlation_confidence, next_sla_breach_at, version,
+                        tenant_id, workspace_id
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     incident.incident_id,
                     incident.title,
@@ -1405,7 +1427,9 @@ class IncidentOrchestrator:
                     incident.primary_run_id,
                     incident.correlation_confidence,
                     (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
-                    1
+                    1,
+                    tenant_id,
+                    workspace_id,
                 ))
                 
                 conn.execute("""

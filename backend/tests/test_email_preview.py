@@ -142,7 +142,8 @@ class PreviewTests(unittest.TestCase):
             from app.store import alert_inbox
             import app.api.main as api
             alert_inbox.initialize(db)
-            with patch.object(api, "get_database", return_value=db), \
+            with patch.dict(os.environ, {"NEMOGUARD_OUTLOOK_TENANT_ID": "tenant-test", "NEMOGUARD_OUTLOOK_WORKSPACE_ID": "workspace-test"}), \
+                 patch.object(api, "get_database", return_value=db), \
                  patch.object(domain, "get_database", return_value=db), \
                  patch.object(domain, "WatcherAgent", Watcher), \
                  patch.object(triage_scheduler, "schedule_triage_for_new_incident", new_callable=AsyncMock, return_value={"status": "QUEUED_DIRECT"}) as schedule:
@@ -154,6 +155,16 @@ class PreviewTests(unittest.TestCase):
             self.assertEqual(second.json()["incident_id"], first.json()["incident_id"])
             schedule.assert_awaited_once()
             with db.get_connection() as conn:
+                incident_scope = conn.execute(
+                    "SELECT tenant_id,workspace_id FROM incident WHERE incident_id=%s",
+                    (first.json()["incident_id"],),
+                ).fetchone()
+                alert_scope = conn.execute(
+                    "SELECT tenant_id,workspace_id FROM alert WHERE alert_id=%s",
+                    (first.json()["alert_id"],),
+                ).fetchone()
+                self.assertEqual(tuple(incident_scope), ("tenant-test", "workspace-test"))
+                self.assertEqual(tuple(alert_scope), ("tenant-test", "workspace-test"))
                 row = conn.execute(
                     "SELECT source_system, authority, metadata_json FROM evidence WHERE incident_id=%s",
                     (first.json()["incident_id"],),
@@ -165,7 +176,12 @@ class PreviewTests(unittest.TestCase):
                 attachment = conn.execute("SELECT content, submitted_by FROM reviewed_alert_document WHERE document_kind=%s", ("EMAIL_ATTACHMENT",)).fetchone()
                 self.assertTrue(attachment[0].endswith("FINAL"))
                 self.assertEqual(attachment[1], "automatic-outlook-bridge")
-                self.assertEqual(conn.execute("SELECT COUNT(*) FROM evidence WHERE incident_id=%s", (first.json()["incident_id"],)).fetchone()[0], 2)
+                evidence_scopes = conn.execute(
+                    "SELECT tenant_id,workspace_id FROM evidence WHERE incident_id=%s",
+                    (first.json()["incident_id"],),
+                ).fetchall()
+                self.assertEqual(len(evidence_scopes), 2)
+                self.assertTrue(all(tuple(scope) == ("tenant-test", "workspace-test") for scope in evidence_scopes))
 
     def test_inbox_retains_ignored_and_rejects_conflicts(self):
         import app.api.main as api

@@ -163,8 +163,8 @@ async def _run_direct_triage(incident_id: str, previous_status: str) -> None:
             )
             orchestrator._log_audit(
                 incident_id, "SYSTEM", "TRIAGE_FAILED",
-                "Direct triage completed without producing a usable recovery plan "
-                "(both the primary investigation and its deterministic fallback failed). "
+                "Triage did not produce a usable recovery plan. A safe fallback plan was unavailable; "
+                "manual review is required. "
                 f"{restoration_note}",
             )
     except Exception as e:

@@ -123,6 +123,21 @@ export function WorkspaceTabs({ alertCount, overview, evidence, investigation, a
                 motion is applied to just the currently-visible panel via a
                 plain re-keyed inner element that animates without ever
                 touching the hidden siblings' mount state. */}
+            {active === 'overview' && (
+                <div className="console-surface rounded-2xl p-4 text-sm text-text-secondary">
+                    <p>Do you have an SOP or dependency information for this incident?</p>
+                    <button
+                        type="button"
+                        onClick={() => {
+                            setActive('investigation');
+                            window.setTimeout(() => document.getElementById('incident-reference-title')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0);
+                        }}
+                        className="mt-2 rounded-lg border border-border-color px-4 py-2 font-semibold text-text-primary focus-ring"
+                    >
+                        Add or review SOPs and dependencies
+                    </button>
+                </div>
+            )}
             {TABS.map((tab) => {
                 const isActive = tab.key === active;
                 return (

@@ -701,9 +701,13 @@ async def ingest_webhook(payload: dict, request: Request):
         result = await orchestrator.process_webhook(payload, delivery_key, payload_hash)
     else:
         classification_payload = {k: v for k, v in payload.items() if k != "attachments"}
+        options = {}
+        if getattr(request.state, "outlook_scope", None) is not None:
+            options["trusted_scope"] = request.state.outlook_scope
         result = await orchestrator.process_webhook(
             classification_payload, delivery_key, payload_hash,
             reviewed_documents=reviewed, submitted_by=request.state.reviewed_by,
+            **options,
         )
 
     if result.get("status") == "idempotency_conflict":
@@ -778,6 +782,7 @@ async def ingest_outlook_bridge(payload: dict, request: Request):
         raise HTTPException(status_code=409, detail="Idempotency-Key was already used with a different payload")
     request.state.reviewed_documents = [{"kind": "EMAIL_BODY", "title": subject[:200] or "Outlook email", "content": body}, *attachments]
     request.state.reviewed_by = "automatic-outlook-bridge"
+    request.state.outlook_scope = alert_inbox.scope()
     try:
         result = await ingest_webhook(payload, request)
     except Exception:

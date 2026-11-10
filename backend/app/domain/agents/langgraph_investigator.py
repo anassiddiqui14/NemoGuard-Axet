@@ -231,6 +231,14 @@ class LangGraphInvestigator:
         async def run_rca(state: InvestigationState):
             res = await self.rca_agent.analyze(state["incident_id"], feedback_context=state.get("feedback_context", ""), reference_context=state.get("reference_context", ""))
             if not isinstance(res, dict) or "error" in res:
+                detail = str(res.get("error", "")) if isinstance(res, dict) else ""
+                if "LLM response was not valid JSON" in detail:
+                    category = "invalid_model_json"
+                elif "Unable to retrieve reviewed email evidence" in detail:
+                    category = "email_evidence_unavailable"
+                else:
+                    category = "agent_or_tool_error"
+                print(f"RCA investigation failure category: {category}", flush=True)
                 raise RuntimeError("RCA could not complete; investigation not verified")
             return {"rca_result": res}
             

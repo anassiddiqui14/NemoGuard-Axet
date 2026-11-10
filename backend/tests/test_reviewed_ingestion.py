@@ -70,6 +70,49 @@ class ReviewedIngestionTests(unittest.TestCase):
         self.assertIn("1023", evidence["matches"][0]["text"])
         self.assertEqual(self.ingest(digest="changed")["status"], "idempotency_conflict")
 
+    def test_outlook_scope_is_persisted_and_blocks_cross_workspace_correlation(self):
+        now = "2026-01-01T00:00:00Z"
+        with self.db.get_connection() as conn:
+            for ident, workspace in (("other", "workspace-b"), ("unassigned", None), ("same", "workspace-a")):
+                conn.execute(
+                    "INSERT INTO incident (incident_id,tenant_id,workspace_id,title,status,severity,detected_at,created_at,updated_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (ident, "tenant-a", workspace, "Existing", "PLAN_READY", "high", now, now, now),
+                )
+        seen = []
+
+        class ScopedWatcher:
+            async def analyze(self, payload, active_incidents):
+                seen.extend(item["incident_id"] for item in active_incidents)
+                return {
+                    "is_valid": True,
+                    "correlated_incident_id": "other",
+                    "normalized_alert": {
+                        "severity": "high", "alert_type": "TEST",
+                        "source_system": "Email", "message": "Synthetic failure",
+                    },
+                }
+
+        with patch.object(module, "WatcherAgent", ScopedWatcher):
+            result = asyncio.run(self.obj.process_webhook(
+                {"message": "Synthetic failure"}, "scoped", "digest",
+                reviewed_documents=self.documents, submitted_by="automatic-outlook-bridge",
+                trusted_scope=("tenant-a", "workspace-a"),
+            ))
+        self.assertEqual(seen, ["same"])
+        self.assertEqual(result["status"], "ingested_and_incident_created")
+        with self.db.get_connection() as conn:
+            incident = conn.execute(
+                "SELECT tenant_id,workspace_id FROM incident WHERE incident_id=%s",
+                (result["incident_id"],),
+            ).fetchone()
+            alert = conn.execute(
+                "SELECT tenant_id,workspace_id FROM alert WHERE alert_id=%s",
+                (result["alert_id"],),
+            ).fetchone()
+        self.assertEqual(tuple(incident), ("tenant-a", "workspace-a"))
+        self.assertEqual(tuple(alert), ("tenant-a", "workspace-a"))
+
     def test_correlated_incident_gets_evidence_without_new_plan(self):
         now = "2026-01-01T00:00:00Z"
         with self.db.get_connection() as conn:
@@ -154,6 +197,30 @@ class ReviewedIngestionTests(unittest.TestCase):
             self.assertEqual(conn.execute(
                 "SELECT COUNT(*) FROM hypothesis WHERE incident_id=%s", (incident_id,)
             ).fetchone()[0], 0)
+
+    def test_rca_failure_logs_safe_category_and_stops_investigation(self):
+        from app.domain.agents.langgraph_investigator import LangGraphInvestigator
+
+        class FailingRCA:
+            async def analyze(self, *args, **kwargs):
+                return {"error": "LLM response was not valid JSON; sensitive synthetic content"}
+
+        class UnusedAgent:
+            async def analyze(self, *args, **kwargs):
+                raise AssertionError("Downstream agents must not run after RCA failure")
+
+        investigator = LangGraphInvestigator.__new__(LangGraphInvestigator)
+        investigator.rca_agent = FailingRCA()
+        investigator.dep_agent = UnusedAgent()
+        investigator.runbook_agent = UnusedAgent()
+        investigator.critic = UnusedAgent()
+        investigator.graph = investigator._build_graph()
+        with patch("builtins.print") as output:
+            with self.assertRaisesRegex(RuntimeError, "RCA could not complete"):
+                asyncio.run(investigator.investigate("synthetic"))
+        logged = " ".join(str(call) for call in output.call_args_list)
+        self.assertIn("invalid_model_json", logged)
+        self.assertNotIn("sensitive synthetic content", logged)
 
     def test_substituted_plan_never_inherits_passed_safety_verdict(self):
         from app.domain.agents.langgraph_investigator import LangGraphInvestigator
