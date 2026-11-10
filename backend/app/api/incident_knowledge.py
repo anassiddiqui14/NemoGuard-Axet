@@ -1,6 +1,7 @@
 """Authenticated incident knowledge submission and review endpoints."""
 from datetime import datetime, timezone
 from typing import Literal
+import os
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -9,9 +10,45 @@ from pydantic import BaseModel, Field
 
 from app.api.auth import User, get_current_user, require_role
 from app.domain import incident_knowledge as knowledge
+from app.domain import model_settings
 from app.store.database_factory import get_database
 
 router = APIRouter(prefix="/api/v2")
+
+
+@router.get("/admin/model-runtime")
+def model_runtime(current_user: User = Depends(require_role("admin"))):
+    """Report only the API process default, never provider credentials."""
+    if not current_user.tenant_id or not current_user.workspace_id:
+        raise HTTPException(status_code=400, detail="A tenant and workspace are required.")
+    model = os.environ.get("AXET_MODEL") or None
+    overrides = model_settings.get_overrides(get_database(), current_user.tenant_id, current_user.workspace_id)
+    return JSONResponse({
+        "model": model,
+        "source": "AXET_MODEL" if model else "not configured",
+        "operations": [
+            {"key": key, "label": label, "override": overrides.get(key)}
+            for key, label in model_settings.OPERATIONS.items()
+        ],
+        "scope": "Workspace overrides apply to new operations; separate workers may use a different runtime default.",
+        "editable": True,
+    }, headers={"Cache-Control": "no-store"})
+
+
+class ModelOverride(BaseModel):
+    model_id: str | None = Field(max_length=200)
+
+
+@router.put("/admin/model-runtime/{operation}")
+def update_model_runtime(operation: str, req: ModelOverride, current_user: User = Depends(require_role("admin"))):
+    try:
+        model_settings.set_override(
+            get_database(), current_user.tenant_id, current_user.workspace_id,
+            operation, req.model_id, current_user.user_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse({"status": "saved", "operation": operation}, headers={"Cache-Control": "no-store"})
 
 
 class Submission(BaseModel):

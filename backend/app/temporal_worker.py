@@ -14,9 +14,11 @@ async def main():
     # Workers can start before the API. Ensure the additive knowledge tables
     # exist before accepting investigations, rather than silently omitting
     # operator-submitted references.
-    from app.domain import incident_knowledge
+    from app.domain import incident_knowledge, model_settings
     from app.store.database_factory import get_database
-    incident_knowledge.initialize(get_database())
+    db = get_database()
+    incident_knowledge.initialize(db)
+    model_settings.initialize(db)
 
     temporal_url = os.getenv("TEMPORAL_URL", "localhost:7233")
     logging.info(f"Connecting to Temporal server at {temporal_url}")

@@ -243,8 +243,9 @@ async def startup_event():
 
     from app.store import alert_inbox
     alert_inbox.initialize(db)
-    from app.domain import incident_knowledge
+    from app.domain import incident_knowledge, model_settings
     incident_knowledge.initialize(db)
+    model_settings.initialize(db)
 
     _bootstrap_admin_if_configured(db)
     print(f"[startup-timing] bootstrap admin complete at +{__import__('time').perf_counter() - _startup_t0:.2f}s")

@@ -15,6 +15,7 @@ is still only ever performed through POST /plans/{plan_id}/approve with an
 exact plan_hash match (see backend/app/api/main.py::approve_plan).
 """
 import asyncio
+import copy
 import json
 import os
 import uuid
@@ -247,7 +248,10 @@ class CommanderConversation:
         self._add_message(incident_id, "OPERATOR", question, intent="ASK", created_by=asked_by)
 
         context = self._load_context(incident_id)
-        answer = await self.agent.ask(incident_id, context, question, history=history)
+        from app.domain import model_settings
+        agent = copy.copy(self.agent)
+        model_settings.apply_override(agent, "commander", model_settings.for_incident(self.db, incident_id))
+        answer = await agent.ask(incident_id, context, question, history=history)
 
         self._add_message(incident_id, "COMMANDER", answer, evidence_refs=[h["statement"] for h in context["hypotheses"]])
 
@@ -324,7 +328,10 @@ class CommanderConversation:
             commander_ack = "Reference request recorded."
         else:
             context = self._load_context(incident_id)
-            commander_ack = await self.agent.react_to_guidance(incident_id, context, text, is_fact, is_material)
+            from app.domain import model_settings
+            agent = copy.copy(self.agent)
+            model_settings.apply_override(agent, "commander", model_settings.for_incident(self.db, incident_id))
+            commander_ack = await agent.react_to_guidance(incident_id, context, text, is_fact, is_material)
 
         # Perform the actual decision to re-run the investigation graph.
         # Runs in the background (fire-and-forget via asyncio.create_task,

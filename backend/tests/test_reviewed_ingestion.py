@@ -76,6 +76,35 @@ class ReviewedIngestionTests(unittest.TestCase):
             )
             self.assertEqual(result.rowcount, 1)
 
+    def test_watcher_model_uses_trusted_workspace_only(self):
+        from app.domain import model_settings
+
+        model_settings.initialize(self.db)
+        model_settings.set_override(self.db, "tenant-a", "workspace-a", "watcher", "scoped-model", "admin")
+        seen = []
+
+        class ModelWatcher:
+            def __init__(self):
+                self.model = "runtime-default"
+
+            async def analyze(self, payload, active_incidents):
+                seen.append(self.model)
+                return {"is_valid": False, "reasoning": "test"}
+
+        with patch.object(module, "WatcherAgent", ModelWatcher):
+            asyncio.run(self.obj.process_webhook(
+                {"message": "test"}, "scoped-model-test", "digest",
+                trusted_scope=("tenant-a", "workspace-a"),
+            ))
+            asyncio.run(self.obj.process_webhook(
+                {"message": "test"}, "unscoped-model-test", "digest",
+            ))
+            asyncio.run(self.obj.process_webhook(
+                {"message": "test"}, "other-model-test", "digest",
+                trusted_scope=("tenant-a", "workspace-b"),
+            ))
+        self.assertEqual(seen, ["scoped-model", "runtime-default", "runtime-default"])
+
     def test_new_incident_retry_and_evidence(self):
         result = self.ingest()
         self.assertEqual(result["status"], "ingested_and_incident_created")

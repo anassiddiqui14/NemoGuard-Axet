@@ -127,6 +127,14 @@ No NVIDIA API key is required by the active V22 agent path.
 
 `GET /api/v2/status` reports whether the required inference configuration is present. It deliberately does not call that state "healthy" without a live probe.
 
+### Admin knowledge and model controls
+
+Deploy the updated SPA and Python Agent together, then sign in with an admin account and open **Admin → SOP and dependency administration**. The knowledge library is scoped to the admin's tenant and workspace. A Git push does not itself update a running Flow.
+
+The **AI model configuration** panel shows the API process's `AXET_MODEL` and workspace-specific overrides for individual agent operations. Administrators can set an exact provider model ID or reset an operation to its runtime default. The provider does not validate model availability or tool-calling compatibility through this interface; an unsupported ID can cause new operations to fail. Changes affect new operations, not calls already in progress. Unscoped webhook classification uses its runtime default.
+
+A separate Temporal worker can have a different `AXET_MODEL` default. Deploy the updated worker as well and ensure it shares the same persistent database as the API for overrides to take effect. The panel does not report the worker's actual environment. The exact provider ID and availability of GPT-6.1 Terra have not been verified; it is not selected automatically.
+
 ## 6. Authentication
 
 Use the aXet/Okta-provided application session in cloud deployment. NemoGuard's backend APIs still enforce role and tenant/workspace boundaries.

@@ -4,6 +4,7 @@ import { Logomark } from '../LandingPage/Brand';
 import { CapabilityPolicyTab } from './CapabilityPolicyTab';
 import { KnowledgeReview } from './KnowledgeReview';
 import { KnowledgeLibrary } from './KnowledgeLibrary';
+import { ModelRuntime } from './ModelRuntime';
 
 /**
  * V22 admin intentionally exposes only controls that have a matching,
@@ -27,10 +28,11 @@ export function AdminPage() {
                         <div className="flex items-center gap-2 text-[10.5px] font-bold uppercase tracking-[0.16em] text-[#0C6F58]">
                             <Logomark className="h-4 w-4" /> Governance
                         </div>
-                        <h1 className="mt-2 text-[28px] font-bold tracking-[-0.045em] text-[#13231E]">Capability Policy</h1>
+                        <h1 className="mt-2 text-[28px] font-bold tracking-[-0.045em] text-[#13231E]">Administration</h1>
                         <p className="mt-1 max-w-2xl text-[12.5px] leading-relaxed text-[#62716B]">
-                            The active control surface for what NemoGuard is allowed to execute, recommend, or deny. Every control below is backed by a real API contract.
+                            Manage capability policy and review SOP and dependency documents for your workspace.
                         </p>
+                        <a href="#knowledge-admin" className="mt-3 inline-block rounded-lg border border-[#0C6F58] px-3 py-2 text-xs font-semibold text-[#0C6F58]">SOP and dependency administration</a>
                     </div>
                     <div className="flex items-center gap-2 rounded-2xl border border-[#0C6F58]/15 bg-[#E1F3EC] px-3 py-2 text-[10.5px] font-bold text-[#0C6F58]">
                         <ShieldCheck size={14} /> Enforced backend policy
@@ -41,8 +43,12 @@ export function AdminPage() {
                     <CapabilityPolicyTab />
                 </div>
 
-                <KnowledgeReview refreshRevision={reviewRevision} onChanged={() => setLibraryRevision((value) => value + 1)} />
-                <KnowledgeLibrary refreshRevision={libraryRevision} onChanged={() => setReviewRevision((value) => value + 1)} />
+                <ModelRuntime />
+
+                <div id="knowledge-admin" className="space-y-5 scroll-mt-5">
+                    <KnowledgeReview refreshRevision={reviewRevision} onChanged={() => setLibraryRevision((value) => value + 1)} />
+                    <KnowledgeLibrary refreshRevision={libraryRevision} onChanged={() => setReviewRevision((value) => value + 1)} />
+                </div>
             </div>
         </div>
     );

@@ -12,7 +12,7 @@ os.environ["AXET_FLOWS_AUTH"] = "false"
 from fastapi.testclient import TestClient
 from app.api.auth import create_access_token
 from app.api.main import app
-from app.domain import incident_knowledge
+from app.domain import incident_knowledge, model_settings
 from app.store.sqlite_database import SqliteDatabase
 
 
@@ -32,6 +32,7 @@ class KnowledgeApiTests(unittest.TestCase):
         self.db = SqliteDatabase(str(Path(self.temp.name) / "test.db"))
         self.db.init_schema()
         incident_knowledge.initialize(self.db)
+        model_settings.initialize(self.db)
         with self.db.get_connection() as conn:
             for incident, workspace in (("first", "ws-a"), ("second", "ws-a"), ("other", "ws-b")):
                 conn.execute(
@@ -47,6 +48,37 @@ class KnowledgeApiTests(unittest.TestCase):
         self.client.close()
         self.db_patch.stop()
         self.temp.cleanup()
+
+    def test_model_runtime_is_admin_only_and_does_not_expose_credentials(self):
+        path = "/api/v2/admin/model-runtime"
+        with patch.dict(os.environ, {"AXET_MODEL": "test-model", "OPENAI_API_KEY": "test-secret"}):
+            self.assertEqual(self.client.get(path, headers=headers("operator")).status_code, 403)
+            response = self.client.get(path, headers=headers("admin"))
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["model"], "test-model")
+            self.assertTrue(response.json()["editable"])
+            self.assertNotIn("test-secret", response.text)
+            self.assertEqual(response.headers["cache-control"], "no-store")
+        with patch.dict(os.environ, {}, clear=True):
+            response = self.client.get(path, headers=headers("admin"))
+            self.assertIsNone(response.json()["model"])
+
+    def test_model_overrides_are_scoped_validated_and_audited(self):
+        path = "/api/v2/admin/model-runtime/rca"
+        self.assertEqual(self.client.put(path, headers=headers("operator"), json={"model_id": "model-a"}).status_code, 403)
+        self.assertEqual(self.client.put(path, headers=headers("admin"), json={"model_id": "bad model"}).status_code, 400)
+        self.assertEqual(self.client.put("/api/v2/admin/model-runtime/unknown", headers=headers("admin"), json={"model_id": "model-a"}).status_code, 400)
+        self.assertEqual(self.client.put(path, headers=headers("admin"), json={"model_id": "model-a"}).status_code, 200)
+        self.assertEqual(model_settings.for_incident(self.db, "first"), {"rca": "model-a"})
+        self.assertEqual(model_settings.for_incident(self.db, "other"), {})
+        self.assertEqual(model_settings.get_overrides(self.db, "other-tenant", "ws-a"), {})
+        response = self.client.get("/api/v2/admin/model-runtime", headers=headers("admin"))
+        self.assertEqual(next(x for x in response.json()["operations"] if x["key"] == "rca")["override"], "model-a")
+        self.assertEqual(self.client.put(path, headers=headers("admin"), json={"model_id": None}).status_code, 200)
+        self.assertEqual(model_settings.for_incident(self.db, "first"), {})
+        with self.db.get_connection() as conn:
+            audit = conn.execute("SELECT old_model,new_model,actor FROM workspace_model_audit WHERE operation=%s ORDER BY created_at", ("rca",)).fetchall()
+        self.assertEqual([tuple(row) for row in audit], [(None, "model-a", "test-user"), ("model-a", None, "test-user")])
 
     def test_submission_requires_operator_and_review_requires_admin(self):
         payload = {

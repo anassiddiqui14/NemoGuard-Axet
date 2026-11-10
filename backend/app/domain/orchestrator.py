@@ -108,7 +108,9 @@ class IncidentOrchestrator:
         self._log_audit(incident_id, "Commander", "TRIAGE_STARTED", "Triage started for this incident.")
 
         investigator = LangGraphInvestigator()
-        
+        from app.domain import model_settings
+        model_settings.apply_investigation(investigator, model_settings.for_incident(self.db, incident_id))
+
         alerts_data = []
         with self.db.get_connection() as conn:
             cursor = conn.execute(
@@ -893,6 +895,8 @@ class IncidentOrchestrator:
                 "bypass safety, approval, policy, precondition, or verification controls."
             ),
         )
+        from app.domain import model_settings
+        model_settings.apply_override(feedback_agent, "feedback", model_settings.for_incident(self.db, incident_id))
         llm_response = await feedback_agent.call_llm_json(prompt)
 
         if "error" in llm_response:
@@ -1105,6 +1109,8 @@ class IncidentOrchestrator:
         try:
             from app.domain.agents.langgraph_investigator import LangGraphInvestigator
             investigator = LangGraphInvestigator()
+            from app.domain import model_settings
+            model_settings.apply_investigation(investigator, model_settings.for_incident(self.db, incident_id))
             reference_context, has_pending = self._reference_context(incident_id)
             final_state = await investigator.investigate(
                 incident_id, alerts_data, audit_callback=self._log_audit,
@@ -1254,6 +1260,9 @@ class IncidentOrchestrator:
             active_incidents = [dict(zip(cols, row)) for row in cursor.fetchall()]
 
         watcher = WatcherAgent()
+        from app.domain import model_settings
+        overrides = model_settings.get_overrides(self.db, tenant_id, workspace_id)
+        model_settings.apply_override(watcher, "watcher", overrides)
         analysis = await watcher.analyze(payload, active_incidents)
         
         if not isinstance(analysis, dict):
