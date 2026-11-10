@@ -89,6 +89,64 @@ class WorkspaceChatTests(unittest.TestCase):
         self.assertNotIn("unassigned", context)
         self.assertEqual(args["messages"][-1]["content"], "What needs attention?")
 
+    def test_context_scopes_alerts_and_inbox_by_workspace_and_role(self):
+        from app.domain.workspace_chat_context import build_context
+
+        alert_inbox.initialize(self.db)
+        with self.db.get_connection() as conn:
+            for ident, tenant, workspace in (
+                ("local-alert", "tenant-a", "ws-a"),
+                ("other-alert", "tenant-a", "ws-b"),
+                ("foreign-alert", "tenant-b", "ws-a"),
+            ):
+                conn.execute(
+                    "INSERT INTO alert (alert_id,tenant_id,workspace_id,opened_ts,severity,alert_type,source_system,message,status) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (ident, tenant, workspace, "2026-01-01", "high", "test", "test", "private body", "open"),
+                )
+            conn.execute(
+                "INSERT INTO incident_alert (incident_id,alert_id,correlation_score,correlation_reasons_json,added_at) "
+                "VALUES (%s,%s,%s,%s,%s)",
+                ("allowed", "local-alert", 1.0, "[]", "2026-01-01"),
+            )
+            for key, workspace, subject in (("local", "ws-a", "local subject"), ("private", "ws-b", "private subject")):
+                conn.execute(
+                    "INSERT INTO outlook_inbox (delivery_key,payload_hash,tenant_id,workspace_id,subject,body,state,received_at,updated_at,result_json) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (key, "hash", "tenant-a", workspace, subject, "sensitive body", "needs_review", "2026-01-01", "2026-01-01", '{"status":"ignored","reasoning":"synthetic reason","alert_id":"local-alert","incident_id":"allowed"}'),
+                )
+        viewer = build_context(self.db, "tenant-a", "ws-a", False)
+        self.assertEqual(viewer["alert_total"], 1)
+        self.assertEqual(viewer["recent_alerts"][0]["linked_incident_id"], "allowed")
+        self.assertEqual(viewer["outlook_inbox"]["availability"], "not authorized")
+        self.assertNotIn("private body", str(viewer))
+        self.assertNotIn("other-alert", str(viewer))
+        self.assertNotIn("foreign-alert", str(viewer))
+        operator = build_context(self.db, "tenant-a", "ws-a", True)
+        self.assertEqual(operator["outlook_inbox"]["total"], 1)
+        self.assertEqual(operator["outlook_inbox"]["recent_outcomes"][0]["processing_status"], "ignored")
+        self.assertEqual(operator["outlook_inbox"]["recent_outcomes"][0]["reported_alert_id"], "local-alert")
+        self.assertEqual(operator["outlook_inbox"]["recent_outcomes"][0]["reported_incident_id"], "allowed")
+        self.assertNotIn("local subject", str(viewer))
+        self.assertIn("local subject", str(operator))
+        self.assertNotIn("private subject", str(operator))
+        self.assertNotIn("sensitive body", str(operator))
+
+    def test_recent_alert_sample_reports_truncation(self):
+        from app.domain.workspace_chat_context import LIMIT, build_context
+
+        with self.db.get_connection() as conn:
+            for index in range(LIMIT + 1):
+                conn.execute(
+                    "INSERT INTO alert (alert_id,tenant_id,workspace_id,opened_ts,severity,alert_type,source_system,message,status) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (f"alert-{index}", "tenant-a", "ws-a", "2026-01-01", "high", "test", "test", "", "open"),
+                )
+        context = build_context(self.db, "tenant-a", "ws-a", False)
+        self.assertEqual(context["alert_total"], LIMIT + 1)
+        self.assertEqual(len(context["recent_alerts"]), LIMIT)
+        self.assertTrue(context["recent_alerts_may_be_truncated"])
+
     def test_today_count_is_scoped_and_requires_inbox_permission(self):
         alert_inbox.initialize(self.db)
         today = datetime.now(timezone.utc).isoformat()

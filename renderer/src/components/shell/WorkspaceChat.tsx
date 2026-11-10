@@ -62,7 +62,7 @@ export function WorkspaceChat() {
 
     return (
         <div className="fixed bottom-4 right-4 z-50 sm:bottom-6 sm:right-6">
-            <section aria-label="NemoGuard chat" style={{ display: open ? 'flex' : 'none' }} className="mb-3 h-[min(520px,70vh)] w-[min(380px,calc(100vw-2rem))] flex-col overflow-hidden rounded-2xl border border-[#BED2C7] bg-white text-[#13231E] shadow-2xl">
+            <section aria-label="NemoGuard chat" style={{ display: open ? 'flex' : 'none' }} className="mb-3 h-[min(720px,calc(100dvh-7rem))] w-[min(640px,calc(100vw-2rem))] flex-col overflow-hidden rounded-2xl border border-[#BED2C7] bg-white text-[#13231E] shadow-2xl">
                 <header className="flex items-center justify-between bg-[#073F32] px-4 py-3 text-white">
                     <div><h2 className="font-semibold">NemoGuard assistant</h2><p className="text-xs text-white/75">Workspace and incident chat</p></div>
                     <button type="button" aria-label="Close chat" onClick={() => setOpen(false)} className="rounded-lg p-2 hover:bg-white/10"><X size={18} /></button>
@@ -72,7 +72,7 @@ export function WorkspaceChat() {
                     <button type="button" aria-pressed={mode === 'incident'} onClick={() => setMode('incident')} className={`rounded-lg border px-3 py-2 ${mode === 'incident' ? 'border-[#0C6F58] bg-[#E1F3EC] font-semibold text-[#0C6F58]' : 'border-[#BED2C7]'}`}>Incident: {incidentId}</button>
                 </div>}
                 <div style={{ display: mode === 'workspace' ? 'flex' : 'none' }} className="min-h-0 flex-1 flex-col">
-                    <p className="border-b px-4 py-2 text-xs text-[#62716B]">Read-only. Uses up to 10 recent incidents; supported inbox counts use received messages. Workspace chat resets on reload.</p>
+                    <p className="border-b px-4 py-2 text-xs text-[#62716B]">Read-only. Uses workspace totals and recent samples; inbox outcomes require operator access. Workspace chat resets on reload.</p>
                     <div className="flex-1 space-y-3 overflow-y-auto p-4" aria-live="polite">
                         {turns.length === 0 && <p className="text-sm text-[#62716B]">Ask a question about your workspace or an operations topic.</p>}
                         {turns.map((turn, index) => <div key={index} className={`whitespace-pre-wrap break-words rounded-xl px-3 py-2 text-sm ${turn.role === 'user' ? 'ml-8 bg-[#E1F3EC]' : 'mr-8 bg-[#F1F4F1]'}`}>
