@@ -12,6 +12,7 @@ import { MobileNavDrawer } from './MobileNavDrawer';
 import { UserMenu } from './UserMenu';
 import { Logomark } from '../../pages/LandingPage/Brand';
 import { CommandPalette } from '../../design-system/components/CommandPalette';
+import { WorkspaceChat } from './WorkspaceChat';
 
 /*
  * UI MODERNIZATION (spec Section 18/73 -- genuine accessibility gap
@@ -216,6 +217,7 @@ export function AppShell() {
              * imperative ref/open() method on a self-contained component.
              */}
             <CommandPalette openSignal={paletteKey} />
+            <WorkspaceChat />
             <div className="flex flex-1 min-h-0 overflow-hidden">
                 <GlobalNavRail />
                 <main className="flex-1 overflow-hidden">

@@ -12,7 +12,6 @@ import {
     Clock3,
     Database,
     Inbox,
-    MessageCircle,
     RefreshCw,
     ShieldCheck,
     TriangleAlert,
@@ -576,13 +575,6 @@ export function ProductionOverviewPage() {
                 </footer>
             </div>
 
-            <Link
-                to="/app/command-center"
-                aria-label="Open Commander"
-                className="fixed bottom-6 right-6 z-30 flex h-14 w-14 items-center justify-center rounded-full bg-[#073F32] text-white shadow-[0_18px_40px_-16px_rgba(7,63,50,.75)] transition-transform hover:-translate-y-1 active:scale-[0.96] focus-ring"
-            >
-                <MessageCircle size={21} />
-            </Link>
         </main>
     );
 }

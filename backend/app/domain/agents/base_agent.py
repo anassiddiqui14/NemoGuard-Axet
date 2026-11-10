@@ -5,6 +5,13 @@ from typing import Dict, Any
 from openai import AsyncOpenAI
 
 
+def completion_token_limit(model: str, limit: int) -> dict:
+    """Select the supported token-limit parameter for the configured model."""
+    if (model or "").strip().lower() == "gpt-6.1-terra":
+        return {"max_completion_tokens": limit}
+    return {"max_tokens": limit}
+
+
 class BaseAgent:
     def __init__(self, agent_name: str, system_prompt: str, model: str = ""):
         self.agent_name = agent_name
@@ -104,7 +111,7 @@ class BaseAgent:
                     },
                 ],
                 temperature=0.1,
-                max_tokens=16384,
+                **completion_token_limit(self.model, 16384),
                 stream=False,
             )
 
@@ -190,7 +197,7 @@ class BaseAgent:
                     messages=messages,
                     tools=tools,
                     temperature=0.1,
-                    max_tokens=4096,
+                    **completion_token_limit(self.model, 4096),
                     stream=False,
                 )
 
@@ -280,7 +287,7 @@ class BaseAgent:
                     model=self.model,
                     messages=messages,
                     temperature=0.1,
-                    max_tokens=4096,
+                    **completion_token_limit(self.model, 4096),
                     stream=False,
                 )
                 final_message = final_completion.choices[0].message

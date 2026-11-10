@@ -44,7 +44,9 @@ from app.api.auth import (
 app = FastAPI(title="NemoGuard - Pipeline Incident Commander", version="2.0.0")
 
 from app.api.incident_knowledge import router as incident_knowledge_router
+from app.api.workspace_chat import router as workspace_chat_router
 app.include_router(incident_knowledge_router)
+app.include_router(workspace_chat_router)
 
 _startup_t0 = __import__("time").perf_counter()
 setup_telemetry("nemoguard_api")
