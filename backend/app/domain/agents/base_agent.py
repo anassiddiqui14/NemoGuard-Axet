@@ -12,6 +12,16 @@ def completion_token_limit(model: str, limit: int) -> dict:
     return {"max_tokens": limit}
 
 
+def completion_sampling(model: str, temperature: float, top_p: float | None = None) -> dict:
+    """Leave sampling at provider defaults for Terra; preserve other models' settings."""
+    if (model or "").strip().lower() == "gpt-6.1-terra":
+        return {}
+    result = {"temperature": temperature}
+    if top_p is not None:
+        result["top_p"] = top_p
+    return result
+
+
 class BaseAgent:
     def __init__(self, agent_name: str, system_prompt: str, model: str = ""):
         self.agent_name = agent_name
@@ -110,7 +120,7 @@ class BaseAgent:
                         "content": prompt,
                     },
                 ],
-                temperature=0.1,
+                **completion_sampling(self.model, 0.1),
                 **completion_token_limit(self.model, 16384),
                 stream=False,
             )
@@ -196,7 +206,7 @@ class BaseAgent:
                     model=self.model,
                     messages=messages,
                     tools=tools,
-                    temperature=0.1,
+                    **completion_sampling(self.model, 0.1),
                     **completion_token_limit(self.model, 4096),
                     stream=False,
                 )
@@ -286,7 +296,7 @@ class BaseAgent:
                 final_completion = await self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
-                    temperature=0.1,
+                    **completion_sampling(self.model, 0.1),
                     **completion_token_limit(self.model, 4096),
                     stream=False,
                 )

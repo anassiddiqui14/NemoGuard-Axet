@@ -57,7 +57,7 @@ async def workspace_chat(req: ChatRequest, user: User = Depends(get_current_user
     overrides = model_settings.get_overrides(db, user.tenant_id, user.workspace_id)
     if not os.getenv("AXET_MODEL") and not overrides.get("commander"):
         raise HTTPException(status_code=503, detail="The assistant model is not configured.")
-    from app.domain.agents.base_agent import BaseAgent, completion_token_limit
+    from app.domain.agents.base_agent import BaseAgent, completion_sampling, completion_token_limit
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -70,7 +70,8 @@ async def workspace_chat(req: ChatRequest, user: User = Depends(get_current_user
         agent = BaseAgent("Workspace_Chat", SYSTEM_PROMPT)
         model_settings.apply_override(agent, "commander", overrides)
         completion = await agent.client.chat.completions.create(
-            model=agent.model, messages=messages, temperature=0.3,
+            model=agent.model, messages=messages,
+            **completion_sampling(agent.model, 0.3),
             **completion_token_limit(agent.model, 700), stream=False,
         )
         answer = (completion.choices[0].message.content or "").strip()

@@ -27,7 +27,7 @@ is the single authoritative model for every call this agent makes.
 """
 from typing import Any, Dict, List, Optional
 
-from app.domain.agents.base_agent import BaseAgent, completion_token_limit
+from app.domain.agents.base_agent import BaseAgent, completion_sampling, completion_token_limit
 from app.domain.agents.agent_tools import _get_read_only_tools_schema, execute_read_only_tool_call
 
 
@@ -180,8 +180,7 @@ class CommanderLiveAgent(BaseAgent):
                     model=self.model,
                     messages=messages,
                     tools=tools,
-                    temperature=0.3,
-                    top_p=0.95,
+                    **completion_sampling(self.model, 0.3, 0.95),
                     **completion_token_limit(self.model, 384),
                     stream=False,
                 )
@@ -202,7 +201,8 @@ class CommanderLiveAgent(BaseAgent):
             # Budget exhausted -- force a final answer-only turn.
             messages.append({"role": "user", "content": "Please give your final answer now, in plain text, based on the evidence gathered so far."})
             completion = await self.client.chat.completions.create(
-                model=self.model, messages=messages, temperature=0.3, top_p=0.95,
+                model=self.model, messages=messages,
+                **completion_sampling(self.model, 0.3, 0.95),
                 **completion_token_limit(self.model, 384), stream=False,
             )
             return (completion.choices[0].message.content or "").strip()
@@ -236,8 +236,7 @@ class CommanderLiveAgent(BaseAgent):
                     {"role": "system", "content": self.system_prompt},
                     {"role": "user", "content": prompt},
                 ],
-                temperature=0.4,
-                top_p=0.95,
+                **completion_sampling(self.model, 0.4, 0.95),
                 **completion_token_limit(self.model, 180),
                 stream=False,
             )
